@@ -3,22 +3,26 @@
   "private": true,
   "type": "module",
   "version": "0.0.2-alpha.18",
+  "license": "Apache-2.0",
   "scripts": {
     "workflow": "workflow",
     "wf": "wf",
-    "build": "workflow build --target vercel-build-output-api --workflow-manifest manifest.js && rm -rf .vercel/output/static && cp -rv public .vercel/output/static"
+    "build": "workflow build --target vercel-build-output-api --workflow-manifest manifest.js"
   },
   "devDependencies": {
+    "@workflow/world-postgres": "workspace:*",
     "@types/lodash.chunk": "^4.2.9",
     "@types/node": "catalog:",
     "@workflow/cli": "workspace:*",
     "esbuild": "catalog:"
   },
   "dependencies": {
+    "@ai-sdk/workflow": "catalog:ai-sdk-v7",
+    "@opentelemetry/api": "^1.9.0",
     "@vercel/functions": "catalog:",
-    "@vercel/otel": "^1.13.0",
+    "@vercel/otel": "^1.14.2",
     "workflow": "workspace:*",
-    "ai": "catalog:",
+    "ai": "catalog:ai-sdk-v7",
     "lodash.chunk": "^4.2.0",
     "mixpart": "^0.0.4",
     "openai": "^6",

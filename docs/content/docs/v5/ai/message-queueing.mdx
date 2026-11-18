@@ -1,0 +1,138 @@
+---
+title: Queueing User Messages
+description: Inject messages during an agent's turn, before tool calls complete or while the model is reasoning.
+type: guide
+summary: Inject user messages mid-turn using the `prepareStep` callback to influence the agent's next step.
+prerequisites:
+  - /docs/ai
+related:
+  - /docs/ai/chat-session-modeling
+  - /docs/api-reference/workflow/define-hook
+---
+
+When using [multi-turn workflows](/docs/ai/chat-session-modeling#multi-turn-workflows), messages typically arrive between agent turns. The workflow waits at a hook, receives a message, then starts a new turn. But sometimes you need to inject messages *during* an agent's turn, before tool calls complete or while the model is reasoning.
+
+`WorkflowAgent`'s `prepareStep` callback enables this by running before each step in the agent loop, giving you a chance to inject queued messages into the conversation. `prepareStep` also allows you to modify the model choice and existing messages mid-turn, see AI SDK's [prepareStep callback](https://ai-sdk.dev/docs/agents/loop-control#prepare-step) for more details.
+
+## When to use this
+
+Message queueing is useful when:
+
+- Users send follow-up messages while the agent is still searching for flights or processing bookings
+- External systems need to inject context mid-turn (e.g., a flight status webhook fires during processing)
+- You want messages to influence the agent's next step rather than waiting for the current turn to complete
+
+<Callout type="info">
+If you need basic multi-turn conversations where messages arrive between turns, see [Chat Session Modeling](/docs/ai/chat-session-modeling). This guide covers the more advanced case of injecting messages *during* turns.
+</Callout>
+
+## The `prepareStep` callback
+
+The `prepareStep` callback runs before each step in the agent loop. Use WorkflowAgent's exported types rather than redeclaring its normalized provider-prompt contract:
+
+```typescript lineNumbers
+import type {
+  PrepareStepInfo,
+  PrepareStepResult,
+} from "@ai-sdk/workflow";
+
+const prepareStep = (
+  { messages }: PrepareStepInfo
+): PrepareStepResult => ({ messages });
+```
+
+`PrepareStepInfo.messages` is a normalized `LanguageModelV4Prompt`, not the application-level `ModelMessage[]` accepted by `WorkflowAgent.stream()`.
+
+## Queueing messages during and between turns
+
+Use one async Hook consumer and one FIFO. `prepareStep` atomically drains messages that arrived during a model turn; messages that arrive after the final model step become input to the next turn. Each Hook payload therefore has exactly one ownership path.
+
+```typescript title="workflows/chat/index.ts" lineNumbers
+import { WorkflowAgent, type ModelCallStreamPart } from "@ai-sdk/workflow";
+import { getWritable, getWorkflowMetadata } from "workflow";
+import { chatMessageHook } from "./hooks/chat-message";
+import { flightBookingTools, FLIGHT_ASSISTANT_PROMPT } from "./steps/tools";
+import type { ModelMessage } from "ai";
+
+export async function chat(initialMessages: ModelMessage[]) {
+  "use workflow";
+
+  const { workflowRunId: runId } = getWorkflowMetadata();
+  const writable = getWritable<ModelCallStreamPart>();
+  let messages: ModelMessage[] = [...initialMessages];
+  const messageQueue: Array<{ role: "user"; content: string }> = []; // [!code highlight]
+  let stopped = false;
+  let notifyMessage: (() => void) | undefined;
+
+  const agent = new WorkflowAgent({
+    model: "spacexai/grok-4.6",
+    instructions: FLIGHT_ASSISTANT_PROMPT,
+    tools: flightBookingTools,
+  });
+
+  const hook = chatMessageHook.create({ token: runId }); // [!code highlight]
+  // This is the only code path that consumes Hook payloads. // [!code highlight]
+  const consumeMessages = (async () => { // [!code highlight]
+    for await (const { message } of hook) { // [!code highlight]
+      if (message === "/done") { // [!code highlight]
+        stopped = true; // [!code highlight]
+        notifyMessage?.(); // [!code highlight]
+        break; // [!code highlight]
+      } // [!code highlight]
+      messageQueue.push({ role: "user", content: message }); // [!code highlight]
+      notifyMessage?.(); // [!code highlight]
+      notifyMessage = undefined; // [!code highlight]
+    } // [!code highlight]
+  })(); // [!code highlight]
+
+  const waitForMessage = async () => {
+    while (messageQueue.length === 0 && !stopped) {
+      await new Promise<void>((resolve) => {
+        notifyMessage = resolve;
+      });
+    }
+  };
+
+  while (!stopped) {
+    const result = await agent.stream({
+      messages,
+      writable,
+      preventClose: true,
+      sendFinish: false,
+      prepareStep: ({ messages: currentMessages }) => {
+        const queued = messageQueue.splice(0); // Atomic drain // [!code highlight]
+        if (queued.length === 0) return {};
+        return {
+          messages: [
+            ...currentMessages,
+            ...queued.map(({ role, content }) => ({
+              role,
+              content: [{ type: "text" as const, text: content }],
+            })),
+          ],
+        };
+      },
+    });
+    messages = result.messages;
+
+    if (stopped) break;
+    await waitForMessage(); // [!code highlight]
+    if (stopped) break;
+
+    // Anything not consumed by prepareStep arrived after the final model step.
+    messages = [...messages, ...messageQueue.splice(0)]; // [!code highlight]
+  }
+
+  await consumeMessages;
+  return { messages };
+}
+```
+
+Messages sent via `chatMessageHook.resume()` accumulate until either `prepareStep` or the between-turn branch drains the FIFO. Send `/done` to stop the consumer and let the workflow return.
+
+## Related documentation
+
+- [Chat Session Modeling](/docs/ai/chat-session-modeling) - Single-turn vs multi-turn patterns
+- [Building Durable AI Agents](/docs/ai) - Complete guide to creating durable agents
+- [`WorkflowAgent`](https://ai-sdk.dev/v7/docs/agents/workflow-agent#workflowagent) - AI SDK API for durable, resumable agents
+- [`defineHook()` API Reference](/docs/api-reference/workflow/define-hook) - Hook configuration options

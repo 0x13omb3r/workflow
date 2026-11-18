@@ -1,11 +1,44 @@
-import { runInContext } from 'node:vm';
-import { ERROR_SLUGS } from '@workflow/errors';
-import type { Event, WorkflowRun } from '@workflow/world';
-import * as nanoid from 'nanoid';
+import { Script } from 'node:vm';
+import type { Span } from '@opentelemetry/api';
+import {
+  ERROR_SLUGS,
+  ReplayDivergenceError,
+  WorkflowNotRegisteredError,
+  WorkflowRuntimeError,
+} from '@workflow/errors';
+import {
+  createWorkflowBaseUrl,
+  type PromiseWithResolvers,
+  withResolvers,
+} from '@workflow/utils';
+import { parseWorkflowName } from '@workflow/utils/parse-name';
+import type { Event, WorkflowRun, WorldCapabilities } from '@workflow/world';
+import { entityEventClass } from '@workflow/world/event-metadata';
+import { SPEC_VERSION_SUPPORTS_COMPRESSION } from '@workflow/world/spec-version';
 import { monotonicFactory } from 'ulid';
-import { EventConsumerResult, EventsConsumer } from './events-consumer.js';
-import { ENOTSUP } from './global.js';
+import {
+  EventConsumerResult,
+  EventsConsumer,
+  type ParkedSummary,
+} from './events-consumer.js';
+import type { QueueItem } from './global.js';
+import { ENOTSUP, WorkflowSuspension } from './global.js';
+import { runtimeLogger } from './logger.js';
 import type { WorkflowOrchestratorContext } from './private.js';
+import { isDeliveryIdle } from './private.js';
+import { describeDivergenceContext } from './replay-divergence.js';
+import { ReplayPayloadCache } from './replay-payload-cache.js';
+import { getPortLazy } from './runtime/get-port-lazy.js';
+import { runIdCreatedAt } from './runtime/run-id-time.js';
+import type { RunStartHook } from './runtime/start-hook-binding.js';
+import { createSeededNanoid } from './seeded-nanoid.js';
+import type { PayloadKey } from './serialization/encryption.js';
+import {
+  bindStateContext,
+  registerStateSource,
+  StateContext,
+  stateSourceId,
+} from './serialization/state-refs.js';
 import {
   dehydrateWorkflowReturnValue,
   hydrateWorkflowArguments,
@@ -13,162 +46,802 @@ import {
 import { createUseStep } from './step.js';
 import {
   BODY_INIT_SYMBOL,
+  STABLE_ULID,
   WORKFLOW_CREATE_HOOK,
   WORKFLOW_GET_STREAM_ID,
+  WORKFLOW_SET_ATTRIBUTES,
+  WORKFLOW_SLEEP,
   WORKFLOW_USE_STEP,
 } from './symbols.js';
 import * as Attribute from './telemetry/semantic-conventions.js';
-import { trace } from './telemetry.js';
-import { getWorkflowRunStreamId, withResolvers } from './util.js';
+import {
+  applyWorkflowSuspensionToSpan,
+  createRefreshableTraceContext,
+  startTraceSpan,
+  trace,
+} from './telemetry.js';
+import { getWorkflowRunStreamId } from './util.js';
 import { createContext } from './vm/index.js';
+import { getCachedWorkflowScript } from './vm/script-cache.js';
+import {
+  createAbortSignalStatics,
+  createCreateAbortController,
+} from './workflow/abort-controller.js';
+import { createSetAttributes } from './workflow/attribute-dispatcher.js';
 import type { WorkflowMetadata } from './workflow/get-workflow-metadata.js';
 import { WORKFLOW_CONTEXT_SYMBOL } from './workflow/get-workflow-metadata.js';
 import { createCreateHook } from './workflow/hook.js';
+import { createSleep } from './workflow/sleep.js';
 
-export async function runWorkflow(
-  workflowCode: string,
+/**
+ * Drain pending queue items at workflow completion (success or failure).
+ *
+ * Treats completion as a final suspension so unawaited hook, wait, and
+ * attribute operations are recorded before the run becomes terminal. This
+ * also lets a final `controller.abort()` reach in-flight steps. Final hook
+ * disposals of non-retained hooks are omitted because termination releases them.
+ *
+ * It records `*_created` and native attribute events, but never executes step
+ * bodies: `step_started` is rejected after the run becomes terminal. A
+ * fire-and-forget step therefore needs a later suspension to be scheduled.
+ *
+ * Drain failures do not change the workflow's terminal outcome.
+ */
+async function drainPendingQueueItems(
+  runId: string,
+  pendingQueue: Map<string, QueueItem>,
+  vmGlobalThis: typeof globalThis,
   workflowRun: WorkflowRun,
-  events: Event[]
-): Promise<unknown> {
-  return trace(`WORKFLOW.run ${workflowRun.workflowName}`, async (span) => {
+  outcome: 'completed' | 'failed',
+  drainPendingQueue: PendingQueueDrain | undefined
+): Promise<void> {
+  if (pendingQueue.size === 0 || !drainPendingQueue) return;
+  try {
+    const synthesized = new WorkflowSuspension(pendingQueue, vmGlobalThis);
+    await drainPendingQueue(synthesized, workflowRun);
+  } catch (err) {
+    runtimeLogger.warn(
+      `Failed to drain pending queue items for ${outcome} workflow run`,
+      {
+        workflowRunId: runId,
+        message: err instanceof Error ? err.message : String(err),
+      }
+    );
+  }
+}
+
+/**
+ * Records the items a finished run's workflow left queued, as the
+ * orchestrator records any suspension (see `drainPendingQueueItems`), except
+ * that disposals the terminal event makes redundant are skipped. Each
+ * orchestrator passes its own; without one nothing is drained.
+ */
+export type PendingQueueDrain = (
+  suspension: WorkflowSuspension,
+  workflowRun: WorkflowRun
+) => Promise<void>;
+
+/** Everything needed to cold-start a workflow VM over an event log. */
+interface WorkflowSessionOptions {
+  readonly workflowCode: string;
+  readonly workflowRun: WorkflowRun;
+  readonly events: Event[];
+  readonly encryptionKey: PayloadKey | undefined;
+  readonly replayPayloadCache: ReplayPayloadCache;
+  readonly compiledWorkflowScripts?: CompiledWorkflowScripts;
+  /** Records the end-of-run drain. */
+  readonly drainPendingQueue?: PendingQueueDrain;
+  readonly worldCapabilities?: WorldCapabilities;
+  /**
+   * The run's start Hook, from `resolveRunStartHook`. `undefined` for a run
+   * started without one, which then replays exactly as before.
+   */
+  readonly startHook?: RunStartHook;
+}
+
+/** Context-independent V8 scripts that can be evaluated in any fresh VM. */
+export interface CompiledWorkflowScripts {
+  readonly bundleScript: Script;
+  readonly workflowLookupScript: Script;
+}
+
+/**
+ * Compile the workflow bundle before its run snapshot is available.
+ *
+ * Compilation depends only on the route's bundle string and the workflow name
+ * persisted on the run, not the event log or VM context. The runtime starts
+ * this promise while `run_started` loads the replay snapshot, then evaluates
+ * the scripts only after it has created the fresh context.
+ */
+function compileWorkflowScripts(
+  workflowCode: string,
+  workflowName: string,
+  cache: 'shared' | 'none'
+): Promise<CompiledWorkflowScripts> {
+  const parsedName = parseWorkflowName(workflowName);
+  const filename = parsedName?.moduleSpecifier || workflowName;
+  const workflowLookupCode = `globalThis.__private_workflows?.get(${JSON.stringify(workflowName)})`;
+
+  return trace('workflow.bundle.compile', async (span) => {
+    const bundle =
+      cache === 'shared'
+        ? getCachedWorkflowScript(workflowCode, filename)
+        : {
+            script: new Script(workflowCode, { filename }),
+            cacheHit: false,
+          };
+    const lookup =
+      cache === 'shared'
+        ? getCachedWorkflowScript(workflowLookupCode, filename)
+        : {
+            script: new Script(workflowLookupCode, { filename }),
+            cacheHit: false,
+          };
+    span?.setAttributes({
+      // This attribute intentionally describes the workflow bundle. The tiny
+      // lookup script may miss when another workflow from the same source file
+      // runs, but that does not mean V8 recompiled the application bundle.
+      ...Attribute.WorkflowBundleCompileCacheHit(bundle.cacheHit),
+    });
+    return {
+      bundleScript: bundle.script,
+      workflowLookupScript: lookup.script,
+    };
+  });
+}
+
+export function compileWorkflowBundle(
+  workflowCode: string,
+  workflowName: string
+): Promise<CompiledWorkflowScripts> {
+  return compileWorkflowScripts(workflowCode, workflowName, 'shared');
+}
+
+/** Compile invocation-scoped dynamic source without touching the static cache. */
+export function compileDynamicWorkflowBundle(
+  workflowCode: string,
+  workflowName: string
+): Promise<CompiledWorkflowScripts> {
+  return compileWorkflowScripts(workflowCode, workflowName, 'none');
+}
+
+/**
+ * A live workflow VM, parked at a suspension boundary. `resume` advances it
+ * by appending events instead of replaying from scratch.
+ */
+export interface WorkflowSession {
+  readonly workflowRun: WorkflowRun;
+  readonly argumentCount: number;
+  resume(
+    events: Event[],
+    rebase?: WorkflowSessionRebase
+  ): Promise<WorkflowResumeResult>;
+}
+
+/**
+ * How a log differs from what a retained session consumed, when it does not
+ * extend it: the session consumed some of its own events ahead of their
+ * writes, at positions they did not get, and another writer's events landed
+ * below them. Without a rebase, a log that is not a strict extension of what
+ * the session consumed sends it to a cold replay.
+ */
+export interface WorkflowSessionRebase {
+  /**
+   * The id each event the session consumed ahead of its write committed
+   * under, where the two differ.
+   */
+  readonly aliases: ReadonlyMap<string, string>;
+  /**
+   * Whether an event the session never consumed may still join it although
+   * it sits below events it did. It is fed after them, so this holds only
+   * for an event whose position before the next consumer cannot change what
+   * the workflow decides (see `runtime/out-of-band-observation.ts`).
+   */
+  admitBelow(event: Event): boolean;
+}
+
+/** A finished execution attempt: the workflow's output or a live boundary. */
+export type WorkflowResult =
+  | {
+      readonly type: 'completed';
+      readonly output: unknown;
+      /** `typeof` the raw return value, for telemetry. */
+      readonly resultType: string;
+    }
+  | {
+      readonly type: 'suspended';
+      readonly suspension: WorkflowSuspension;
+      readonly session: WorkflowSession;
+      /**
+       * Events the replay walked past unclaimed and is still holding, if any.
+       * Ordinary on a suspension, and only actionable across a run's
+       * suspensions, so it is reported for telemetry rather than acted on here.
+       */
+      readonly parked?: Readonly<ParkedSummary>;
+    };
+
+/**
+ * `resume` can additionally decline: `{ type: 'replay' }` means "this
+ * session is unusable, cold-replay instead". A fresh replay never declines.
+ */
+export type WorkflowResumeResult = WorkflowResult | { readonly type: 'replay' };
+
+/** The session's private state machine. */
+type WorkflowSessionState =
+  | {
+      readonly type: 'running';
+      readonly interruption: PromiseWithResolvers<never>;
+    }
+  | { readonly type: 'suspended'; readonly suspension: WorkflowSuspension }
+  | { readonly type: 'replay' }
+  | { readonly type: 'completed' };
+
+/** Cold-start: build a fresh VM session and replay it over `events`. */
+export function replayWorkflow(
+  options: WorkflowSessionOptions
+): Promise<WorkflowResult> {
+  return traceExecution(
+    'replay',
+    options.workflowRun,
+    options.events,
+    async (span) => {
+      const { session, execution } = await createWorkflowSession(options);
+      span?.setAttributes({
+        ...Attribute.WorkflowArgumentsCount(session.argumentCount),
+      });
+      return recordResult(await execution, span);
+    }
+  );
+}
+
+/** Warm-start: advance a retained session by appending events. */
+export function resumeWorkflow(
+  session: WorkflowSession,
+  events: Event[],
+  rebase?: WorkflowSessionRebase
+): Promise<WorkflowResumeResult> {
+  return traceExecution(
+    'retained',
+    session.workflowRun,
+    events,
+    async (span) => {
+      span?.setAttributes({
+        ...Attribute.WorkflowArgumentsCount(session.argumentCount),
+      });
+      const result = await session.resume(events, rebase);
+      return result.type === 'replay' ? result : recordResult(result, span);
+    }
+  );
+}
+
+function traceExecution<T>(
+  mode: 'replay' | 'retained',
+  workflowRun: WorkflowRun,
+  events: Event[],
+  fn: (span: Span | undefined) => Promise<T>
+): Promise<T> {
+  return trace(`workflow.run ${workflowRun.workflowName}`, (span) => {
     span?.setAttributes({
       ...Attribute.WorkflowName(workflowRun.workflowName),
       ...Attribute.WorkflowRunId(workflowRun.runId),
       ...Attribute.WorkflowRunStatus(workflowRun.status),
       ...Attribute.WorkflowEventsCount(events.length),
+      ...Attribute.WorkflowExecutionMode(mode),
     });
+    return fn(span);
+  });
+}
 
-    const startedAt = workflowRun.startedAt;
-    if (!startedAt) {
-      throw new Error(
-        `Workflow run "${workflowRun.runId}" has no "startedAt" timestamp (should not happen)`
+function recordResult(
+  result: WorkflowResult,
+  span: Span | undefined
+): WorkflowResult {
+  if (result.type === 'completed') {
+    span?.setAttributes({
+      ...Attribute.WorkflowResultType(result.resultType),
+    });
+  } else if (span) {
+    applyWorkflowSuspensionToSpan(result.suspension, span);
+    // Events this pass walked past unclaimed and is still holding. Ordinary on
+    // a suspension: an out-of-band delivery that landed ahead of the code that
+    // reads it waits for the pass that reaches that code, and failing here
+    // would fail exactly the runs that tolerance exists for. The case that is
+    // not ordinary (the same event still held pass after pass) is a shape
+    // across these spans, which is why the eventId is on each one and no pass
+    // tries to rule on it alone.
+    if (result.parked?.eventId !== undefined) {
+      span.setAttributes({
+        ...Attribute.WorkflowParkedEventsCount(result.parked.count),
+        ...Attribute.WorkflowParkedEventId(result.parked.eventId),
+        ...(result.parked.eventType !== undefined
+          ? Attribute.WorkflowParkedEventType(result.parked.eventType)
+          : {}),
+      });
+    }
+    // Payloads resumed into the start Hook that the body has not opened (yet,
+    // or ever: the token may be only an idempotency key). Not a stuck bet.
+    if (result.parked?.unclaimedStartHook !== undefined) {
+      span.setAttributes({
+        ...Attribute.WorkflowParkedStartHookEventsCount(
+          result.parked.unclaimedStartHook
+        ),
+      });
+    }
+  }
+  return result;
+}
+
+/**
+ * Single-shot replay: execute the workflow over `events` and either return
+ * its output or throw its suspension. Kept for the extensive existing test
+ * suites; production code goes through `replayWorkflow`/`resumeWorkflow`.
+ */
+export async function runWorkflow(
+  workflowCode: string,
+  workflowRun: WorkflowRun,
+  events: Event[],
+  encryptionKey: PayloadKey | undefined,
+  /**
+   * Optional per-run cache for replay payload preparation and immutable final
+   * values. Owned by the inline execution loop for this invocation.
+   */
+  replayPayloadCache: ReplayPayloadCache = new ReplayPayloadCache(
+    encryptionKey
+  ),
+  /** Records the end-of-run drain. */
+  drainPendingQueue?: PendingQueueDrain,
+  /**
+   * Features supported by the World executing this workflow. Missing
+   * capabilities are treated as unsupported.
+   */
+  worldCapabilities?: WorldCapabilities,
+  /** The run's start Hook, if it was started with one. */
+  startHook?: RunStartHook
+): Promise<Uint8Array | unknown> {
+  const result = await replayWorkflow({
+    workflowCode,
+    workflowRun,
+    events,
+    encryptionKey,
+    replayPayloadCache,
+    drainPendingQueue,
+    worldCapabilities,
+    ...(startHook ? { startHook } : {}),
+  });
+  if (result.type === 'suspended') throw result.suspension;
+  return result.output;
+}
+
+async function createWorkflowSession(options: WorkflowSessionOptions) {
+  const vmTrace = await startTraceSpan('workflow.vm.create_context');
+  return createWorkflowSessionInner(options, vmTrace.end).catch((error) => {
+    vmTrace.fail(error);
+    throw error;
+  });
+}
+
+async function createWorkflowSessionInner(
+  {
+    workflowCode,
+    workflowRun,
+    events,
+    encryptionKey,
+    replayPayloadCache,
+    compiledWorkflowScripts,
+    drainPendingQueue,
+    worldCapabilities,
+    startHook,
+  }: WorkflowSessionOptions,
+  endVmTrace: () => void
+): Promise<{
+  session: WorkflowSession;
+  execution: Promise<WorkflowResult>;
+}> {
+  const startedAt = workflowRun.startedAt;
+  if (!startedAt) {
+    throw new WorkflowRuntimeError(
+      `Workflow run "${workflowRun.runId}" has no "startedAt" timestamp (should not happen)`
+    );
+  }
+
+  // Seed and initial clock must be available before I/O and remain stable on
+  // replay. The clock then advances as deliveries reach the workflow (see
+  // `advanceClock` below).
+  const fixedTimestamp =
+    runIdCreatedAt(workflowRun.runId) ?? +workflowRun.createdAt;
+
+  // Truthiness, not presence: `vercel env pull` writes `VERCEL_URL=""` into
+  // `.env.local`, and a framework that loads that file locally would otherwise
+  // put us on the Vercel branch with nothing to build a host from, making
+  // `https://` the base URL of every run.
+  const isVercel = Boolean(process.env.VERCEL_URL);
+  // Load getPort lazily to prevent Turbopack from tracing get-port's
+  // fs ops (readdir, readFile) into the flow route bundle. The resolved
+  // port is cached per process (see get-port-lazy.ts), so this is cheap
+  // on replays after the first.
+  const workflowBaseUrl = createWorkflowBaseUrl(
+    isVercel
+      ? `https://${process.env.VERCEL_URL}`
+      : `http://localhost:${(await getPortLazy()) ?? 3000}`
+  );
+  // Include both node:vm's context creation and the host-side sandbox wiring
+  // below. Most of the bootstrap lives in this function (EventsConsumer,
+  // workflow globals, Web API shims), so tracing createContext() alone would
+  // materially under-report VM startup.
+  const {
+    context,
+    globalThis: vmGlobalThis,
+    updateTimestamp,
+  } = createContext({
+    seed: `${workflowRun.runId}:${workflowRun.workflowName}:${workflowRun.deploymentId}`,
+    fixedTimestamp,
+  });
+
+  // Each replay rebuilds frozen state versions from the log it reads, and
+  // inline steps resolve their inputs against the same context.
+  replayPayloadCache.stateContext = new StateContext();
+  bindStateContext(vmGlobalThis, replayPayloadCache.stateContext);
+
+  const initialInterruption = withResolvers<never>();
+  let state: WorkflowSessionState = {
+    type: 'running',
+    interruption: initialInterruption,
+  };
+
+  const onWorkflowError = (error: Error): void => {
+    switch (state.type) {
+      case 'running': {
+        const { interruption } = state;
+        state = WorkflowSuspension.is(error)
+          ? { type: 'suspended', suspension: error }
+          : { type: 'replay' };
+        // Step, hook, wait, and attribute consumers can schedule the same
+        // suspension. The first signal advances the generation so the rest
+        // no-op.
+        workflowContext.suspensionGeneration++;
+        interruption.reject(error);
+        return;
+      }
+      case 'suspended':
+        // Same-boundary duplicates were staled by the generation bump above,
+        // so anything landing here is out-of-band or a divergence. Fall back
+        // to replay rather than resuming a potentially inconsistent session.
+        state = { type: 'replay' };
+        return;
+      case 'replay':
+      case 'completed':
+        return;
+    }
+    state satisfies never;
+  };
+
+  const ulid = monotonicFactory(() => vmGlobalThis.Math.random());
+  // Correlation IDs must be replay-stable. `startedAt` differs between a turbo
+  // delivery and a later server-backed replay, so use fixedTimestamp.
+  // The draw counter is the progress metric for `quiesceEarlierCascades`
+  // (log-order draws): a quiet turn is one that drew nothing. It
+  // counts EVERY draw from this sequence. This same function is installed as
+  // the `STABLE_ULID` global below, which serialization draws stream ids
+  // from during dehydration. This is deliberate because quiescence must also
+  // wait out serialization-driven draws, and counting extra draws only extends
+  // the wait (see the termination note on `quiesceEarlierCascades`).
+  let mintCount = 0;
+  const generateUlid = () => {
+    mintCount += 1;
+    return ulid(fixedTimestamp);
+  };
+  const generateNanoid = createSeededNanoid(() => vmGlobalThis.Math.random());
+
+  // Create a mutable holder for the promise queue so the EventsConsumer
+  // can access the current queue state via a getter. The queue is mutated
+  // by step/hook/sleep callbacks as events are processed.
+  const promiseQueueHolder = { current: Promise.resolve() };
+
+  // Same reason as the queue holder: the consumer is built before the context
+  // whose delivery state it has to read. Idle until the context exists, which
+  // is before any delivery can be registered against it.
+  const deliveryIdleHolder = { current: (): boolean => true };
+
+  // The VM clock only ever moves forward, and it moves when a branch-deciding
+  // delivery (a step result, a hook payload, a wait completion, an abort, a
+  // hook's registration outcome) is handed to the workflow, not when the
+  // consumer walk reads an event. See `WorkflowOrchestratorContext.advanceClock` for
+  // why consumption is the wrong anchor: the walk runs ahead of delivery, so
+  // a later event's time would leak into an earlier delivery's cascade and
+  // `Date.now()` would depend on how much log this replay loaded. Deliveries
+  // reach the workflow in log order (the barrier registry), so the clock a
+  // cascade observes is a function of the log prefix alone.
+  let clock = fixedTimestamp;
+  const advanceClock = (at: number) => {
+    if (at > clock) {
+      clock = at;
+      updateTimestamp(at);
+    }
+  };
+
+  const eventsConsumer = new EventsConsumer(events, {
+    onUnconsumedEvent: (event) => {
+      // `workflowContext` is assigned below, before any event can be offered,
+      // so it is always populated by the time this fires. The appended detail
+      // names the pending invocation that holds this event's ordinal (the
+      // usual reason nobody can consume it) and where the walk stands.
+      onWorkflowError(
+        new ReplayDivergenceError(
+          `Replay could not consume event: eventType=${event.eventType}, correlationId=${event.correlationId}, eventId=${event.eventId}. ${describeDivergenceContext(event, workflowContext.invocationsQueue, eventsConsumer)}`,
+          { eventId: event.eventId }
+        )
       );
+    },
+    // Both branches log at `debug`, so neither reaches the console unless
+    // `DEBUG` matches. A duplicate is a permanent feature of the log: every
+    // later replay re-reads it and lands here again, so anything the logger
+    // prints unconditionally would print once per replay for the life of the
+    // run. There is also nothing to act on. Ignoring the event is the correct
+    // outcome, not a degraded one, and no user change makes the straggler go
+    // away. What the levels are for is diagnosis after the fact, which is
+    // exactly what `DEBUG=workflow:runtime:debug` is for.
+    onDuplicateEvent: (event, firstEventType) => {
+      const details = {
+        workflowRunId: workflowRun.runId,
+        eventId: event.eventId,
+        eventType: event.eventType,
+        firstEventType,
+        correlationId: event.correlationId,
+      };
+      if (
+        firstEventType !== event.eventType &&
+        entityEventClass(firstEventType) === entityEventClass(event.eventType)
+      ) {
+        // Two writers reached opposite conclusions about one entity: a
+        // `step_failed` behind a `step_completed`, or the reverse. Ignoring it
+        // is still correct and still deterministic (replay reads the first one
+        // at the same position every time), but unlike a re-commit of the same
+        // outcome there is no reading of this where both writers were right,
+        // so the discarded outcome gets its own message.
+        runtimeLogger.debug(
+          'Ignoring inert event that decides an already-decided outcome differently',
+          details
+        );
+        return;
+      }
+      if (firstEventType !== event.eventType) {
+        // `firstEventType` is the entity's terminal event: the entity closed
+        // before this event, so nothing was left to consume it (a step
+        // invocation that stalled past its lease writing a start after the
+        // step's outcome, or a payload committed behind a hook's disposal).
+        runtimeLogger.debug(
+          'Ignoring inert event for an entity whose terminal event is already in the event log',
+          details
+        );
+        return;
+      }
+      // The first event of this class decided the outcome at a lower log
+      // position and replay reads that one. Recorded because a straggler is
+      // still evidence of two replays writing for the same entity, which is
+      // worth seeing when diagnosing a run.
+      runtimeLogger.debug(
+        'Ignoring inert event that repeats a class already in the event log',
+        details
+      );
+    },
+    getPromiseQueue: () => promiseQueueHolder.current,
+    isDeliveryIdle: () => deliveryIdleHolder.current(),
+    // Payloads resumed into the start Hook before the body calls
+    // `createHook` (from the run's admission on, even before `run_started`)
+    // park at once rather than after the deferred check.
+    ...(startHook ? { eagerParkCorrelationId: startHook.hookId } : {}),
+  });
+
+  const workflowContext: WorkflowOrchestratorContext = {
+    runId: workflowRun.runId,
+    encryptionKey,
+    worldCapabilities,
+    ...(startHook
+      ? {
+          startHook: {
+            token: startHook.token,
+            hookId: startHook.hookId,
+            tokenRetentionUntil: startHook.tokenRetentionUntil,
+            bound: false,
+          },
+        }
+      : {}),
+    globalThis: vmGlobalThis,
+    onWorkflowError,
+    eventsConsumer,
+    generateUlid,
+    generateNanoid,
+    get mintCount() {
+      return mintCount;
+    },
+    invocationsQueue: new Map(),
+    // Use getter/setter so the EventsConsumer's getPromiseQueue() always
+    // sees the latest queue state as it's mutated by step/hook/sleep callbacks.
+    get promiseQueue() {
+      return promiseQueueHolder.current;
+    },
+    set promiseQueue(value: Promise<void>) {
+      promiseQueueHolder.current = value;
+    },
+    pendingDeliveries: 0,
+    suspensionGeneration: 0,
+    pendingDeliveryBarriers: new Map(),
+    hookPayloadAwaiters: new Map(),
+    advanceClock,
+    replayPayloadCache,
+  };
+
+  deliveryIdleHolder.current = () => isDeliveryIdle(workflowContext);
+
+  // Consume run lifecycle events - these are structural events that don't
+  // need special handling in the workflow, but must be consumed to advance
+  // past them in the event log
+  let consumedRunStarted = false;
+  workflowContext.eventsConsumer.subscribe((event) => {
+    if (!event) {
+      return EventConsumerResult.NotConsumed;
     }
 
-    const {
-      context,
-      globalThis: vmGlobalThis,
-      updateTimestamp,
-    } = createContext({
-      seed: workflowRun.runId,
-      fixedTimestamp: +startedAt,
-    });
+    // Consume run_created - every run has exactly one
+    if (event.eventType === 'run_created') {
+      return EventConsumerResult.Consumed;
+    }
 
-    const workflowDiscontinuation = withResolvers<void>();
-
-    const ulid = monotonicFactory(() => vmGlobalThis.Math.random());
-    const generateNanoid = nanoid.customRandom(nanoid.urlAlphabet, 21, (size) =>
-      new Uint8Array(size).map(() => 256 * vmGlobalThis.Math.random())
-    );
-
-    const workflowContext: WorkflowOrchestratorContext = {
-      globalThis: vmGlobalThis,
-      onWorkflowError: workflowDiscontinuation.reject,
-      eventsConsumer: new EventsConsumer(events),
-      generateUlid: () => ulid(+startedAt),
-      generateNanoid,
-      invocationsQueue: [],
-    };
-
-    // Subscribe to the events log to update the timestamp in the vm context
-    workflowContext.eventsConsumer.subscribe((event) => {
-      const createdAt = event?.createdAt;
-      if (createdAt) {
-        updateTimestamp(+createdAt);
+    // Consume the first run_started. Two replays can each write one (the
+    // create is idempotent for a run already running, which makes the write
+    // safe, not single-shot); the first is the one the replay observes, and
+    // the consumer skips the rest rather than advancing the workflow clock
+    // twice.
+    if (event.eventType === 'run_started') {
+      if (consumedRunStarted) {
+        return EventConsumerResult.NotConsumed;
       }
-      // Never consume events - this is only a passive subscriber
-      return EventConsumerResult.NotConsumed;
+      consumedRunStarted = true;
+      return EventConsumerResult.Consumed;
+    }
+
+    // Attribute writes performed from a step have no workflow-body call to
+    // consume them during replay; they are already reflected in the run
+    // snapshot and remain structural until a read API is introduced.
+    if (
+      event.eventType === 'attr_set' &&
+      event.eventData.writer.type === 'step'
+    ) {
+      return EventConsumerResult.Consumed;
+    }
+
+    return EventConsumerResult.NotConsumed;
+  });
+
+  const useStep = createUseStep(workflowContext);
+  const createHook = createCreateHook(workflowContext);
+  const sleep = createSleep(workflowContext);
+  const setAttributes = createSetAttributes(workflowContext);
+
+  // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
+  vmGlobalThis[WORKFLOW_USE_STEP] = useStep;
+  // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
+  vmGlobalThis[WORKFLOW_SET_ATTRIBUTES] = setAttributes;
+  // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
+  vmGlobalThis[WORKFLOW_CREATE_HOOK] = createHook;
+  // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
+  vmGlobalThis[WORKFLOW_SLEEP] = sleep;
+  // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
+  vmGlobalThis[WORKFLOW_GET_STREAM_ID] = (namespace?: string) =>
+    getWorkflowRunStreamId(workflowRun.runId, namespace);
+
+  // For the workflow VM, we store the context in a symbol on the `globalThis` object
+  const ctx: WorkflowMetadata = {
+    workflowName: workflowRun.workflowName,
+    workflowRunId: workflowRun.runId,
+    workflowStartedAt: new vmGlobalThis.Date(+startedAt),
+    url: workflowBaseUrl,
+    features: { encryption: !!encryptionKey },
+  };
+
+  // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
+  vmGlobalThis[WORKFLOW_CONTEXT_SYMBOL] = ctx;
+  // Serialization mints stream ids through this symbol, and calls it with no
+  // seed time. `monotonicFactory` returns `encodeTime(lastTime)` on its
+  // increment branch, so one such call latches the *host* wall clock into
+  // `lastTime`, and every id the run mints afterwards carries that timestamp
+  // instead of `fixedTimestamp`, a value that differs on every replay. Binding
+  // the seed time here keeps the whole run on one replay-stable clock.
+  // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
+  vmGlobalThis[STABLE_ULID] = generateUlid;
+
+  // Workflow code must import the deterministic `fetch` step from `workflow`.
+  vmGlobalThis.fetch = () => {
+    throw new vmGlobalThis.Error(
+      `Global "fetch" is unavailable in workflow functions. Use the "fetch" step function from "workflow" to make HTTP requests.\n\nLearn more: https://workflow-sdk.dev/err/${ERROR_SLUGS.FETCH_IN_WORKFLOW_FUNCTION}`
+    );
+  };
+
+  // Override timeout/interval functions to throw helpful errors
+  // These are not supported in workflow functions because they rely on
+  // asynchronous scheduling which breaks deterministic replay
+  const timeoutErrorMessage =
+    'Timeout functions like "setTimeout" and "setInterval" are not supported in workflow functions. Use the "sleep" function from "workflow" for time-based delays.';
+
+  (vmGlobalThis as any).setTimeout = () => {
+    throw new WorkflowRuntimeError(timeoutErrorMessage, {
+      slug: ERROR_SLUGS.TIMEOUT_FUNCTIONS_IN_WORKFLOW,
     });
+  };
+  (vmGlobalThis as any).setInterval = () => {
+    throw new WorkflowRuntimeError(timeoutErrorMessage, {
+      slug: ERROR_SLUGS.TIMEOUT_FUNCTIONS_IN_WORKFLOW,
+    });
+  };
+  (vmGlobalThis as any).clearTimeout = () => {
+    throw new WorkflowRuntimeError(timeoutErrorMessage, {
+      slug: ERROR_SLUGS.TIMEOUT_FUNCTIONS_IN_WORKFLOW,
+    });
+  };
+  (vmGlobalThis as any).clearInterval = () => {
+    throw new WorkflowRuntimeError(timeoutErrorMessage, {
+      slug: ERROR_SLUGS.TIMEOUT_FUNCTIONS_IN_WORKFLOW,
+    });
+  };
+  (vmGlobalThis as any).setImmediate = () => {
+    throw new WorkflowRuntimeError(timeoutErrorMessage, {
+      slug: ERROR_SLUGS.TIMEOUT_FUNCTIONS_IN_WORKFLOW,
+    });
+  };
+  (vmGlobalThis as any).clearImmediate = () => {
+    throw new WorkflowRuntimeError(timeoutErrorMessage, {
+      slug: ERROR_SLUGS.TIMEOUT_FUNCTIONS_IN_WORKFLOW,
+    });
+  };
 
-    const useStep = createUseStep(workflowContext);
-    const createHook = createCreateHook(workflowContext);
+  // `AbortController` and `AbortSignal` in the workflow VM are hook-backed
+  // for deterministic replay. The controller's abort() queues a hook resumption,
+  // and signal.aborted is updated when the hook event is processed during replay.
+  (vmGlobalThis as any).AbortController =
+    createCreateAbortController(workflowContext);
+  const abortSignalStatics = createAbortSignalStatics();
+  (vmGlobalThis as any).AbortSignal = {
+    abort: abortSignalStatics.abort,
+    any: abortSignalStatics.any,
+    timeout: abortSignalStatics.timeout,
+  };
 
-    // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
-    vmGlobalThis[WORKFLOW_USE_STEP] = useStep;
-    // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
-    vmGlobalThis[WORKFLOW_CREATE_HOOK] = createHook;
-    // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
-    vmGlobalThis[WORKFLOW_GET_STREAM_ID] = (namespace?: string) =>
-      getWorkflowRunStreamId(workflowRun.runId, namespace);
+  // `Request` and `Response` are special built-in classes that invoke steps
+  // for the `json()`, `text()` and `arrayBuffer()` instance methods
+  class Request implements globalThis.Request {
+    cache!: globalThis.Request['cache'];
+    credentials!: globalThis.Request['credentials'];
+    destination!: globalThis.Request['destination'];
+    headers!: Headers;
+    integrity!: string;
+    method!: string;
+    mode!: globalThis.Request['mode'];
+    redirect!: globalThis.Request['redirect'];
+    referrer!: string;
+    referrerPolicy!: globalThis.Request['referrerPolicy'];
+    url!: string;
+    keepalive!: boolean;
+    signal!: AbortSignal;
+    duplex!: 'half';
+    body!: ReadableStream<any> | null;
 
-    // TODO: there should be a getUrl method on the world interface itself. This
-    // solution only works for vercel + embedded worlds.
-    const url = process.env.VERCEL_URL
-      ? `https://${process.env.VERCEL_URL}`
-      : `http://localhost:${process.env.PORT || 3000}`;
-
-    // For the workflow VM, we store the context in a symbol on the `globalThis` object
-    const ctx: WorkflowMetadata = {
-      workflowRunId: workflowRun.runId,
-      workflowStartedAt: new vmGlobalThis.Date(+startedAt),
-      url,
-    };
-
-    // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
-    vmGlobalThis[WORKFLOW_CONTEXT_SYMBOL] = ctx;
-
-    // NOTE: Will have a config override to use the custom fetch step.
-    //       For now `fetch` must be explicitly imported from `workflow`.
-    vmGlobalThis.fetch = () => {
-      throw new vmGlobalThis.Error(
-        `Global "fetch" is unavailable in workflow functions. Use the "fetch" step function from "workflow" to make HTTP requests.\n\nLearn more: https://useworkflow.dev/err/${ERROR_SLUGS.FETCH_IN_WORKFLOW_FUNCTION}`
-      );
-    };
-
-    // `Request` and `Response` are special built-in classes that invoke steps
-    // for the `json()`, `text()` and `arrayBuffer()` instance methods
-    class Request implements globalThis.Request {
-      cache!: globalThis.Request['cache'];
-      credentials!: globalThis.Request['credentials'];
-      destination!: globalThis.Request['destination'];
-      headers!: Headers;
-      integrity!: string;
-      method!: string;
-      mode!: globalThis.Request['mode'];
-      redirect!: globalThis.Request['redirect'];
-      referrer!: string;
-      referrerPolicy!: globalThis.Request['referrerPolicy'];
-      url!: string;
-      keepalive!: boolean;
-      signal!: AbortSignal;
-      duplex!: 'half';
-      body!: ReadableStream<any> | null;
-
-      constructor(input: any, init?: RequestInit) {
-        // Handle URL input
-        if (typeof input === 'string' || input instanceof vmGlobalThis.URL) {
-          const urlString = String(input);
-          // Validate URL format
-          try {
-            new vmGlobalThis.URL(urlString);
-            this.url = urlString;
-          } catch (cause) {
-            throw new TypeError(`Failed to parse URL from ${urlString}`, {
-              cause,
-            });
-          }
-        } else {
-          // Input is a Request object - clone its properties
-          this.url = input.url;
-          if (!init) {
-            this.method = input.method;
-            this.headers = new vmGlobalThis.Headers(input.headers);
-            this.body = input.body;
-            this.mode = input.mode;
-            this.credentials = input.credentials;
-            this.cache = input.cache;
-            this.redirect = input.redirect;
-            this.referrer = input.referrer;
-            this.referrerPolicy = input.referrerPolicy;
-            this.integrity = input.integrity;
-            this.keepalive = input.keepalive;
-            this.signal = input.signal;
-            this.duplex = input.duplex;
-            this.destination = input.destination;
-            return;
-          }
-          // If init is provided, merge: use source properties, then override with init
-          // Copy all properties from the source Request first
+    constructor(input: any, init?: RequestInit) {
+      // Handle URL input
+      if (typeof input === 'string' || input instanceof vmGlobalThis.URL) {
+        const urlString = String(input);
+        // Validate URL format
+        try {
+          new vmGlobalThis.URL(urlString);
+          this.url = urlString;
+        } catch (cause) {
+          throw new TypeError(`Failed to parse URL from ${urlString}`, {
+            cause,
+          });
+        }
+      } else {
+        // Input is a Request object - clone its properties
+        this.url = input.url;
+        if (!init) {
           this.method = input.method;
           this.headers = new vmGlobalThis.Headers(input.headers);
           this.body = input.body;
@@ -183,385 +856,635 @@ export async function runWorkflow(
           this.signal = input.signal;
           this.duplex = input.duplex;
           this.destination = input.destination;
+          return;
         }
-
-        // Override with init options if provided
-        // Set method
-        if (init?.method) {
-          this.method = init.method.toUpperCase();
-        } else if (typeof this.method !== 'string') {
-          // Fallback to default for string input case
-          this.method = 'GET';
-        }
-
-        // Set headers
-        if (init?.headers) {
-          this.headers = new vmGlobalThis.Headers(init.headers);
-        } else if (
-          typeof input === 'string' ||
-          input instanceof vmGlobalThis.URL
-        ) {
-          // For string/URL input, create empty headers
-          this.headers = new vmGlobalThis.Headers();
-        }
-
-        // Set other properties with init values or defaults
-        if (init?.mode !== undefined) {
-          this.mode = init.mode;
-        } else if (typeof this.mode !== 'string') {
-          this.mode = 'cors';
-        }
-
-        if (init?.credentials !== undefined) {
-          this.credentials = init.credentials;
-        } else if (typeof this.credentials !== 'string') {
-          this.credentials = 'same-origin';
-        }
-
-        if (init?.cache !== undefined) {
-          this.cache = init.cache;
-        } else if (typeof this.cache !== 'string') {
-          this.cache = 'default';
-        }
-
-        if (init?.redirect !== undefined) {
-          this.redirect = init.redirect;
-        } else if (typeof this.redirect !== 'string') {
-          this.redirect = 'follow';
-        }
-
-        if (init?.referrer !== undefined) {
-          this.referrer = init.referrer;
-        } else if (typeof this.referrer !== 'string') {
-          this.referrer = 'about:client';
-        }
-
-        if (init?.referrerPolicy !== undefined) {
-          this.referrerPolicy = init.referrerPolicy;
-        } else if (typeof this.referrerPolicy !== 'string') {
-          this.referrerPolicy = '';
-        }
-
-        if (init?.integrity !== undefined) {
-          this.integrity = init.integrity;
-        } else if (typeof this.integrity !== 'string') {
-          this.integrity = '';
-        }
-
-        if (init?.keepalive !== undefined) {
-          this.keepalive = init.keepalive;
-        } else if (typeof this.keepalive !== 'boolean') {
-          this.keepalive = false;
-        }
-
-        if (init?.signal !== undefined) {
-          // @ts-expect-error - AbortSignal stub
-          this.signal = init.signal;
-        } else if (!this.signal) {
-          // @ts-expect-error - AbortSignal stub
-          this.signal = { aborted: false };
-        }
-
-        if (!this.duplex) {
-          this.duplex = 'half';
-        }
-
-        if (!this.destination) {
-          this.destination = 'document';
-        }
-
-        const body = init?.body;
-
-        // Validate that GET/HEAD methods don't have a body
-        if (
-          body !== null &&
-          body !== undefined &&
-          (this.method === 'GET' || this.method === 'HEAD')
-        ) {
-          throw new TypeError(`Request with GET/HEAD method cannot have body.`);
-        }
-
-        // Store the original BodyInit for serialization
-        if (body !== null && body !== undefined) {
-          // Create a "fake" ReadableStream that stores the original body
-          // This avoids doing async work during workflow replay
-          this.body = Object.create(vmGlobalThis.ReadableStream.prototype, {
-            [BODY_INIT_SYMBOL]: {
-              value: body,
-              writable: false,
-            },
-          });
-        } else {
-          this.body = null;
-        }
+        // If init is provided, merge: use source properties, then override with init
+        // Copy all properties from the source Request first
+        this.method = input.method;
+        this.headers = new vmGlobalThis.Headers(input.headers);
+        this.body = input.body;
+        this.mode = input.mode;
+        this.credentials = input.credentials;
+        this.cache = input.cache;
+        this.redirect = input.redirect;
+        this.referrer = input.referrer;
+        this.referrerPolicy = input.referrerPolicy;
+        this.integrity = input.integrity;
+        this.keepalive = input.keepalive;
+        this.signal = input.signal;
+        this.duplex = input.duplex;
+        this.destination = input.destination;
       }
 
-      clone(): Request {
-        ENOTSUP();
+      // Override with init options if provided
+      // Set method
+      if (init?.method) {
+        this.method = init.method.toUpperCase();
+      } else if (typeof this.method !== 'string') {
+        // Fallback to default for string input case
+        this.method = 'GET';
       }
 
-      get bodyUsed() {
-        return false;
+      // Set headers
+      if (init?.headers) {
+        this.headers = new vmGlobalThis.Headers(init.headers);
+      } else if (
+        typeof input === 'string' ||
+        input instanceof vmGlobalThis.URL
+      ) {
+        // For string/URL input, create empty headers
+        this.headers = new vmGlobalThis.Headers();
       }
 
-      // TODO: implement these
-      blob!: () => Promise<Blob>;
-      formData!: () => Promise<FormData>;
-
-      async arrayBuffer() {
-        return resArrayBuffer(this);
+      // Set other properties with init values or defaults
+      if (init?.mode !== undefined) {
+        this.mode = init.mode;
+      } else if (typeof this.mode !== 'string') {
+        this.mode = 'cors';
       }
 
-      async bytes() {
-        return new Uint8Array(await resArrayBuffer(this));
+      if (init?.credentials !== undefined) {
+        this.credentials = init.credentials;
+      } else if (typeof this.credentials !== 'string') {
+        this.credentials = 'same-origin';
       }
 
-      async json() {
-        return resJson(this);
+      // `any` cast here because @types/node v22 does not yet have `cache`
+      if ((init as any)?.cache !== undefined) {
+        this.cache = (init as any).cache;
+      } else if (typeof this.cache !== 'string') {
+        this.cache = 'default';
       }
 
-      async text() {
-        return resText(this);
+      if (init?.redirect !== undefined) {
+        this.redirect = init.redirect;
+      } else if (typeof this.redirect !== 'string') {
+        this.redirect = 'follow';
+      }
+
+      if (init?.referrer !== undefined) {
+        this.referrer = init.referrer;
+      } else if (typeof this.referrer !== 'string') {
+        this.referrer = 'about:client';
+      }
+
+      if (init?.referrerPolicy !== undefined) {
+        this.referrerPolicy = init.referrerPolicy;
+      } else if (typeof this.referrerPolicy !== 'string') {
+        this.referrerPolicy = '';
+      }
+
+      if (init?.integrity !== undefined) {
+        this.integrity = init.integrity;
+      } else if (typeof this.integrity !== 'string') {
+        this.integrity = '';
+      }
+
+      if (init?.keepalive !== undefined) {
+        this.keepalive = init.keepalive;
+      } else if (typeof this.keepalive !== 'boolean') {
+        this.keepalive = false;
+      }
+
+      if (init?.signal !== undefined) {
+        // @ts-expect-error - AbortSignal stub
+        this.signal = init.signal;
+      } else if (!this.signal) {
+        // @ts-expect-error - AbortSignal stub
+        this.signal = { aborted: false };
+      }
+
+      if (!this.duplex) {
+        this.duplex = 'half';
+      }
+
+      if (!this.destination) {
+        this.destination = 'document';
+      }
+
+      const body = init?.body;
+
+      // Validate that GET/HEAD methods don't have a body
+      if (
+        body !== null &&
+        body !== undefined &&
+        (this.method === 'GET' || this.method === 'HEAD')
+      ) {
+        throw new TypeError(`Request with GET/HEAD method cannot have body.`);
+      }
+
+      // Store the original BodyInit for serialization
+      if (body !== null && body !== undefined) {
+        // Create a "fake" ReadableStream that stores the original body
+        // This avoids doing async work during workflow replay
+        this.body = Object.create(vmGlobalThis.ReadableStream.prototype, {
+          [BODY_INIT_SYMBOL]: {
+            value: body,
+            writable: false,
+          },
+        });
+      } else {
+        this.body = null;
       }
     }
-    vmGlobalThis.Request = Request;
 
-    const resJson = useStep<[any], any>('__builtin_response_json');
-    const resText = useStep<[any], string>('__builtin_response_text');
-    const resArrayBuffer = useStep<[any], ArrayBuffer>(
-      '__builtin_response_array_buffer'
+    clone(): Request {
+      ENOTSUP();
+    }
+
+    get bodyUsed() {
+      return false;
+    }
+
+    // TODO: implement these
+    blob!: () => Promise<Blob>;
+    formData!: () => Promise<FormData>;
+
+    arrayBuffer!: () => Promise<ArrayBuffer>;
+    json!: () => Promise<any>;
+    text!: () => Promise<string>;
+
+    async bytes() {
+      return new Uint8Array(await this.arrayBuffer());
+    }
+  }
+  vmGlobalThis.Request = Request;
+
+  Object.defineProperties(Request.prototype, {
+    arrayBuffer: {
+      value: useStep<[], ArrayBuffer>('__builtin_response_array_buffer'),
+      writable: true,
+      configurable: true,
+    },
+    json: {
+      value: useStep<[], any>('__builtin_response_json'),
+      writable: true,
+      configurable: true,
+    },
+    text: {
+      value: useStep<[], string>('__builtin_response_text'),
+      writable: true,
+      configurable: true,
+    },
+  });
+
+  class Response implements globalThis.Response {
+    type!: globalThis.Response['type'];
+    url!: string;
+    status!: number;
+    statusText!: string;
+    body!: ReadableStream<Uint8Array> | null;
+    headers!: Headers;
+    redirected!: boolean;
+
+    constructor(body?: any, init?: ResponseInit) {
+      this.status = init?.status ?? 200;
+      this.statusText = init?.statusText ?? '';
+      this.headers = new vmGlobalThis.Headers(init?.headers);
+      this.type = 'default';
+      this.url = '';
+      this.redirected = false;
+
+      // Validate that null-body status codes don't have a body
+      // Per HTTP spec: 204 (No Content), 205 (Reset Content), and 304 (Not Modified)
+      if (
+        body !== null &&
+        body !== undefined &&
+        (this.status === 204 || this.status === 205 || this.status === 304)
+      ) {
+        throw new TypeError(
+          `Response constructor: Invalid response status code ${this.status}`
+        );
+      }
+
+      // Store the original BodyInit for serialization
+      if (body !== null && body !== undefined) {
+        // Create a "fake" ReadableStream that stores the original body
+        // This avoids doing async work during workflow replay
+        this.body = Object.create(vmGlobalThis.ReadableStream.prototype, {
+          [BODY_INIT_SYMBOL]: {
+            value: body,
+            writable: false,
+          },
+        });
+      } else {
+        this.body = null;
+      }
+    }
+
+    // TODO: implement these
+    clone!: () => Response;
+    blob!: () => Promise<globalThis.Blob>;
+    formData!: () => Promise<globalThis.FormData>;
+
+    get ok() {
+      return this.status >= 200 && this.status < 300;
+    }
+
+    get bodyUsed() {
+      return false;
+    }
+
+    arrayBuffer!: () => Promise<ArrayBuffer>;
+    json!: () => Promise<any>;
+    text!: () => Promise<string>;
+
+    async bytes() {
+      return new Uint8Array(await this.arrayBuffer());
+    }
+
+    static json(data: any, init?: ResponseInit): Response {
+      const body = JSON.stringify(data);
+      const headers = new vmGlobalThis.Headers(init?.headers);
+      if (!headers.has('content-type')) {
+        headers.set('content-type', 'application/json');
+      }
+      return new Response(body, { ...init, headers });
+    }
+
+    static error(): Response {
+      ENOTSUP();
+    }
+
+    static redirect(url: string | URL, status: number = 302): Response {
+      // Validate status code - only specific redirect codes are allowed
+      if (![301, 302, 303, 307, 308].includes(status)) {
+        throw new RangeError(
+          `Invalid redirect status code: ${status}. Must be one of: 301, 302, 303, 307, 308`
+        );
+      }
+
+      // Create response with Location header
+      const headers = new vmGlobalThis.Headers();
+      headers.set('Location', String(url));
+
+      const response = Object.create(Response.prototype);
+      response.status = status;
+      response.statusText = '';
+      response.headers = headers;
+      response.body = null;
+      response.type = 'default';
+      response.url = '';
+      response.redirected = false;
+
+      return response;
+    }
+  }
+  vmGlobalThis.Response = Response;
+
+  Object.defineProperties(Response.prototype, {
+    arrayBuffer: {
+      value: useStep<[], ArrayBuffer>('__builtin_response_array_buffer'),
+      writable: true,
+      configurable: true,
+    },
+    json: {
+      value: useStep<[], any>('__builtin_response_json'),
+      writable: true,
+      configurable: true,
+    },
+    text: {
+      value: useStep<[], string>('__builtin_response_text'),
+      writable: true,
+      configurable: true,
+    },
+  });
+
+  class ReadableStream<T> implements globalThis.ReadableStream<T> {
+    constructor() {
+      ENOTSUP();
+    }
+
+    get locked() {
+      return false;
+    }
+
+    cancel(): any {
+      ENOTSUP();
+    }
+
+    getReader(): any {
+      ENOTSUP();
+    }
+
+    pipeThrough(): any {
+      ENOTSUP();
+    }
+
+    pipeTo(): any {
+      ENOTSUP();
+    }
+
+    tee(): any {
+      ENOTSUP();
+    }
+
+    values(): any {
+      ENOTSUP();
+    }
+
+    static from(): any {
+      ENOTSUP();
+    }
+
+    [Symbol.asyncIterator](): any {
+      ENOTSUP();
+    }
+  }
+  vmGlobalThis.ReadableStream = ReadableStream;
+
+  class WritableStream<T> implements globalThis.WritableStream<T> {
+    constructor() {
+      ENOTSUP();
+    }
+
+    get locked() {
+      return false;
+    }
+
+    abort(): any {
+      ENOTSUP();
+    }
+
+    close(): any {
+      ENOTSUP();
+    }
+
+    getWriter(): any {
+      ENOTSUP();
+    }
+  }
+  vmGlobalThis.WritableStream = WritableStream;
+
+  class TransformStream<I, O> implements globalThis.TransformStream<I, O> {
+    readable: globalThis.ReadableStream<O>;
+    writable: globalThis.WritableStream<I>;
+
+    constructor() {
+      ENOTSUP();
+    }
+  }
+  vmGlobalThis.TransformStream = TransformStream;
+
+  vmGlobalThis.console = globalThis.console;
+
+  // Expose the request-context symbol required by AI Gateway.
+  const SYMBOL_FOR_REQ_CONTEXT = Symbol.for('@vercel/request-context');
+  // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
+  vmGlobalThis[SYMBOL_FOR_REQ_CONTEXT] = (globalThis as any)[
+    SYMBOL_FOR_REQ_CONTEXT
+  ];
+  endVmTrace();
+
+  // Reuse compiled scripts by `(code, filename)`: compilation is deterministic
+  // and the filename preserves workflow source attribution in stack traces.
+  // The bundle registers workflows on `globalThis.__private_workflows`.
+  const { bundleScript, workflowLookupScript } =
+    compiledWorkflowScripts ??
+    (await compileWorkflowBundle(workflowCode, workflowRun.workflowName));
+  const workflowFn = await trace('workflow.bundle.evaluate', async () => {
+    bundleScript.runInContext(context);
+    return workflowLookupScript.runInContext(context);
+  });
+
+  if (typeof workflowFn !== 'function') {
+    throw new WorkflowNotRegisteredError(workflowRun.workflowName);
+  }
+
+  // Chain workflow argument hydration onto the promiseQueue so that the
+  // unconsumed event check (which waits for the queue to drain) doesn't
+  // fire during the async gap between run_started consumption and the
+  // workflow function subscribing its first step callbacks.
+  let args: unknown[] = [];
+  workflowContext.promiseQueue = workflowContext.promiseQueue.then(async () => {
+    // Include any residual payload preparation plus VM-local deserialization
+    // in the blocking boundary.
+    args = await trace('workflow.input.hydrate', async () => {
+      const prepared =
+        await replayPayloadCache.prepareWorkflowInput(workflowRun);
+      const hydrated = await hydrateWorkflowArguments(
+        workflowRun.input,
+        workflowRun.runId,
+        encryptionKey,
+        vmGlobalThis,
+        {},
+        prepared
+      );
+      // Later state changes may refer to the input's strings.
+      registerStateSource(vmGlobalThis, stateSourceId('run-input'), hydrated);
+      return hydrated;
+    });
+  });
+  await workflowContext.promiseQueue;
+
+  const failWorkflow = async (error: unknown): Promise<never> => {
+    // Control-flow signals are handled by the runtime and do not mean the
+    // workflow has terminally failed. `onWorkflowError` usually already moved
+    // the state machine, but a divergence can also arrive via a step
+    // promise's direct rejection (bypassing `onWorkflowError`); demote so
+    // every control-flow path converges on `replay` and a later resume falls
+    // back instead of throwing.
+    if (WorkflowSuspension.is(error) || ReplayDivergenceError.is(error)) {
+      if (state.type === 'running') state = { type: 'replay' };
+      throw error;
+    }
+    state = { type: 'completed' };
+
+    await drainPendingQueueItems(
+      workflowRun.runId,
+      workflowContext.invocationsQueue,
+      vmGlobalThis,
+      workflowRun,
+      'failed',
+      drainPendingQueue
     );
-    class Response implements globalThis.Response {
-      type!: globalThis.Response['type'];
-      url!: string;
-      status!: number;
-      statusText!: string;
-      body!: ReadableStream<Uint8Array> | null;
-      headers!: Headers;
-      redirected!: boolean;
 
-      constructor(body?: any, init?: ResponseInit) {
-        this.status = init?.status ?? 200;
-        this.statusText = init?.statusText ?? '';
-        this.headers = new vmGlobalThis.Headers(init?.headers);
-        this.type = 'default';
-        this.url = '';
-        this.redirected = false;
+    throw error;
+  };
 
-        // Validate that null-body status codes don't have a body
-        // Per HTTP spec: 204 (No Content), 205 (Reset Content), and 304 (Not Modified)
-        if (
-          body !== null &&
-          body !== undefined &&
-          (this.status === 204 || this.status === 205 || this.status === 304)
-        ) {
-          throw new TypeError(
-            `Response constructor: Invalid response status code ${this.status}`
-          );
-        }
-
-        // Store the original BodyInit for serialization
-        if (body !== null && body !== undefined) {
-          // Create a "fake" ReadableStream that stores the original body
-          // This avoids doing async work during workflow replay
-          this.body = Object.create(vmGlobalThis.ReadableStream.prototype, {
-            [BODY_INIT_SYMBOL]: {
-              value: body,
-              writable: false,
-            },
-          });
-        } else {
-          this.body = null;
-        }
+  const waitForExecution = async (
+    workflowBody: Promise<unknown>,
+    interruption: PromiseWithResolvers<never>
+  ): Promise<WorkflowResult> => {
+    let result: unknown;
+    try {
+      result = await Promise.race([workflowBody, interruption.promise]);
+    } catch (error) {
+      if (state.type === 'suspended' && error === state.suspension) {
+        return {
+          type: 'suspended',
+          suspension: state.suspension,
+          session,
+          // A suspension is not a settling point: the consumer for something
+          // held may well be registered by the replay that follows this one.
+          // So it is carried out for the span instead of being judged here.
+          parked: eventsConsumer.parkedSummary,
+        };
       }
-
-      // TODO: implement these
-      clone!: () => Response;
-      blob!: () => Promise<globalThis.Blob>;
-      formData!: () => Promise<globalThis.FormData>;
-
-      get ok() {
-        return this.status >= 200 && this.status < 300;
-      }
-
-      get bodyUsed() {
-        return false;
-      }
-
-      async arrayBuffer() {
-        return resArrayBuffer(this);
-      }
-
-      async bytes() {
-        return new Uint8Array(await resArrayBuffer(this));
-      }
-
-      async json() {
-        return resJson(this);
-      }
-
-      static json(data: any, init?: ResponseInit): Response {
-        const body = JSON.stringify(data);
-        const headers = new vmGlobalThis.Headers(init?.headers);
-        if (!headers.has('content-type')) {
-          headers.set('content-type', 'application/json');
-        }
-        return new Response(body, { ...init, headers });
-      }
-
-      async text() {
-        return resText(this);
-      }
-
-      static error(): Response {
-        ENOTSUP();
-      }
-
-      static redirect(url: string | URL, status: number = 302): Response {
-        // Validate status code - only specific redirect codes are allowed
-        if (![301, 302, 303, 307, 308].includes(status)) {
-          throw new RangeError(
-            `Invalid redirect status code: ${status}. Must be one of: 301, 302, 303, 307, 308`
-          );
-        }
-
-        // Create response with Location header
-        const headers = new vmGlobalThis.Headers();
-        headers.set('Location', String(url));
-
-        const response = Object.create(Response.prototype);
-        response.status = status;
-        response.statusText = '';
-        response.headers = headers;
-        response.body = null;
-        response.type = 'default';
-        response.url = '';
-        response.redirected = false;
-
-        return response;
-      }
+      return failWorkflow(error);
     }
-    vmGlobalThis.Response = Response;
 
-    class ReadableStream<T> implements globalThis.ReadableStream<T> {
-      constructor() {
-        ENOTSUP();
-      }
-
-      get locked() {
-        return false;
-      }
-
-      cancel(): any {
-        ENOTSUP();
-      }
-
-      getReader(): any {
-        ENOTSUP();
-      }
-
-      pipeThrough(): any {
-        ENOTSUP();
-      }
-
-      pipeTo(): any {
-        ENOTSUP();
-      }
-
-      tee(): any {
-        ENOTSUP();
-      }
-
-      values(): any {
-        ENOTSUP();
-      }
-
-      static from(): any {
-        ENOTSUP();
-      }
-
-      [Symbol.asyncIterator](): any {
-        ENOTSUP();
-      }
-    }
-    vmGlobalThis.ReadableStream = ReadableStream;
-
-    class WritableStream<T> implements globalThis.WritableStream<T> {
-      constructor() {
-        ENOTSUP();
-      }
-
-      get locked() {
-        return false;
-      }
-
-      abort(): any {
-        ENOTSUP();
-      }
-
-      close(): any {
-        ENOTSUP();
-      }
-
-      getWriter(): any {
-        ENOTSUP();
-      }
-    }
-    vmGlobalThis.WritableStream = WritableStream;
-
-    class TransformStream<I, O> implements globalThis.TransformStream<I, O> {
-      readable: globalThis.ReadableStream<O>;
-      writable: globalThis.WritableStream<I>;
-
-      constructor() {
-        ENOTSUP();
-      }
-    }
-    vmGlobalThis.TransformStream = TransformStream;
-
-    // Eventually we'll probably want to provide our own `console` object,
-    // but for now we'll just expose the global one.
-    vmGlobalThis.console = globalThis.console;
-
-    // HACK: propagate symbol needed for AI gateway usage
-    const SYMBOL_FOR_REQ_CONTEXT = Symbol.for('@vercel/request-context');
-    // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
-    vmGlobalThis[SYMBOL_FOR_REQ_CONTEXT] = (globalThis as any)[
-      SYMBOL_FOR_REQ_CONTEXT
-    ];
-
-    // Get a reference to the user-defined workflow function
-    const workflowFn = runInContext(
-      `${workflowCode}; globalThis.__private_workflows?.get(${JSON.stringify(workflowRun.workflowName)})`,
-      context
-    );
-
-    if (typeof workflowFn !== 'function') {
-      throw new ReferenceError(
-        `Workflow ${JSON.stringify(
-          workflowRun.workflowName
-        )} must be a function, but got "${typeof workflowFn}" instead`
+    state = { type: 'completed' };
+    // The consumer walks past events whose type carries no ordering claim and
+    // holds them for a consumer it expects a later `subscribe()` to register.
+    // The workflow function returning is the point where that expectation is
+    // settled: nothing more will subscribe, so anything still held was never
+    // anyone's, and completing here would drop it silently.
+    const stranded = eventsConsumer.strandedEvent;
+    if (stranded) {
+      return failWorkflow(
+        new ReplayDivergenceError(
+          `Replay finished without consuming event: eventType=${stranded.eventType}, correlationId=${stranded.correlationId}, eventId=${stranded.eventId}. ${describeDivergenceContext(stranded, workflowContext.invocationsQueue, eventsConsumer)}`,
+          { eventId: stranded.eventId }
+        )
       );
     }
+    try {
+      const output = await dehydrateWorkflowReturnValue(
+        result,
+        workflowRun.runId,
+        encryptionKey,
+        vmGlobalThis,
+        false,
+        // Only compression-capable runs (spec >= 5) may write compressed
+        // payloads. The serializer uses zstd when supported and may use gzip.
+        (workflowRun.specVersion ?? 0) >= SPEC_VERSION_SUPPORTS_COMPRESSION
+      );
 
-    const args = hydrateWorkflowArguments(workflowRun.input, vmGlobalThis);
+      await drainPendingQueueItems(
+        workflowRun.runId,
+        workflowContext.invocationsQueue,
+        vmGlobalThis,
+        workflowRun,
+        'completed',
+        drainPendingQueue
+      );
 
-    span?.setAttributes({
-      ...Attribute.WorkflowArgumentsCount(args.length),
-    });
+      return { type: 'completed', output, resultType: typeof result };
+    } catch (error) {
+      return failWorkflow(error);
+    }
+  };
 
-    // Invoke user workflow
-    const result = await Promise.race([
-      workflowFn(...args),
-      workflowDiscontinuation.promise,
-    ]);
+  const workflowTraceContext = await createRefreshableTraceContext();
+  const replayTrace = await startTraceSpan('workflow.replay.execute');
+  const workflowBody = workflowTraceContext.run(async () =>
+    workflowFn(...args)
+  );
 
-    const dehydrated = dehydrateWorkflowReturnValue(result, vmGlobalThis);
+  /** Ids consumed ahead of their write, mapped to the ids they committed at. */
+  const aliases = new Map<string, string>();
+  /** Events admitted below events consumed before them (see the rebase). */
+  const admittedBelow = new Set<string>();
+  const committedId = (eventId: string): string => {
+    let id = eventId;
+    for (let hops = 0; hops < 16 && aliases.has(id); hops++) {
+      id = aliases.get(id)!;
+    }
+    return id;
+  };
+  /**
+   * The events of `nextEvents` this session has not consumed, when the rest
+   * of it is what the session consumed under the rebase: every consumed
+   * event present at its committed id, in the order consumed (apart from the
+   * ones admitted below), and every new event below the last of them one the
+   * rebase admits. `undefined` when not, or when nothing is new.
+   */
+  const rebasedExtension = (
+    nextEvents: Event[],
+    rebase: WorkflowSessionRebase | undefined
+  ): Event[] | undefined => {
+    const indexById = new Map<string, number>();
+    for (const [index, event] of nextEvents.entries()) {
+      indexById.set(event.eventId, index);
+    }
+    const consumedIds = new Set<string>();
+    let last = -1;
+    for (const event of eventsConsumer.events) {
+      const id = committedId(event.eventId);
+      const index = indexById.get(id);
+      if (index === undefined) return undefined;
+      consumedIds.add(id);
+      if (admittedBelow.has(id)) continue;
+      if (index < last) return undefined;
+      last = index;
+    }
+    const fresh: Event[] = [];
+    for (const [index, event] of nextEvents.entries()) {
+      if (consumedIds.has(event.eventId)) continue;
+      if (index < last) {
+        if (!rebase?.admitBelow(event)) return undefined;
+        admittedBelow.add(event.eventId);
+      }
+      fresh.push(event);
+    }
+    return fresh.length > 0 ? fresh : undefined;
+  };
 
-    span?.setAttributes({
-      ...Attribute.WorkflowResultType(typeof result),
-    });
+  const session: WorkflowSession = {
+    workflowRun,
+    argumentCount: args.length,
+    async resume(nextEvents, rebase) {
+      switch (state.type) {
+        case 'suspended': {
+          if (rebase || aliases.size > 0 || admittedBelow.size > 0) {
+            for (const [from, to] of rebase?.aliases ?? []) {
+              aliases.set(from, to);
+            }
+            const fresh = rebasedExtension(nextEvents, rebase);
+            if (!fresh) {
+              state = { type: 'replay' };
+              return { type: 'replay' };
+            }
+            const interruption = withResolvers<never>();
+            state = { type: 'running', interruption };
+            workflowContext.suspensionGeneration++;
+            workflowTraceContext.refresh();
+            eventsConsumer.append(fresh);
+            return waitForExecution(workflowBody, interruption);
+          }
+          // The full O(known events) prefix compare is required: the runtime
+          // usually grows one array in place, but its wait-completion and
+          // stale-reload paths REPLACE the array with a fresh full fetch, so
+          // a rewritten prefix is a real input, not paranoia. The compares
+          // are cheap string equality and dwarfed by the replay they avoid.
+          const knownEvents = eventsConsumer.events;
+          const isStrictExtension =
+            nextEvents.length > knownEvents.length &&
+            knownEvents.every(
+              (event, index) => event.eventId === nextEvents[index].eventId
+            );
+          if (!isStrictExtension) {
+            state = { type: 'replay' };
+            return { type: 'replay' };
+          }
+          const interruption = withResolvers<never>();
+          state = { type: 'running', interruption };
+          workflowContext.suspensionGeneration++;
+          workflowTraceContext.refresh();
+          eventsConsumer.append(nextEvents.slice(knownEvents.length));
+          return waitForExecution(workflowBody, interruption);
+        }
+        case 'replay':
+          return { type: 'replay' };
+        case 'completed':
+        case 'running':
+          throw new WorkflowRuntimeError(
+            `Cannot resume ${state.type} workflow "${workflowRun.runId}"`
+          );
+      }
+      state satisfies never;
+    },
+  };
 
-    return dehydrated;
-  });
+  // The replay span measures the user function without becoming its ambient
+  // context. The workflow promise stays pending across retained resumes, so an
+  // active replay span here would remain captured after that span has ended.
+  const execution = waitForExecution(workflowBody, initialInterruption);
+  void execution.then(replayTrace.end, replayTrace.fail);
+
+  return {
+    session,
+    execution,
+  };
 }

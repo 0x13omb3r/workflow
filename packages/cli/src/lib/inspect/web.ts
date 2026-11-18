@@ -1,67 +1,79 @@
-import type { ChildProcess } from 'node:child_process';
-import { spawn } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import chalk from 'chalk';
 import open from 'open';
 import { logger } from '../config/log.js';
 import { getEnvVars } from './env.js';
+import { setupCliWorld } from './setup.js';
 import { getVercelDashboardUrl } from './vercel-api.js';
 
-export const WEB_PORT = 3456;
-export const WEB_PACKAGE_NAME = '@workflow/web';
-export const HOST_URL = `http://localhost:${WEB_PORT}`;
-
-let serverProcess: ChildProcess | null = null;
-let isServerStarting = false;
-let cleanupHandlersRegistered = false;
+export const getHostUrl = (webPort: number) => `http://localhost:${webPort}`;
 
 /**
- * Get the path to the @workflow/web package
- * Since it's now a direct dependency, we can resolve it from node_modules
- *
- * We resolve relative to this file's location to handle cases where the CLI
- * is installed as a dependency of another project:
- *   test-project/node_modules/@workflow/cli/node_modules/@workflow/web
+ * The standalone web UI server, as returned by `@workflow/web/server` (a srvx
+ * `Server`). Derived from the export rather than imported by name so the CLI
+ * doesn't need its own `srvx` dependency just to spell the type.
  */
-function getWebPackagePath(): string {
-  try {
-    // Get the path to this file so we can resolve relative to the CLI package
-    const thisFilePath = fileURLToPath(import.meta.url);
+type WebServer = Awaited<
+  ReturnType<typeof import('@workflow/web/server').startServer>
+>;
 
-    logger.debug(`Resolving web package from: ${thisFilePath}`);
+let webServer: WebServer | null = null;
 
-    // Create a require function that resolves relative to this file
-    // This is the proper way to resolve dependencies of the CLI package
-    const requireFromHere = createRequire(import.meta.url);
-
-    // Resolve the package.json of @workflow/web from the CLI's location
-    // This ensures we find it even when the CLI is a dependency of another project
-    const packageJsonPath = requireFromHere.resolve(
-      `${WEB_PACKAGE_NAME}/package.json`
-    );
-
-    logger.debug(`Resolved web package: ${packageJsonPath}`);
-
-    // Return the directory containing package.json
-    return dirname(packageJsonPath);
-  } catch (error) {
-    throw new Error(
-      `Failed to resolve ${WEB_PACKAGE_NAME} package. ` +
-        `This should be installed as a dependency of the CLI. Error: ${error}`
-    );
-  }
+interface DashboardRegistryEntry {
+  url: string;
+  basename: string;
+  world: string;
+  pid: number;
+  startedAt: string;
 }
 
 /**
- * Check if server is already running on the port
+ * Find embedded dashboards (e.g. a framework integration serving `/_workflow`)
+ * that are currently live for this project. Reads the best-effort registry and
+ * health-checks each entry, since stale entries are expected (a SIGKILL'd dev
+ * server can't clean up). Returns [] on any error, since coordination is
+ * optional.
+ */
+async function findLiveEmbeddedDashboards(): Promise<DashboardRegistryEntry[]> {
+  let entries: DashboardRegistryEntry[];
+  try {
+    const { readDashboardRegistry } = await import('@workflow/web/registry');
+    entries = readDashboardRegistry() as DashboardRegistryEntry[];
+  } catch {
+    return [];
+  }
+
+  const live: DashboardRegistryEntry[] = [];
+  for (const entry of entries) {
+    if (!entry?.url) continue;
+    // Best-effort PID liveness check (same-host dev servers).
+    if (typeof entry.pid === 'number') {
+      try {
+        process.kill(entry.pid, 0);
+      } catch {
+        continue; // process gone
+      }
+    }
+    try {
+      const res = await fetch(entry.url, {
+        method: 'HEAD',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(1500),
+      });
+      // Any non-5xx response means something is serving that route.
+      if (res.status < 500) live.push(entry);
+    } catch {
+      // unreachable, so treat as dead
+    }
+  }
+  return live;
+}
+
+/**
+ * Check if a server is already listening on the given URL.
  */
 async function isServerRunning(hostUrl: string): Promise<boolean> {
   try {
-    const response = await fetch(hostUrl, {
-      method: 'HEAD',
-    });
+    const response = await fetch(hostUrl, { method: 'HEAD' });
     return response.ok;
   } catch {
     return false;
@@ -69,157 +81,64 @@ async function isServerRunning(hostUrl: string): Promise<boolean> {
 }
 
 /**
- * Cleanup function to stop the server gracefully
+ * Start the @workflow/web server in the current process.
  */
-function cleanupServer(): void {
-  if (serverProcess && !serverProcess.killed) {
-    logger.debug('Cleaning up web server process...');
-    serverProcess.kill('SIGTERM');
-    serverProcess = null;
-  }
-}
-
-/**
- * Register cleanup handlers to ensure server is stopped when CLI exits
- */
-function registerCleanupHandlers(): void {
-  if (cleanupHandlersRegistered) {
-    return;
-  }
-
-  cleanupHandlersRegistered = true;
-
-  // Handle Ctrl+C (SIGINT)
-  process.on('SIGINT', () => {
-    logger.debug('Received SIGINT, cleaning up...');
-    cleanupServer();
-    process.exit(0);
-  });
-
-  // Handle termination signal
-  process.on('SIGTERM', () => {
-    logger.debug('Received SIGTERM, cleaning up...');
-    cleanupServer();
-    process.exit(0);
-  });
-
-  // Handle normal process exit
-  process.on('exit', () => {
-    cleanupServer();
-  });
-
-  // Handle uncaught exceptions
-  process.on('uncaughtException', (error) => {
-    logger.error(`Uncaught exception: ${error}`);
-    cleanupServer();
-    process.exit(1);
-  });
-
-  // Handle unhandled promise rejections
-  process.on('unhandledRejection', (reason) => {
-    logger.error(`Unhandled rejection: ${reason}`);
-    cleanupServer();
-    process.exit(1);
-  });
-}
-
-/**
- * Start the web server without detaching
- * The server will stay attached to the CLI process and be cleaned up on exit
- */
-async function startWebServer(): Promise<boolean> {
-  if (isServerStarting) {
-    logger.debug('Server is already starting...');
-    return false;
-  }
-
-  if (await isServerRunning(HOST_URL)) {
+async function startWebServer(webPort: number): Promise<boolean> {
+  if (await isServerRunning(getHostUrl(webPort))) {
     logger.debug('Server is already running');
     return true;
   }
 
-  const packagePath = getWebPackagePath();
-  logger.debug(`Using web package at: ${packagePath}`);
-
-  isServerStarting = true;
-
   try {
     logger.info('Starting web UI server...');
-    const command = 'npx';
-    const args = ['next', 'start', '-p', String(WEB_PORT)];
-    logger.debug(`Running ${command} ${args.join(' ')} in ${packagePath}`);
-
-    // Start the Next.js server WITHOUT detaching
-    // This keeps it attached to the CLI process
-    serverProcess = spawn(command, args, {
-      cwd: packagePath,
-      detached: false, // Keep attached so Ctrl+C works
-      stdio: ['ignore', 'pipe', 'pipe'], // Pipe output so we can log it if needed
-    });
-
-    // Register cleanup handlers to ensure server is killed on exit
-    registerCleanupHandlers();
-
-    // Log server output for debugging
-    if (serverProcess.stdout) {
-      serverProcess.stdout.on('data', (data) => {
-        logger.debug(`[web-server] ${data.toString().trim()}`);
-      });
-    }
-
-    if (serverProcess.stderr) {
-      serverProcess.stderr.on('data', (data) => {
-        logger.debug(`[web-server] ${data.toString().trim()}`);
-      });
-    }
-
-    // Handle server process errors
-    serverProcess.on('error', (error) => {
-      logger.error(`Web server process error: ${error}`);
-      cleanupServer();
-    });
-
-    // Handle server process exit
-    serverProcess.on('exit', (code, signal) => {
-      if (code !== null && code !== 0) {
-        logger.debug(`Web server exited with code ${code}`);
-      } else if (signal) {
-        logger.debug(`Web server exited with signal ${signal}`);
-      }
-      serverProcess = null;
-    });
-
-    // Wait for server to be ready
-    const maxRetries = 30;
-    const retryIntervalMs = 1000;
-    for (let i = 0; i < maxRetries; i++) {
-      await new Promise((resolve) => setTimeout(resolve, retryIntervalMs));
-      if (await isServerRunning(HOST_URL)) {
-        logger.success(
-          chalk.green(`Web UI server started on port ${WEB_PORT}`)
-        );
-        isServerStarting = false;
-        return true;
-      }
-    }
-
-    logger.error(
-      `Server failed to start within ${maxRetries * retryIntervalMs}ms`
-    );
-    cleanupServer();
-    isServerStarting = false;
-    return false;
+    const { startServer } = await import('@workflow/web/server');
+    webServer = await startServer(webPort);
+    logger.success(chalk.green(`Web UI server started on port ${webPort}`));
+    return true;
   } catch (error) {
     logger.error(`Failed to start server: ${error}`);
-    cleanupServer();
-    isServerStarting = false;
     return false;
   }
 }
 
 /**
- * Launch the web UI with the specified configuration
- * This starts the server (if not running), opens the browser, then keeps the server running
+ * Build a URL for opening the local web UI.
+ *
+ * The web UI reads world configuration from server-side environment variables.
+ * Query params are only used for deep-linking to specific resources (resource/id, runId, etc.)
+ */
+export function buildWebUIUrl(
+  hostUrl: string,
+  resource: string,
+  id: string | undefined,
+  flags: Record<string, any>
+): string {
+  const params = new URLSearchParams();
+
+  // Deep-linking params
+  params.set('resource', resource);
+  if (id) {
+    params.set('id', id);
+  }
+
+  // Optional deep-linking to specific run/step/hook
+  for (const flagName of ['runId', 'stepId', 'hookId'] as const) {
+    const value = flags[flagName];
+    if (value !== undefined && value !== '' && value !== false) {
+      params.set(flagName, String(value));
+    }
+  }
+
+  const queryString = params.toString();
+  return queryString ? `${hostUrl}?${queryString}` : hostUrl;
+}
+
+/**
+ * Launch the web UI with the specified configuration.
+ * This starts the server (if not running), opens the browser, then keeps the server running.
+ *
+ * World configuration is passed to the web server via environment variables.
+ * The web UI reads these from process.env on the server side, not from query params.
  */
 export async function launchWebUI(
   resource: string,
@@ -229,42 +148,45 @@ export async function launchWebUI(
 ): Promise<void> {
   const envVars = getEnvVars();
 
+  // Check if browser opening is disabled via flag or environment variable
+  const disableBrowserOpen = flags.noBrowser;
+
   // Check if we should try to use the Vercel dashboard
   const vercelBackendNames = ['vercel', '@workflow/world-vercel'];
   const isVercelBackend = vercelBackendNames.includes(
     envVars.WORKFLOW_TARGET_WORLD
   );
   const teamSlug = envVars.WORKFLOW_VERCEL_TEAM;
-  const projectName = envVars.WORKFLOW_VERCEL_PROJECT;
+  const projectName =
+    envVars.WORKFLOW_VERCEL_PROJECT_NAME || envVars.WORKFLOW_VERCEL_PROJECT;
 
-  if (!envVars.WORKFLOW_LOCAL_UI && isVercelBackend) {
+  // Check if user wants local UI via flag or environment variable
+  const useLocalUi = flags.localUi;
+
+  if (!useLocalUi && isVercelBackend) {
     logger.info(
-      'If you do not want to use the Vercel dashboard, set WORKFLOW_LOCAL_UI=1 in your environment variables.'
+      'If you do not want to use the Vercel dashboard, use the --localUi flag or set WORKFLOW_LOCAL_UI=1 in your environment variables.'
     );
   }
-  if (
-    isVercelBackend &&
-    teamSlug &&
-    projectName &&
-    !envVars.WORKFLOW_LOCAL_UI
-  ) {
+  if (isVercelBackend && teamSlug && projectName && !useLocalUi) {
     logger.debug(
       `Checking Vercel dashboard availability for team: ${teamSlug}, project: ${projectName}`
     );
 
-    // const dashboardAvailable = await checkVercelDashboardAvailable(
-    //   teamSlug,
-    //   projectName,
-    //   envVars.WORKFLOW_VERCEL_AUTH_TOKEN
-    // );
-
-    // if (dashboardAvailable) {
     const dashboardUrl = getVercelDashboardUrl(
       teamSlug,
       projectName,
       resource,
-      id
+      id,
+      envVars.WORKFLOW_VERCEL_ENV || 'production'
     );
+
+    if (disableBrowserOpen) {
+      logger.info(chalk.cyan(`Vercel dashboard URL: ${dashboardUrl}`));
+      logger.info(chalk.cyan('(Browser auto-open disabled)'));
+      return;
+    }
+
     logger.info(
       chalk.green(`Opening Vercel dashboard for workflows at: ${dashboardUrl}`)
     );
@@ -273,32 +195,63 @@ export async function launchWebUI(
       return; // Exit early since we opened the dashboard
     } catch (error) {
       logger.error(`Failed to open browser: ${error}`);
-      logger.info(`Please open manually: ${dashboardUrl}`);
+      logger.info(`Please open the link manually.`);
       return;
     }
-    // } else {
-    //   logger.warn(
-    //     chalk.yellow(
-    //       'Vercel dashboard is not available for this project. Falling back to local web UI.'
-    //     )
-    //   );
-    // }
+  }
+
+  // Defer to an already-running embedded dashboard (e.g. a framework
+  // integration serving `/_workflow`) unless the user forces a standalone
+  // server. Avoids spinning up a redundant UI on :3456 when one is already up.
+  if (!flags.standalone) {
+    const live = await findLiveEmbeddedDashboards();
+    if (live.length === 1) {
+      const target = buildWebUIUrl(live[0].url, resource, id, flags);
+      logger.info(
+        chalk.green(
+          `An embedded workflow dashboard is already running at ${live[0].url}`
+        )
+      );
+      if (disableBrowserOpen) {
+        logger.info(chalk.cyan(`Open it at: ${target}`));
+        return;
+      }
+      logger.info(chalk.cyan(`Opening ${target}`));
+      try {
+        await open(target);
+      } catch (error) {
+        logger.error(`Failed to open browser: ${error}`);
+        logger.info(`Please open the link manually: ${target}`);
+      }
+      return;
+    }
+    if (live.length > 1) {
+      logger.info('Embedded workflow dashboards are already running at:');
+      for (const entry of live) {
+        logger.info(chalk.cyan(`  - ${entry.url}`));
+      }
+      logger.info(
+        'Open the one you want, or pass --standalone to start a separate web UI.'
+      );
+      return;
+    }
   }
 
   // Fall back to local web UI
-  // Build URL with query params
-  const queryParams = envToQueryParams(resource, id, flags, envVars);
-  const url = `${HOST_URL}?${queryParams.toString()}`;
+  const webPort = flags.webPort ?? 3456;
+  const hostUrl = getHostUrl(webPort);
+  const url = buildWebUIUrl(hostUrl, resource, id, flags);
 
   // Check if server is already running
-  const alreadyRunning = await isServerRunning(HOST_URL);
+  const alreadyRunning = await isServerRunning(hostUrl);
 
   if (alreadyRunning) {
-    logger.info(chalk.cyan('Web UI server is already running'));
-    logger.info(chalk.cyan(`Access at: ${HOST_URL}`));
+    logger.info(
+      chalk.cyan(`Web UI server is already running on port ${webPort}.`)
+    );
   } else {
     // Start the server
-    const started = await startWebServer();
+    const started = await startWebServer(webPort);
     if (!started) {
       logger.error('Failed to start web UI server');
       return;
@@ -306,71 +259,101 @@ export async function launchWebUI(
   }
 
   // Open browser
-  logger.info(chalk.cyan(`Opening browser to: ${url}`));
-  try {
-    await open(url);
-  } catch (error) {
-    logger.error(`Failed to open browser: ${error}`);
-    logger.info(`Please open manually: ${url}`);
+  if (disableBrowserOpen) {
+    logger.info(chalk.cyan(`Web UI available at: ${url}`));
+    logger.info(chalk.cyan('(Browser auto-open disabled)'));
+  } else {
+    logger.info(chalk.cyan(`Opening browser to: ${url}`));
+    try {
+      await open(url);
+    } catch (error) {
+      logger.error(`Failed to open browser: ${error}`);
+      logger.info(`Please open the link manually.`);
+    }
   }
 
   // If we started the server, keep the process running
-  if (!alreadyRunning && serverProcess) {
+  if (!alreadyRunning && webServer) {
     logger.info(chalk.cyan('Press Ctrl+C to stop the web UI server and exit'));
 
-    // Keep the CLI process alive to maintain the server
-    // The server will be cleaned up when the process exits
-    await new Promise((resolve) => {
-      // This will only resolve when the server exits, or immediately if there is no serverProcess
-      if (serverProcess) {
-        serverProcess.on('exit', resolve);
+    // Keep the CLI process alive while the server is running. srvx has no
+    // close event of its own, so we listen on the underlying Node server —
+    // always present here, since the CLI only ever runs on Node.
+    const nodeServer = webServer.node?.server;
+    await new Promise<void>((resolve) => {
+      if (nodeServer) {
+        nodeServer.on('close', () => resolve());
       } else {
-        resolve(null);
+        resolve();
       }
     });
   }
 }
 
 /**
- * Convert CLI flags to query parameters
+ * Build the deep-link URL for a resource without any side effects (no server,
+ * no browser). Picks the Vercel dashboard for a Vercel backend (unless
+ * `--localUi`), otherwise the local web UI deep link.
+ *
+ * Assumes env vars have already been resolved (e.g. via `setupCliWorld`).
  */
-function envToQueryParams(
+export function buildDeepLinkUrl(
+  resource: string,
+  id: string | undefined,
+  flags: Record<string, any>
+): string {
+  const envVars = getEnvVars();
+
+  const vercelBackendNames = ['vercel', '@workflow/world-vercel'];
+  const isVercelBackend = vercelBackendNames.includes(
+    envVars.WORKFLOW_TARGET_WORLD
+  );
+  const teamSlug = envVars.WORKFLOW_VERCEL_TEAM;
+  const projectName =
+    envVars.WORKFLOW_VERCEL_PROJECT_NAME || envVars.WORKFLOW_VERCEL_PROJECT;
+
+  // Use the Vercel dashboard when targeting Vercel (and not forced local).
+  if (isVercelBackend && !flags.localUi && teamSlug && projectName) {
+    return getVercelDashboardUrl(
+      teamSlug,
+      projectName,
+      resource,
+      id,
+      envVars.WORKFLOW_VERCEL_ENV || 'production'
+    );
+  }
+
+  // Fall back to the local web UI deep link.
+  const webPort = flags.webPort ?? 3456;
+  return buildWebUIUrl(getHostUrl(webPort), resource, id, flags);
+}
+
+/**
+ * Resolve and print a shareable deep-link URL to stdout, then return, without
+ * opening a browser or starting the local web server. Intended for scripting
+ * and agents that need the link rather than a rendered dashboard.
+ *
+ * Human-readable chatter (the startup box, info/debug logs) is routed to stderr
+ * so stdout contains only the URL (or `{ "url": "..." }` with `--json`).
+ */
+export async function printDeepLink(
   resource: string,
   id: string | undefined,
   flags: Record<string, any>,
-  envVars: Record<string, string>
-): URLSearchParams {
-  const params = new URLSearchParams();
-  params.set('resource', resource);
-  if (id) {
-    params.set('id', id);
-  }
+  version: string
+): Promise<void> {
+  const wantsJson = Boolean(flags.json);
 
-  // Map relevant flags to query params
-  const envToQueryParamMappings: Record<string, string> = {
-    WORKFLOW_TARGET_WORLD: 'backend',
-    WORKFLOW_VERCEL_ENV: 'env',
-    WORKFLOW_VERCEL_AUTH_TOKEN: 'authToken',
-    WORKFLOW_VERCEL_PROJECT: 'project',
-    WORKFLOW_VERCEL_TEAM: 'team',
-    PORT: 'port',
-    WORKFLOW_EMBEDDED_DATA_DIR: 'dataDir',
-  };
+  // Force JSON logging mode during setup so the startup box and any info/debug
+  // logs go to stderr, keeping stdout clean for the URL. We print the URL
+  // ourselves below, respecting the user's actual `--json` choice.
+  await setupCliWorld({ ...flags, json: true } as any, version, true);
 
-  for (const [envName, paramName] of Object.entries(envToQueryParamMappings)) {
-    const value = envVars[envName];
-    if (value !== undefined && value !== '' && value !== '0') {
-      params.set(paramName, String(value));
-    }
-  }
-  // We only take the runId/stepId/hookId flags directly, the rest are set via env vars,
-  // which are internally already influenced by the CLI flags
-  for (const flagName of ['runId', 'stepId', 'hookId'] as const) {
-    const value = flags[flagName];
-    if (value !== undefined && value !== '' && value !== false) {
-      params.set(flagName, String(value));
-    }
-  }
+  const url = buildDeepLinkUrl(resource, id, flags);
 
-  return params;
+  if (wantsJson) {
+    process.stdout.write(`${JSON.stringify({ url }, null, 2)}\n`);
+  } else {
+    process.stdout.write(`${url}\n`);
+  }
 }

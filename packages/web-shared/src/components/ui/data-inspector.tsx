@@ -1,0 +1,1077 @@
+'use client';
+
+/**
+ * Reusable data inspector for the o11y UI.
+ *
+ * Renders JSON as a collapsible tree: bracket notation (`{ … }` / `[ … ]`),
+ * colored keys, typed value colors, `▸`/`▾` disclosure icons, and a `...`
+ * collapsed indicator.
+ *
+ * On top of plain JSON it handles the workflow-specific value types: StreamRef /
+ * RunRef badges, encrypted markers, decoded byte streams, Dates, and named
+ * class instances.
+ */
+
+import { ChevronDown, ChevronRight, Lock, Radio } from 'lucide-react';
+import {
+  createContext,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+  type RefObject,
+  useContext,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { cn } from '../../lib/cn';
+import {
+  type ClassInstanceRef,
+  isClassInstanceRef,
+  isEncryptedMarker,
+  isRunRef,
+  isStreamRef,
+  type RunRef,
+  type StreamRef,
+} from '../../lib/hydration';
+import {
+  type DecodedStreamChunkSource,
+  type FormattedStreamChunkDisplay,
+  formatArrayBufferViewForDisplay,
+} from '../../lib/stream-display';
+import { Button } from './button';
+import { CLS, JSON_VIEW_STYLES } from './data-inspector.styles';
+
+// ---------------------------------------------------------------------------
+// Decoded byte display (built by `collapseRefs`, rendered by `DataRender`)
+// ---------------------------------------------------------------------------
+
+const BYTES_DISPLAY_TYPE = '__workflow_bytes_display__';
+
+interface BytesDisplay {
+  __type: typeof BYTES_DISPLAY_TYPE;
+  text: string;
+  decodedFrom?: DecodedStreamChunkSource;
+}
+
+function deserializeChunkText(text: string): string {
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed === 'string') {
+      return parsed;
+    }
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return text;
+  }
+}
+
+function parseChunkData(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+export function isBytesDisplay(value: unknown): value is BytesDisplay {
+  if (value === null || typeof value !== 'object') return false;
+  const desc = Object.getOwnPropertyDescriptor(value, '__type');
+  return desc?.value === BYTES_DISPLAY_TYPE;
+}
+
+// ---------------------------------------------------------------------------
+// Stream click context (passed through from the panel)
+// ---------------------------------------------------------------------------
+
+/**
+ * Context for passing stream click handlers down to DataInspector instances.
+ * Exported so that parent components (e.g., AttributePanel) can provide the handler.
+ */
+export const StreamClickContext = createContext<
+  ((streamId: string) => void) | undefined
+>(undefined);
+
+/**
+ * Context for passing a decrypt handler down to DataInspector instances.
+ * When provided, encrypted markers become clickable buttons that trigger decryption.
+ */
+export type DecryptClickContextValue = {
+  onDecrypt: () => void;
+  isDecrypting: boolean;
+  isDecryptDisabled?: boolean;
+  decryptDisabledReason?: string;
+  hasEncryptedData?: boolean;
+};
+
+export const DecryptClickContext = createContext<
+  DecryptClickContextValue | undefined
+>(undefined);
+
+export const RunClickContext = createContext<
+  ((runId: string) => void) | undefined
+>(undefined);
+
+// ---------------------------------------------------------------------------
+// Workflow-specific value renderers (badges, encrypted markers, byte streams)
+// ---------------------------------------------------------------------------
+
+function EncryptedInlineLabel() {
+  const ctx = useContext(DecryptClickContext);
+  if (ctx) {
+    return (
+      <Button
+        size="small"
+        className="align-baseline"
+        loading={ctx.isDecrypting}
+        disabled={ctx.isDecryptDisabled}
+        prefix={<Lock />}
+        title={ctx.isDecryptDisabled ? ctx.decryptDisabledReason : undefined}
+        onClick={(e) => {
+          e.stopPropagation();
+          ctx.onDecrypt();
+        }}
+      >
+        Decrypt
+      </Button>
+    );
+  }
+  return (
+    <span className="text-gray-600 italic">
+      <Lock className="-mt-px mr-[3px] inline h-3 w-3 align-middle" />
+      Encrypted
+    </span>
+  );
+}
+
+function StreamRefInline({ streamRef }: { streamRef: StreamRef }) {
+  const onStreamClick = useContext(StreamClickContext);
+  return (
+    <button
+      type="button"
+      className="inline-flex cursor-pointer items-center gap-1 rounded border border-blue-300 bg-blue-100 px-1.5 py-0.5 font-mono text-[10px] text-blue-900 underline decoration-transparent transition-colors hover:bg-blue-200"
+      onClick={(e) => {
+        e.stopPropagation();
+        onStreamClick?.(streamRef.streamId);
+      }}
+      title={`View stream: ${streamRef.streamId}`}
+    >
+      <Radio className="size-3 shrink-0" aria-hidden />
+      <span>{streamRef.streamId}</span>
+    </button>
+  );
+}
+
+function RunRefInline({ runRef }: { runRef: RunRef }) {
+  const onRunClick = useContext(RunClickContext);
+  return (
+    <button
+      type="button"
+      className="inline-flex cursor-pointer items-center gap-1 rounded border border-purple-300 bg-purple-100 px-1.5 py-0.5 font-mono text-[10px] text-purple-900 underline decoration-transparent transition-colors hover:bg-purple-200"
+      onClick={(e) => {
+        e.stopPropagation();
+        onRunClick?.(runRef.runId);
+      }}
+      title={`View run: ${runRef.runId}`}
+    >
+      <span>{runRef.runId}</span>
+    </button>
+  );
+}
+
+function DecodedBytesChunk({
+  decodedText,
+  source,
+}: {
+  decodedText: string;
+  source: DecodedStreamChunkSource;
+}) {
+  const [selectedView, setSelectedView] = useState<'decoded' | 'bytes'>(
+    'decoded'
+  );
+  const parsed = parseChunkData(decodedText);
+
+  return (
+    <div className="min-w-0">
+      {selectedView === 'decoded' ? (
+        <div className="min-w-0">
+          {typeof parsed === 'string' ? (
+            <span className="whitespace-pre-wrap break-words text-gray-1000">
+              {deserializeChunkText(parsed)}
+            </span>
+          ) : (
+            <DataInspector data={parsed} expandLevel={1} />
+          )}
+        </div>
+      ) : (
+        <DecodedBytesInspector decodedText={decodedText} source={source} />
+      )}
+      <div className="mt-2 flex">
+        <div
+          className="inline-flex overflow-hidden rounded border border-gray-400"
+          title={`${source.type} decoded as ${source.encoding.toUpperCase()} text. Switch to Bytes to inspect the summarized raw value.`}
+        >
+          <button
+            type="button"
+            className={cn(
+              'h-5 px-1.5 font-medium text-[10px] text-gray-900',
+              selectedView === 'decoded' ? 'bg-gray-200' : 'bg-gray-100'
+            )}
+            onClick={() => setSelectedView('decoded')}
+            aria-pressed={selectedView === 'decoded'}
+            aria-label="Show decoded text"
+          >
+            Decoded
+          </button>
+          <button
+            type="button"
+            className={cn(
+              'h-5 border-gray-400 border-l px-1.5 font-medium text-[10px] text-gray-900',
+              selectedView === 'bytes' ? 'bg-gray-200' : 'bg-gray-100'
+            )}
+            onClick={() => setSelectedView('bytes')}
+            aria-pressed={selectedView === 'bytes'}
+            aria-label="Show raw bytes summary"
+          >
+            Bytes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DecodedBytesInspector({
+  decodedText,
+  source,
+}: {
+  decodedText: string;
+  source: DecodedStreamChunkSource;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div className="font-mono">
+      <button
+        type="button"
+        className="flex max-w-full items-start gap-1 text-left text-gray-1000"
+        onClick={() => setExpanded((value) => !value)}
+        title={`${source.type} decoded as ${source.encoding.toUpperCase()} text`}
+      >
+        <span className="flex h-[1lh] shrink-0 items-center text-gray-700">
+          {expanded ? (
+            <ChevronDown className="size-3" aria-hidden />
+          ) : (
+            <ChevronRight className="size-3" aria-hidden />
+          )}
+        </span>
+        <span className="min-w-0 break-words">{source.rawSummary}</span>
+      </button>
+      {expanded && (
+        <div className="mt-1 pl-5">
+          <span className="text-gray-700">decoded: </span>
+          <span className="whitespace-pre-wrap break-words text-green-900">
+            {JSON.stringify(decodedText)}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BytesDisplayValue({ display }: { display: BytesDisplay }) {
+  if (display.decodedFrom) {
+    return (
+      <DecodedBytesChunk
+        decodedText={display.text}
+        source={display.decodedFrom}
+      />
+    );
+  }
+  return (
+    <span className="whitespace-pre-wrap break-words text-gray-1000">
+      {display.text}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tree renderer
+// ---------------------------------------------------------------------------
+
+type Entry = [field: string | undefined, value: unknown, key?: string | number];
+
+interface NodeContext {
+  level: number;
+  shouldExpand: (level: number) => boolean;
+  outerRef: RefObject<HTMLDivElement | null>;
+}
+
+/** Field names are rendered unquoted (empty string shows as `""`). */
+function formatField(field: string): string {
+  return field === '' ? '""' : field;
+}
+
+function isGenericIterable(
+  value: unknown
+): value is object & Iterable<unknown> {
+  if (
+    value === null ||
+    (typeof value !== 'object' && typeof value !== 'function') ||
+    Array.isArray(value) ||
+    value instanceof Map ||
+    value instanceof Set
+  ) {
+    return false;
+  }
+  return (
+    typeof (value as { [Symbol.iterator]?: unknown })[Symbol.iterator] ===
+    'function'
+  );
+}
+
+function isEntryIterable(
+  value: object & Iterable<unknown>
+): value is object & Iterable<unknown> & { entries(): Iterable<unknown> } {
+  return typeof (value as { entries?: unknown }).entries === 'function';
+}
+
+function collectEntries(
+  iterable: Iterable<unknown>,
+  asPairs: boolean
+): Entry[] {
+  return Array.from(iterable, (item, index) => {
+    if (asPairs && Array.isArray(item) && item.length >= 2) {
+      return [String(item[0]), collapseRefs(item[1]), index];
+    }
+    return [undefined, collapseRefs(item), index];
+  });
+}
+
+function isSelfIterableIterator(value: object & Iterable<unknown>): boolean {
+  return Object.is(value[Symbol.iterator](), value);
+}
+
+/**
+ * Describe an object/array/iterable as an expandable container. Returns null
+ * for values that should render as a primitive. `prefix` carries a class name
+ * shown before the opening bracket (Map/Set, generic iterables, and named class
+ * instances).
+ */
+function describeContainer(
+  value: unknown
+): { entries: Entry[]; open: string; close: string; prefix?: string } | null {
+  if (Array.isArray(value)) {
+    return {
+      entries: value.map((item) => [undefined, item] as Entry),
+      open: '[',
+      close: ']',
+    };
+  }
+  if (value instanceof Map) {
+    return {
+      entries: Array.from(value.entries(), ([key, val]) => [
+        String(key),
+        val,
+      ]) as Entry[],
+      open: '{',
+      close: '}',
+      prefix: 'Map',
+    };
+  }
+  if (value instanceof Set) {
+    return {
+      entries: Array.from(value.values(), (item) => [undefined, item] as Entry),
+      open: '[',
+      close: ']',
+      prefix: 'Set',
+    };
+  }
+  if (isGenericIterable(value)) {
+    const name = (value as { constructor?: { name?: string } }).constructor
+      ?.name;
+    const prefix = name && name !== 'Object' ? name : undefined;
+    if (isEntryIterable(value)) {
+      return {
+        entries: collectEntries(value.entries(), true),
+        open: '{',
+        close: '}',
+        prefix,
+      };
+    }
+    return {
+      entries: collectEntries(value, false),
+      open: '[',
+      close: ']',
+      prefix,
+    };
+  }
+  if (value !== null && typeof value === 'object') {
+    const name = (value as { constructor?: { name?: string } }).constructor
+      ?.name;
+    return {
+      entries: Object.entries(value) as Entry[],
+      open: '{',
+      close: '}',
+      prefix: name && name !== 'Object' ? name : undefined,
+    };
+  }
+  return null;
+}
+
+function describePrimitive(value: unknown): { text: string; cls: string } {
+  if (value === null) return { text: 'null', cls: CLS.null };
+  if (value === undefined) return { text: 'undefined', cls: CLS.undefined };
+  if (typeof value === 'string' || value instanceof String) {
+    return { text: `"${String(value)}"`, cls: CLS.string };
+  }
+  if (typeof value === 'boolean' || value instanceof Boolean) {
+    return { text: String(value), cls: CLS.boolean };
+  }
+  if (typeof value === 'number' || value instanceof Number) {
+    return { text: String(value), cls: CLS.number };
+  }
+  if (typeof value === 'bigint') {
+    return { text: `${value.toString()}n`, cls: CLS.number };
+  }
+  return { text: String(value), cls: CLS.punctuation };
+}
+
+function Label({ field, clickable }: { field?: string; clickable?: boolean }) {
+  if (field === undefined) return null;
+  return (
+    <span className={clickable ? CLS.clickableLabel : CLS.label}>
+      {`${formatField(field)}:`}
+    </span>
+  );
+}
+
+function Comma({ isLast }: { isLast: boolean }) {
+  if (isLast) return null;
+  return <span className={CLS.punctuation}>,</span>;
+}
+
+/** A non-expandable row: `field: <value>`. */
+function LeafRow({
+  field,
+  isLast,
+  children,
+}: {
+  field?: string;
+  isLast: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className={CLS.child} role="treeitem" tabIndex={-1}>
+      <Label field={field} />
+      {children}
+      <Comma isLast={isLast} />
+    </div>
+  );
+}
+
+function PrimitiveValue({ field, value, isLast }: NodeProps) {
+  const { text, cls } = describePrimitive(value);
+  return (
+    <LeafRow field={field} isLast={isLast}>
+      <span className={cls}>{text}</span>
+    </LeafRow>
+  );
+}
+
+function EmptyContainer({
+  field,
+  prefix,
+  open,
+  close,
+  isLast,
+}: {
+  field?: string;
+  prefix?: string;
+  open: string;
+  close: string;
+  isLast: boolean;
+}) {
+  return (
+    <div className={CLS.child} role="treeitem" tabIndex={-1}>
+      <Label field={field} />
+      {prefix ? <span className={CLS.className}>{prefix}</span> : null}
+      <span className={CLS.punctuation}>{open}</span>
+      <span className={CLS.punctuation}>{close}</span>
+      <Comma isLast={isLast} />
+    </div>
+  );
+}
+
+function focusExpander(
+  button: HTMLElement,
+  outerRef: RefObject<HTMLDivElement | null>
+) {
+  const previous = outerRef.current?.querySelector<HTMLElement>(
+    '[data-json-expander][tabindex="0"]'
+  );
+  if (previous) previous.tabIndex = -1;
+  button.tabIndex = 0;
+  button.focus();
+}
+
+function moveExpanderFocus(
+  outerRef: RefObject<HTMLDivElement | null>,
+  direction: 1 | -1
+) {
+  const root = outerRef.current;
+  if (!root) return;
+  const buttons = root.querySelectorAll<HTMLElement>('[data-json-expander]');
+  let current = -1;
+  for (let i = 0; i < buttons.length; i += 1) {
+    if (buttons[i].tabIndex === 0) {
+      current = i;
+      break;
+    }
+  }
+  if (current < 0) return;
+  const next = (current + direction + buttons.length) % buttons.length;
+  buttons[current].tabIndex = -1;
+  buttons[next].tabIndex = 0;
+  buttons[next].focus();
+}
+
+function ExpandableContainer({
+  field,
+  entries,
+  open,
+  close,
+  prefix,
+  ctx,
+  isLast,
+}: {
+  field?: string;
+  entries: Entry[];
+  open: string;
+  close: string;
+  prefix?: string;
+  ctx: NodeContext;
+  isLast: boolean;
+}) {
+  const { level, shouldExpand, outerRef } = ctx;
+  const [expanded, setExpanded] = useState(() => shouldExpand(level));
+  const rowRef = useRef<HTMLDivElement>(null);
+  const contentsId = useId();
+
+  if (entries.length === 0) {
+    return (
+      <EmptyContainer
+        field={field}
+        prefix={prefix}
+        open={open}
+        close={close}
+        isLast={isLast}
+      />
+    );
+  }
+
+  const toggle = () => {
+    setExpanded((value) => !value);
+    if (rowRef.current) focusExpander(rowRef.current, outerRef);
+  };
+
+  // Toggle only for clicks that land on this row itself; clicks bubbling up out
+  // of a nested treeitem are handled by that descendant's own row.
+  const onClick = (event: ReactMouseEvent) => {
+    if (
+      (event.target as HTMLElement).closest('[role="treeitem"]') !==
+      event.currentTarget
+    ) {
+      return;
+    }
+    toggle();
+  };
+
+  const onKeyDown = (event: ReactKeyboardEvent) => {
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      setExpanded(true);
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      setExpanded(false);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveExpanderFocus(outerRef, -1);
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      moveExpanderFocus(outerRef, 1);
+    }
+  };
+
+  const lastIndex = entries.length - 1;
+
+  return (
+    // The treeitem row is the focusable, keyboard-operable control (roving
+    // tabindex + arrow keys); the disclosure marker below is purely decorative.
+    <div
+      className={CLS.child}
+      role="treeitem"
+      aria-expanded={expanded}
+      aria-controls={expanded ? contentsId : undefined}
+      data-json-expander
+      ref={rowRef}
+      tabIndex={level === 0 ? 0 : -1}
+      onClick={onClick}
+      onKeyDown={onKeyDown}
+    >
+      <span
+        className={expanded ? CLS.collapseIcon : CLS.expandIcon}
+        aria-hidden="true"
+      />
+      {field !== undefined && (
+        <span className={CLS.clickableLabel}>{`${formatField(field)}:`}</span>
+      )}
+      {prefix ? <span className={CLS.className}>{prefix}</span> : null}
+      <span className={CLS.punctuation}>{open}</span>
+      {expanded ? (
+        // biome-ignore lint/a11y/useSemanticElements: ARIA tree group is the correct role here
+        <ul id={contentsId} className={CLS.childFields} role="group">
+          {entries.map(([childField, childValue, entryKey], index) => (
+            <DataRender
+              key={entryKey ?? childField ?? index}
+              field={childField}
+              value={childValue}
+              isLast={index === lastIndex}
+              ctx={{ ...ctx, level: level + 1 }}
+            />
+          ))}
+        </ul>
+      ) : (
+        <span className={CLS.collapsedContent} aria-hidden="true" />
+      )}
+      <span className={CLS.punctuation}>{close}</span>
+      <Comma isLast={isLast} />
+    </div>
+  );
+}
+
+interface NodeProps {
+  field?: string;
+  value: unknown;
+  isLast: boolean;
+  ctx: NodeContext;
+}
+
+function DataRender({ field, value, isLast, ctx }: NodeProps) {
+  if (isBytesDisplay(value)) {
+    return (
+      <LeafRow field={field} isLast={isLast}>
+        <BytesDisplayValue display={value} />
+      </LeafRow>
+    );
+  }
+  if (isEncryptedMarker(value)) {
+    return (
+      <LeafRow field={field} isLast={isLast}>
+        <EncryptedInlineLabel />
+      </LeafRow>
+    );
+  }
+  if (isStreamRef(value)) {
+    return (
+      <LeafRow field={field} isLast={isLast}>
+        <StreamRefInline streamRef={value} />
+      </LeafRow>
+    );
+  }
+  if (isRunRef(value)) {
+    return (
+      <LeafRow field={field} isLast={isLast}>
+        <RunRefInline runRef={value} />
+      </LeafRow>
+    );
+  }
+  if (value instanceof Date) {
+    return (
+      <LeafRow field={field} isLast={isLast}>
+        <span className={CLS.date}>{value.toISOString()}</span>
+      </LeafRow>
+    );
+  }
+  if (value instanceof RegExp) {
+    return (
+      <LeafRow field={field} isLast={isLast}>
+        <span className={CLS.regexp}>{value.toString()}</span>
+      </LeafRow>
+    );
+  }
+  if (isClassInstanceRef(value)) {
+    return (
+      <ClassInstanceNode
+        field={field}
+        instance={value}
+        isLast={isLast}
+        ctx={ctx}
+      />
+    );
+  }
+
+  const container = describeContainer(value);
+  if (container) {
+    return (
+      <ExpandableContainer
+        field={field}
+        entries={container.entries}
+        open={container.open}
+        close={container.close}
+        prefix={container.prefix}
+        ctx={ctx}
+        isLast={isLast}
+      />
+    );
+  }
+
+  return (
+    <PrimitiveValue field={field} value={value} isLast={isLast} ctx={ctx} />
+  );
+}
+
+function ClassInstanceNode({
+  field,
+  instance,
+  isLast,
+  ctx,
+}: {
+  field?: string;
+  instance: ClassInstanceRef;
+  isLast: boolean;
+  ctx: NodeContext;
+}) {
+  const container = describeContainer(instance.data);
+  if (container) {
+    return (
+      <ExpandableContainer
+        field={field}
+        entries={container.entries}
+        open={container.open}
+        close={container.close}
+        prefix={instance.className}
+        ctx={ctx}
+        isLast={isLast}
+      />
+    );
+  }
+  const { text, cls } = describePrimitive(instance.data);
+  return (
+    <LeafRow field={field} isLast={isLast}>
+      <span className={CLS.className}>{instance.className}</span>
+      <span className={cls}>{text}</span>
+    </LeafRow>
+  );
+}
+
+function JsonTree({
+  data,
+  name,
+  expandLevel,
+}: {
+  data: unknown;
+  name?: string;
+  expandLevel: number;
+}) {
+  const outerRef = useRef<HTMLDivElement>(null);
+  const shouldExpand = useMemo(
+    () => (level: number) => level < expandLevel,
+    [expandLevel]
+  );
+  return (
+    <div
+      ref={outerRef}
+      className={CLS.container}
+      role="tree"
+      aria-label="JSON view"
+    >
+      <DataRender
+        field={name}
+        value={data}
+        isLast
+        ctx={{ level: 0, shouldExpand, outerRef }}
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Ref / typed-array collapsing (preprocessing before render)
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a non-expandable wrapper that carries ref data as non-enumerable
+ * properties so the renderer can detect StreamRef/RunRef without exposing
+ * their internals as object fields.
+ */
+function makeOpaqueRef(ref: Record<string, unknown>): unknown {
+  const opaque = Object.create(null);
+  for (const [key, value] of Object.entries(ref)) {
+    Object.defineProperty(opaque, key, { value, enumerable: false });
+  }
+  return opaque;
+}
+
+function makeBytesDisplay(display: FormattedStreamChunkDisplay): unknown {
+  const opaque = Object.create(null);
+  Object.defineProperty(opaque, '__type', {
+    value: BYTES_DISPLAY_TYPE,
+    enumerable: false,
+  });
+  Object.defineProperty(opaque, 'text', {
+    value: display.text,
+    enumerable: false,
+  });
+  Object.defineProperty(opaque, 'decodedFrom', {
+    value: display.decodedFrom,
+    enumerable: false,
+  });
+  return opaque;
+}
+
+/**
+ * Recursively walk data and replace RunRef/StreamRef/typed array objects with
+ * non-expandable versions so the renderer doesn't show their internals.
+ * Only recurses into plain objects and arrays to avoid stripping class
+ * instances (Date, Error, URL, Headers, etc.) that have their own rendering.
+ * Map and Set contents are prepared here; other iterable contents are prepared
+ * when the renderer traverses them.
+ *
+ * Exported for testing the typed-array detection path used by hydrated
+ * AI agent stream chunks (e.g. `{ delta: new Uint8Array(...) }`).
+ */
+export function collapseRefs(data: unknown): unknown {
+  if (data === null || typeof data !== 'object') return data;
+  if (ArrayBuffer.isView(data) && !(data instanceof DataView)) {
+    return makeBytesDisplay(formatArrayBufferViewForDisplay(data));
+  }
+  if (isRunRef(data) || isStreamRef(data))
+    return makeOpaqueRef(data as unknown as Record<string, unknown>);
+  if (Array.isArray(data)) return data.map(collapseRefs);
+  if (data instanceof Map) {
+    return new Map(
+      Array.from(data.entries(), ([key, value]) => [
+        collapseRefs(key),
+        collapseRefs(value),
+      ])
+    );
+  }
+  if (data instanceof Set) {
+    return new Set(Array.from(data.values(), collapseRefs));
+  }
+  // Only recurse into plain objects; leave class instances untouched
+  const proto = Object.getPrototypeOf(data);
+  if (proto !== Object.prototype && proto !== null) return data;
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(data)) {
+    result[key] = collapseRefs(value);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Public component
+// ---------------------------------------------------------------------------
+
+export interface DataInspectorProps {
+  /** The data to inspect */
+  data: unknown;
+  /** Levels strictly below this number auto-expand (default: 2) */
+  expandLevel?: number;
+  /** Optional name for the root node */
+  name?: string;
+  /** Callback when a stream reference is clicked */
+  onStreamClick?: (streamId: string) => void;
+  /** Callback when a run reference is clicked */
+  onRunClick?: (runId: string) => void;
+  /** Callback when an encrypted marker is clicked (triggers decryption) */
+  onDecrypt?: () => void;
+  /** Whether decryption is currently in progress */
+  isDecrypting?: boolean;
+  /** Whether decryption is unavailable */
+  isDecryptDisabled?: boolean;
+  /** Explains why decryption is unavailable */
+  decryptDisabledReason?: string;
+}
+
+export function DataInspector({
+  data,
+  expandLevel = 2,
+  name,
+  onStreamClick,
+  onRunClick,
+  onDecrypt,
+  isDecrypting = false,
+  isDecryptDisabled = false,
+  decryptDisabledReason,
+}: DataInspectorProps) {
+  const collapsedData = useMemo(() => collapseRefs(data), [data]);
+  const stableData = useStableInspectorData(collapsedData);
+
+  let content: ReactNode = (
+    <>
+      {/* React 19 hoists & dedupes this <style> by href, so it is emitted once
+          regardless of how many inspectors are mounted. */}
+      <style href="wf-json-view" precedence="default">
+        {JSON_VIEW_STYLES}
+      </style>
+      <JsonTree data={stableData} name={name} expandLevel={expandLevel} />
+    </>
+  );
+
+  if (onStreamClick) {
+    content = (
+      <StreamClickContext.Provider value={onStreamClick}>
+        {content}
+      </StreamClickContext.Provider>
+    );
+  }
+  if (onRunClick) {
+    content = (
+      <RunClickContext.Provider value={onRunClick}>
+        {content}
+      </RunClickContext.Provider>
+    );
+  }
+  if (onDecrypt) {
+    content = (
+      <DecryptClickContext.Provider
+        value={{
+          onDecrypt,
+          isDecrypting,
+          isDecryptDisabled,
+          decryptDisabledReason,
+        }}
+      >
+        {content}
+      </DecryptClickContext.Provider>
+    );
+  }
+
+  return content;
+}
+
+// ---------------------------------------------------------------------------
+// Render stabilization (avoid re-renders when data is deeply equal)
+// ---------------------------------------------------------------------------
+
+function useStableInspectorData<T>(next: T): T {
+  const previousRef = useRef<T>(next);
+  if (!isDeepEqual(previousRef.current, next)) {
+    previousRef.current = next;
+  }
+  return previousRef.current;
+}
+
+function isObjectLike(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isSameBytesDisplay(a: BytesDisplay, b: BytesDisplay): boolean {
+  return (
+    a.text === b.text &&
+    a.decodedFrom?.type === b.decodedFrom?.type &&
+    a.decodedFrom?.encoding === b.decodedFrom?.encoding &&
+    a.decodedFrom?.rawSummary === b.decodedFrom?.rawSummary
+  );
+}
+
+function haveSameIterableValues(
+  a: Iterable<unknown>,
+  b: Iterable<unknown>,
+  seen: WeakMap<object, object>
+): boolean {
+  const aIterator = a[Symbol.iterator]();
+  const bIterator = b[Symbol.iterator]();
+  while (true) {
+    const aResult = aIterator.next();
+    const bResult = bIterator.next();
+    if (aResult.done || bResult.done) {
+      return aResult.done === bResult.done;
+    }
+    if (!isDeepEqual(aResult.value, bResult.value, seen)) return false;
+  }
+}
+
+export function isDeepEqual(
+  a: unknown,
+  b: unknown,
+  seen = new WeakMap()
+): boolean {
+  if (Object.is(a, b)) return true;
+
+  if (isBytesDisplay(a) || isBytesDisplay(b)) {
+    return isBytesDisplay(a) && isBytesDisplay(b) && isSameBytesDisplay(a, b);
+  }
+
+  if (a instanceof Date && b instanceof Date) {
+    return a.getTime() === b.getTime();
+  }
+
+  if (a instanceof RegExp && b instanceof RegExp) {
+    return a.source === b.source && a.flags === b.flags;
+  }
+
+  if (isGenericIterable(a) || isGenericIterable(b)) {
+    if (!isGenericIterable(a) || !isGenericIterable(b)) return false;
+    if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+    if (isSelfIterableIterator(a) || isSelfIterableIterator(b)) return false;
+    if (seen.get(a) === b) return true;
+    seen.set(a, b);
+    const aHasEntries = isEntryIterable(a);
+    const bHasEntries = isEntryIterable(b);
+    if (aHasEntries !== bHasEntries) return false;
+    if (aHasEntries && bHasEntries) {
+      return haveSameIterableValues(a.entries(), b.entries(), seen);
+    }
+    return haveSameIterableValues(a, b, seen);
+  }
+
+  if (a instanceof Map && b instanceof Map) {
+    if (a.size !== b.size) return false;
+    for (const [key, value] of a.entries()) {
+      if (!b.has(key) || !isDeepEqual(value, b.get(key), seen)) return false;
+    }
+    return true;
+  }
+
+  if (a instanceof Set && b instanceof Set) {
+    if (a.size !== b.size) return false;
+    for (const value of a.values()) {
+      if (!b.has(value)) return false;
+    }
+    return true;
+  }
+
+  if (!isObjectLike(a) || !isObjectLike(b)) {
+    return false;
+  }
+
+  if (seen.get(a) === b) return true;
+  seen.set(a, b);
+
+  const aIsArray = Array.isArray(a);
+  const bIsArray = Array.isArray(b);
+  if (aIsArray !== bIsArray) return false;
+
+  if (aIsArray && bIsArray) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (!isDeepEqual(a[i], b[i], seen)) return false;
+    }
+    return true;
+  }
+
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+
+  for (const key of aKeys) {
+    if (!Object.hasOwn(b, key)) return false;
+    if (!isDeepEqual(a[key], b[key], seen)) return false;
+  }
+
+  return true;
+}

@@ -1,59 +1,117 @@
-import type { Storage } from '@workflow/world';
-import { createWorkflowRunEvent, getWorkflowRunEvents } from './events.js';
+import type {
+  AnyEventRequest,
+  CreateEventParams,
+  Storage,
+} from '@workflow/world';
+import { SPEC_VERSION_SINGLE_ORCHESTRATOR } from '@workflow/world';
 import {
-  createHook,
-  disposeHook,
-  getHook,
-  getHookByToken,
-  listHooks,
-} from './hooks.js';
+  createWorkflowRunEvent,
+  createWorkflowRunEventBatch,
+  getEvent,
+  getWorkflowRunEvents,
+} from './events.js';
 import {
-  cancelWorkflowRun,
-  createWorkflowRun,
+  cursorAfterSlot,
+  GAP_FILL_PAGE_SIZE,
+  subscribeRunEvents,
+} from './events-live-feed.js';
+import { getHook, getHookByToken, listHooks } from './hooks.js';
+import { instrumentObject } from './instrumentObject.js';
+import {
+  cancelWorkflowRuns,
+  experimentalSetAttributes,
   getWorkflowRun,
+  getWorkflowRuns,
   listWorkflowRuns,
-  pauseWorkflowRun,
-  resumeWorkflowRun,
-  updateWorkflowRun,
+  waitForWorkflowRunTerminalStatus,
 } from './runs.js';
-import {
-  createStep,
-  getStep,
-  listWorkflowRunSteps,
-  updateStep,
-} from './steps.js';
+import { createSnapshotsStorage } from './snapshots.js';
+import { getStep, listWorkflowRunSteps } from './steps.js';
 import type { APIConfig } from './utils.js';
 
 export function createStorage(config?: APIConfig): Storage {
-  return {
+  const snapshots = createSnapshotsStorage(config);
+  const storage: Storage = {
     // Storage interface with namespaced methods
     runs: {
-      create: (data) => createWorkflowRun(data, config),
-      get: (id, params) => getWorkflowRun(id, params, config),
-      update: (id, data) => updateWorkflowRun(id, data, config),
-      list: (params) => listWorkflowRuns(params, config),
-      cancel: (id, params) => cancelWorkflowRun(id, params, config),
-      pause: (id, params) => pauseWorkflowRun(id, params, config),
-      resume: (id, params) => resumeWorkflowRun(id, params, config),
+      get: ((id: string, params?: any) =>
+        getWorkflowRun(id, params, config)) as Storage['runs']['get'],
+      waitForTerminalStatus: ((id: string, params?: any) =>
+        waitForWorkflowRunTerminalStatus(id, params, config)) as NonNullable<
+        Storage['runs']['waitForTerminalStatus']
+      >,
+      getMany: ((ids: readonly string[], params?: any) =>
+        getWorkflowRuns(ids, params, config)) as NonNullable<
+        Storage['runs']['getMany']
+      >,
+      list: ((params?: any) =>
+        listWorkflowRuns(params, config)) as Storage['runs']['list'],
+      experimentalSetAttributes: (runId, changes, options) =>
+        experimentalSetAttributes(runId, changes, options, config),
+      cancelMany: (request) => cancelWorkflowRuns(request, config),
     },
     steps: {
-      create: (runId, data) => createStep(runId, data, config),
-      get: (runId, stepId, params) => getStep(runId, stepId, params, config),
-      update: (runId, stepId, data) => updateStep(runId, stepId, data, config),
-      list: (params) => listWorkflowRunSteps(params, config),
+      get: ((runId: string, stepId: string, params?: any) =>
+        getStep(runId, stepId, params, config)) as Storage['steps']['get'],
+      list: ((params: any) =>
+        listWorkflowRunSteps(params, config)) as Storage['steps']['list'],
     },
     events: {
-      create: (runId, data, params) =>
-        createWorkflowRunEvent(runId, data, params, config),
+      create: (
+        runId: string | null,
+        data: AnyEventRequest,
+        params?: CreateEventParams
+      ) => createWorkflowRunEvent(runId, data, params, config),
+      createBatch: (runId, events, params) =>
+        createWorkflowRunEventBatch(runId, events, params, config),
+      get: (runId, eventId, params) => getEvent(runId, eventId, params, config),
       list: (params) => getWorkflowRunEvents(params, config),
       listByCorrelationId: (params) => getWorkflowRunEvents(params, config),
     },
     hooks: {
-      create: (runId, data) => createHook(runId, data, config),
       get: (hookId, params) => getHook(hookId, params, config),
       getByToken: (token) => getHookByToken(token, config),
       list: (params) => listHooks(params, config),
-      dispose: (hookId) => disposeHook(hookId, config),
     },
+    experimental_snapshots: snapshots,
+  };
+
+  // Instrument all storage methods with tracing
+  // NOTE: Span names are lowercase per OTEL semantic conventions
+  return {
+    runs: instrumentObject('world.runs', storage.runs),
+    steps: instrumentObject('world.steps', storage.steps),
+    events: {
+      ...instrumentObject('world.events', storage.events),
+      // Outside the instrumentation: it returns its unsubscribe synchronously
+      // and stays open for a whole blocked wait, so a per-call span would
+      // measure nothing.
+      subscribe: (runId, afterSlot, onEvent, options) =>
+        subscribeRunEvents(
+          runId,
+          afterSlot,
+          onEvent,
+          options,
+          config,
+          // Fills a gap a heartbeat reveals: the log after the last slot the
+          // subscription delivered, as the runtime's own poll reads it.
+          (after) =>
+            storage.events.list({
+              runId,
+              pagination: {
+                sortOrder: 'asc',
+                limit: GAP_FILL_PAGE_SIZE,
+                ...(after >= 1 ? { cursor: cursorAfterSlot(after) } : {}),
+              },
+              resolveData: 'all',
+              specVersion: SPEC_VERSION_SINGLE_ORCHESTRATOR,
+            })
+        ),
+    },
+    hooks: instrumentObject('world.hooks', storage.hooks),
+    experimental_snapshots: instrumentObject(
+      'world.experimental_snapshots',
+      snapshots
+    ),
   };
 }

@@ -1,75 +1,47 @@
-export interface PromiseWithResolvers<T> {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (reason?: any) => void;
-}
+import { pluralize } from '@workflow/utils';
 
 /**
- * Polyfill for `Promise.withResolvers()`.
- *
- * @see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/withResolvers
- */
-export function withResolvers<T>(): PromiseWithResolvers<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: any) => void;
-  const promise = new Promise<T>((_resolve, _reject) => {
-    resolve = _resolve;
-    reject = _reject;
-  });
-  return { promise, resolve, reject };
-}
-
-/**
- * Creates a lazily-evaluated, memoized version of the provided function.
- *
- * The returned object exposes a `value` getter that calls `fn` only once,
- * caches its result, and returns the cached value on subsequent accesses.
- *
- * @typeParam T - The return type of the provided function.
- * @param fn - The function to be called once and whose result will be cached.
- * @returns An object with a `value` property that returns the memoized result of `fn`.
- */
-export function once<T>(fn: () => T) {
-  const result = {
-    get value() {
-      const value = fn();
-      Object.defineProperty(result, 'value', { value });
-      return value;
-    },
-  };
-  return result;
-}
-
-/**
- * Builds a workflow suspension log message based on the counts of steps and hooks.
- * @param runId - The workflow run ID
+ * Builds a workflow suspension log message based on the counts of steps,
+ * hooks, and waits. The structured logger attaches the run context, so the
+ * message itself only describes what's being enqueued.
  * @param stepCount - Number of steps to be enqueued
  * @param hookCount - Number of hooks to be enqueued
- * @returns The formatted log message or null if both counts are 0
+ * @param waitCount - Number of waits to be enqueued
+ * @returns The formatted log message or null if all counts are 0
  */
 export function buildWorkflowSuspensionMessage(
-  runId: string,
   stepCount: number,
-  hookCount: number
+  hookCount: number,
+  waitCount: number
 ): string | null {
-  if (stepCount === 0 && hookCount === 0) {
+  if (stepCount === 0 && hookCount === 0 && waitCount === 0) {
     return null;
   }
 
   const parts = [];
   if (stepCount > 0) {
-    parts.push(`${stepCount} ${stepCount === 1 ? 'step' : 'steps'}`);
+    parts.push(`${stepCount} ${pluralize('step', 'steps', stepCount)}`);
   }
   if (hookCount > 0) {
-    parts.push(`${hookCount} ${hookCount === 1 ? 'hook' : 'hooks'}`);
+    parts.push(`${hookCount} ${pluralize('hook', 'hooks', hookCount)}`);
+  }
+  if (waitCount > 0) {
+    parts.push(`${waitCount} ${pluralize('timer', 'timers', waitCount)}`);
   }
 
-  const resumeMsg =
-    hookCount > 0
-      ? 'steps are created and hooks are triggered'
-      : 'steps are created';
+  const resumeMsgParts: string[] = [];
+  if (stepCount > 0) {
+    resumeMsgParts.push('steps are completed');
+  }
+  if (hookCount > 0) {
+    resumeMsgParts.push('hooks are received');
+  }
+  if (waitCount > 0) {
+    resumeMsgParts.push('timers have elapsed');
+  }
+  const resumeMsg = resumeMsgParts.join(' and ');
 
-  return `[Workflows] "${runId}" - ${parts.join(' and ')} to be enqueued\n  Workflow will suspend and resume when ${resumeMsg}`;
+  return `${parts.join(' and ')} to be enqueued\n  Workflow will suspend and resume when ${resumeMsg}`;
 }
 
 /**
@@ -91,4 +63,31 @@ export function getWorkflowRunStreamId(runId: string, namespace?: string) {
     'base64url'
   );
   return `${streamId}_${encodedNamespace}`;
+}
+
+/**
+ * Generate a stream ID for an abort signal's backing stream.
+ * Uses the "_system_abort" namespace to isolate from user-defined streams.
+ *
+ * @param id - A unique identifier (typically a ULID)
+ * @returns The stream ID in format: `strm_{id}_system_abort`
+ */
+export function getAbortStreamId(id: string) {
+  return `strm_${id}_system_abort`;
+}
+
+const ABORT_TOKEN_PREFIX = 'abrt_';
+
+/**
+ * Derive the abort stream name from a hook token.
+ * Hook tokens use the format `abrt_{id}`, and the corresponding stream is
+ * `strm_{id}_system_abort`.
+ */
+export function getAbortStreamIdFromToken(hookToken: string): string {
+  if (!hookToken.startsWith(ABORT_TOKEN_PREFIX)) {
+    throw new Error(
+      `Invalid abort hook token format: expected "abrt_" prefix, got "${hookToken}"`
+    );
+  }
+  return getAbortStreamId(hookToken.slice(ABORT_TOKEN_PREFIX.length));
 }

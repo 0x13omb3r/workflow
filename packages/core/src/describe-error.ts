@@ -1,0 +1,328 @@
+import {
+  CorruptedEventLogError,
+  QUICKJS_SNAPSHOT_REMEDIATION,
+  RUN_ERROR_CODES,
+  type RunErrorCode,
+  SerializationError,
+  WorkflowRuntimeError,
+} from '@workflow/errors';
+import { classifyRunError } from './classify-error.js';
+import {
+  NotInStepContextError,
+  NotInWorkflowContextError,
+  NotInWorkflowOrStepContextError,
+  UnavailableInWorkflowContextError,
+} from './context-errors.js';
+
+/**
+ * Attribution of a workflow/step failure for presentation.
+ *
+ * - `user`: the error came from customer code (a step or workflow function
+ *   threw, or a value they passed across a boundary wasn't serializable).
+ * - `sdk`: the SDK produced the error itself: an internal invariant broke,
+ *   or a runtime guard rejected the call. These should be rare; when they
+ *   happen we want to frame the terminal output as "this is us, not you."
+ */
+export type ErrorAttribution = 'user' | 'sdk';
+
+export interface ErrorDescription {
+  attribution: ErrorAttribution;
+  errorCode: RunErrorCode;
+  /**
+   * Short, class-aware hint to help a user understand what the error means.
+   * Only set for well-known SDK error classes (SerializationError,
+   * WorkflowRuntimeError, context-violation errors); `undefined` for plain
+   * user errors, where the stack is already the most useful thing to show.
+   */
+  hint?: string;
+}
+
+/**
+ * Error signal fields carried on persisted failure events (e.g.
+ * `run_failed` / `step_failed`). The shape is intentionally loose:
+ *
+ * - `errorCode` is typed as `string` rather than `RunErrorCode` because
+ *   the value comes from stored JSON/CBOR and may predate the current
+ *   enum, so callers should not narrow on it blindly. Values that don't
+ *   match a known `RUN_ERROR_CODES` entry fall through to USER_ERROR.
+ * - `errorName` is the thrown `Error#name`. It is not universally
+ *   persisted today; callers that have access to it (either via an
+ *   in-memory throw or a richer payload) can pass it in to sharpen
+ *   the attribution and hint. When absent, `describeRunError` still
+ *   returns a sensible attribution from `errorCode` alone.
+ */
+export interface PersistedErrorSignal {
+  errorCode?: string;
+  errorName?: string;
+}
+
+const CONTEXT_ERROR_NAMES = new Set([
+  'NotInWorkflowContextError',
+  'NotInStepContextError',
+  'NotInWorkflowOrStepContextError',
+  'UnavailableInWorkflowContextError',
+]);
+
+function isContextViolationError(err: unknown): boolean {
+  return (
+    err instanceof NotInWorkflowContextError ||
+    err instanceof NotInStepContextError ||
+    err instanceof NotInWorkflowOrStepContextError ||
+    err instanceof UnavailableInWorkflowContextError
+  );
+}
+
+const SERIALIZATION_ERROR_HINT =
+  'A value passed across a workflow/step boundary could not be serialized. See the error message for the offending path and the Learn More link for details.';
+const CONTEXT_ERROR_HINT =
+  'A workflow-only or step-only API was called from the wrong context. The error message includes the exact API and how to move the call.';
+const RUNTIME_ERROR_HINT =
+  'This is an internal workflow SDK error, not a bug in your code. If it keeps happening, please report it with the stack trace and the runId.';
+const CORRUPTED_EVENT_LOG_HINT =
+  'The workflow event log contains orphaned or mismatched events and cannot be replayed. This is an internal workflow SDK error; please report it with the runId.';
+const REPLAY_TIMEOUT_HINT = `The workflow replay between step boundaries took too long. This bounds workflow-VM and event-log replay time only — step bodies (\`"use step"\` functions) are excluded. This usually means the event log is unusually large or the workflow function is doing heavy synchronous work in workflow code outside of step bodies. ${QUICKJS_SNAPSHOT_REMEDIATION} You can also override the default budget via the WORKFLOW_REPLAY_TIMEOUT_MS env var.`;
+const MAX_DELIVERIES_HINT =
+  'The workflow queue exceeded its max-delivery budget. This usually indicates a persistent runtime failure — check the most recent stack traces for the underlying cause.';
+const MAX_EVENTS_HINT = `The workflow exceeded the maximum number of events per run. If the run is expected to be long-running: ${QUICKJS_SNAPSHOT_REMEDIATION} Otherwise, check for unbounded work in the workflow function (e.g. a loop that keeps creating steps without terminating), or split the work into child workflows.`;
+const STREAM_ERROR_HINT =
+  'Workflow stream infrastructure failed while reading or writing data. This is an SDK or backend failure, not an error in your workflow code; please retry the run and report persistent failures with the runId.';
+const WORLD_CONTRACT_HINT =
+  'The workflow backend returned data that violated the SDK contract. This is not retryable; please report it with the stack trace and runId.';
+const DEPLOYMENT_MISMATCH_HINT =
+  "The run was delivered to a deployment other than the deployment it is pinned to, and was stopped to protect against code-skew errors after the runtime failed to re-route it there. Verify that the run's deployment is still available and that queue callbacks route to it.";
+
+const WORKFLOW_NOT_REGISTERED_HINT =
+  'The deployment that executed this run does not have its workflow registered. Usually the run was started or replayed against a deployment where the workflow was renamed, moved, or removed, or the build did not bundle it. Check the workflowId and the deployment the run is pinned to.';
+
+/**
+ * Attribution and hint for persisted error codes that fully determine the
+ * presentation on their own (no `errorName` needed). Used by
+ * {@link describeRunError} after the name-based checks.
+ */
+const CODE_DESCRIPTIONS: Partial<
+  Record<RunErrorCode, Omit<ErrorDescription, 'errorCode'>>
+> = {
+  [RUN_ERROR_CODES.REPLAY_TIMEOUT]: {
+    attribution: 'sdk',
+    hint: REPLAY_TIMEOUT_HINT,
+  },
+  [RUN_ERROR_CODES.MAX_DELIVERIES_EXCEEDED]: {
+    attribution: 'sdk',
+    hint: MAX_DELIVERIES_HINT,
+  },
+  [RUN_ERROR_CODES.MAX_EVENTS_EXCEEDED]: {
+    attribution: 'user',
+    hint: MAX_EVENTS_HINT,
+  },
+  [RUN_ERROR_CODES.CORRUPTED_EVENT_LOG]: {
+    attribution: 'sdk',
+    hint: CORRUPTED_EVENT_LOG_HINT,
+  },
+  [RUN_ERROR_CODES.STREAM_ERROR]: {
+    attribution: 'sdk',
+    hint: STREAM_ERROR_HINT,
+  },
+  [RUN_ERROR_CODES.WORLD_CONTRACT_ERROR]: {
+    attribution: 'sdk',
+    hint: WORLD_CONTRACT_HINT,
+  },
+  [RUN_ERROR_CODES.DEPLOYMENT_MISMATCH]: {
+    attribution: 'sdk',
+    hint: DEPLOYMENT_MISMATCH_HINT,
+  },
+  [RUN_ERROR_CODES.WORKFLOW_NOT_REGISTERED]: {
+    attribution: 'sdk',
+    hint: WORKFLOW_NOT_REGISTERED_HINT,
+  },
+  [RUN_ERROR_CODES.RUNTIME_ERROR]: {
+    attribution: 'sdk',
+    hint: RUNTIME_ERROR_HINT,
+  },
+};
+
+function normalizeErrorCode(code: string | undefined): RunErrorCode {
+  // Values read back from persisted events are `string | undefined`, so we
+  // only trust codes that match a known entry in `RUN_ERROR_CODES`.
+  const known = Object.values(RUN_ERROR_CODES) as readonly string[];
+  if (code && known.includes(code)) {
+    return code as RunErrorCode;
+  }
+  return RUN_ERROR_CODES.USER_ERROR;
+}
+
+/**
+ * Data-driven variant of {@link describeError} that works from persisted
+ * event fields instead of a live `Error` instance. Intended for command-line
+ * interface (CLI) and web renderers that read failure events and no longer
+ * have the original thrown object.
+ */
+export function describeRunError(
+  signal: PersistedErrorSignal
+): ErrorDescription {
+  const name = signal.errorName;
+  const errorCode =
+    name === 'CorruptedEventLogError'
+      ? RUN_ERROR_CODES.CORRUPTED_EVENT_LOG
+      : normalizeErrorCode(signal.errorCode);
+
+  if (name === 'SerializationError') {
+    return { attribution: 'user', errorCode, hint: SERIALIZATION_ERROR_HINT };
+  }
+  if (name && CONTEXT_ERROR_NAMES.has(name)) {
+    return { attribution: 'user', errorCode, hint: CONTEXT_ERROR_HINT };
+  }
+  if (name === 'CorruptedEventLogError') {
+    return {
+      attribution: 'sdk',
+      errorCode,
+      hint: CORRUPTED_EVENT_LOG_HINT,
+    };
+  }
+  // Runs that failed on SDKs before WORKFLOW_NOT_REGISTERED existed persisted
+  // RUNTIME_ERROR; the error name still identifies the targeting/build cause.
+  if (name === 'WorkflowNotRegisteredError') {
+    return {
+      attribution: 'sdk',
+      errorCode,
+      hint: WORKFLOW_NOT_REGISTERED_HINT,
+    };
+  }
+  const byCode = CODE_DESCRIPTIONS[errorCode];
+  if (byCode) {
+    return { ...byCode, errorCode };
+  }
+  if (name === 'WorkflowRuntimeError' || name === 'StepNotRegisteredError') {
+    return { attribution: 'sdk', errorCode, hint: RUNTIME_ERROR_HINT };
+  }
+  return { attribution: 'user', errorCode };
+}
+
+/**
+ * Describe an error for user-facing presentation. Purely informational: it
+ * does not change any persisted event data or error classification used by
+ * the runtime.
+ *
+ * The attribution here is more nuanced than `classifyRunError`:
+ *
+ * - `SerializationError` is technically raised by the SDK, but it almost
+ *   always points at something the caller did (passed a non-serializable
+ *   value, didn't register a class). We attribute it to the user.
+ * - Context-violation errors (`NotInWorkflowContextError`, etc.) likewise
+ *   describe a user mistake.
+ * - `WorkflowRuntimeError` (and subclasses like `StepNotRegisteredError`)
+ *   indicates an internal SDK invariant broke, so surface that as `sdk`.
+ *
+ * @param err The error value thrown by the workflow / step.
+ * @param errorCode Optional precomputed error code. Callers that already
+ *   know the code (e.g. `REPLAY_TIMEOUT` or `MAX_DELIVERIES_EXCEEDED`, which
+ *   `classifyRunError` can't derive from the error alone) should pass it so
+ *   the attribution and hint reflect the actual failure category.
+ */
+export function describeError(
+  err: unknown,
+  errorCode?: RunErrorCode
+): ErrorDescription {
+  const effectiveCode = errorCode ?? classifyRunError(err);
+
+  if (SerializationError.is(err)) {
+    return {
+      attribution: 'user',
+      errorCode: effectiveCode,
+      hint: SERIALIZATION_ERROR_HINT,
+    };
+  }
+
+  if (isContextViolationError(err)) {
+    return {
+      attribution: 'user',
+      errorCode: effectiveCode,
+      hint: CONTEXT_ERROR_HINT,
+    };
+  }
+
+  if (CorruptedEventLogError.is(err)) {
+    return {
+      attribution: 'sdk',
+      errorCode: effectiveCode,
+      hint: CORRUPTED_EVENT_LOG_HINT,
+    };
+  }
+
+  // Check DEPLOYMENT_MISMATCH before the generic WorkflowRuntimeError branch:
+  // WorkflowDeploymentMismatchError subclasses it, but has its own code + hint.
+  if (effectiveCode === RUN_ERROR_CODES.DEPLOYMENT_MISMATCH) {
+    return {
+      attribution: 'sdk',
+      errorCode: effectiveCode,
+      hint: DEPLOYMENT_MISMATCH_HINT,
+    };
+  }
+
+  // Likewise WorkflowNotRegisteredError: a WorkflowRuntimeError subclass with
+  // its own code and a targeting/build hint instead of the internal-error one.
+  if (effectiveCode === RUN_ERROR_CODES.WORKFLOW_NOT_REGISTERED) {
+    return {
+      attribution: 'sdk',
+      errorCode: effectiveCode,
+      hint: WORKFLOW_NOT_REGISTERED_HINT,
+    };
+  }
+
+  if (err instanceof WorkflowRuntimeError) {
+    return {
+      attribution: 'sdk',
+      errorCode: effectiveCode,
+      hint: RUNTIME_ERROR_HINT,
+    };
+  }
+
+  if (effectiveCode === RUN_ERROR_CODES.REPLAY_TIMEOUT) {
+    return {
+      attribution: 'sdk',
+      errorCode: effectiveCode,
+      hint: REPLAY_TIMEOUT_HINT,
+    };
+  }
+
+  if (effectiveCode === RUN_ERROR_CODES.MAX_DELIVERIES_EXCEEDED) {
+    return {
+      attribution: 'sdk',
+      errorCode: effectiveCode,
+      hint: MAX_DELIVERIES_HINT,
+    };
+  }
+
+  if (effectiveCode === RUN_ERROR_CODES.MAX_EVENTS_EXCEEDED) {
+    return {
+      attribution: 'user',
+      errorCode: effectiveCode,
+      hint: MAX_EVENTS_HINT,
+    };
+  }
+
+  if (effectiveCode === RUN_ERROR_CODES.CORRUPTED_EVENT_LOG) {
+    return {
+      attribution: 'sdk',
+      errorCode: effectiveCode,
+      hint: CORRUPTED_EVENT_LOG_HINT,
+    };
+  }
+
+  if (effectiveCode === RUN_ERROR_CODES.STREAM_ERROR) {
+    return {
+      attribution: 'sdk',
+      errorCode: effectiveCode,
+      hint: STREAM_ERROR_HINT,
+    };
+  }
+
+  if (effectiveCode === RUN_ERROR_CODES.WORLD_CONTRACT_ERROR) {
+    return {
+      attribution: 'sdk',
+      errorCode: effectiveCode,
+      hint: WORLD_CONTRACT_HINT,
+    };
+  }
+
+  return { attribution: 'user', errorCode: effectiveCode };
+}

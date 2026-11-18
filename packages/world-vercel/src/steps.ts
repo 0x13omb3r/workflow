@@ -4,48 +4,118 @@ import {
   type ListWorkflowRunStepsParams,
   type PaginatedResponse,
   PaginatedResponseSchema,
+  SerializedDataSchema,
   type Step,
   StepSchema,
+  type StepWithoutData,
   type UpdateStepRequest,
 } from '@workflow/world';
 import { z } from 'zod';
+import { normalizeStepData } from './serialized-data.js';
 import type { APIConfig } from './utils.js';
 import {
   DEFAULT_RESOLVE_DATA_OPTION,
-  dateToStringReplacer,
   makeRequest,
+  serializeError,
 } from './utils.js';
 
-// Local schema for lazy mode with refs instead of data
-const StepWithRefsSchema = StepSchema.omit({
+/**
+ * Wire format schema for steps coming from the backend.
+ *
+ * `error` is SerializedData (Uint8Array) produced by dehydrateStepError.
+ * For backward compatibility with legacy wire formats, we also accept
+ * any other shape and let the resolved `errorRef` supersede it when present.
+ */
+export const StepWireSchema = StepSchema.omit({
+  error: true,
+}).extend({
+  error: z.union([SerializedDataSchema, z.any()]).optional(),
+  errorRef: z.any().optional(),
+});
+
+// Wire schema for lazy mode with refs instead of data
+const StepWireWithRefsSchema = StepWireSchema.omit({
   input: true,
   output: true,
 }).extend({
   // We discard the results of the refs, so we don't care about the type here
   inputRef: z.any().optional(),
   outputRef: z.any().optional(),
-  input: z.array(z.any()).optional(),
-  output: z.any().optional(),
+  input: z.instanceof(Uint8Array).optional(),
+  output: z.instanceof(Uint8Array).optional(),
 });
 
-// Helper to filter step data based on resolveData setting
-function filterStepData(step: any, resolveData: 'none' | 'all'): Step {
+/**
+ * Transform step from wire format to Step interface format.
+ *
+ * The `error` field on Step is SerializedData (Uint8Array) from the
+ * serialization pipeline. We pass through the wire-format `error` (or
+ * the resolved `errorRef`) as-is. Consumers hydrate via `hydrateStepError`.
+ *
+ * Wire→shape only: this does NOT decompress. The runtime write paths
+ * (createStep/updateStep/events.create) re-hydrate step payloads through
+ * `hydrateStepReturnValue`/`hydrateStepError`, which decompress on their
+ * own, so decompressing here would be redundant work and would skew the
+ * runtime's deserialize compression telemetry. Compression normalization
+ * for o11y/display is applied in {@link filterStepData}, the read path.
+ */
+export function deserializeStep(wireStep: any): Step {
+  const { error, errorRef, ...rest } = wireStep;
+  const result: any = { ...rest };
+  const errorSource = error ?? errorRef;
+  if (errorSource !== undefined && errorSource !== null) {
+    result.error = errorSource;
+  }
+  return result as Step;
+}
+
+// Overloaded function signatures for filterStepData
+function filterStepData(step: any, resolveData: 'none'): StepWithoutData;
+function filterStepData(step: any, resolveData: 'all'): Step;
+function filterStepData(
+  step: any,
+  resolveData: 'none' | 'all'
+): Step | StepWithoutData;
+
+// Implementation - when resolveData='none', returns Step with input/output set to undefined
+// to match other World implementations (world-local, world-postgres).
+//
+// This is the read/display entry point, so it decompresses gzip/zstd
+// payload wrappers via `normalizeStepData` (the runtime write paths use
+// `deserializeStep` directly and skip this (see its doc comment).
+function filterStepData(
+  step: any,
+  resolveData: 'none' | 'all'
+): Step | StepWithoutData {
   if (resolveData === 'none') {
     const { inputRef: _inputRef, outputRef: _outputRef, ...rest } = step;
+    const deserialized = normalizeStepData(deserializeStep(rest));
     return {
-      ...rest,
-      input: [],
+      ...deserialized,
+      input: undefined,
       output: undefined,
-    };
+    } as StepWithoutData;
   }
-  return step;
+  return normalizeStepData(deserializeStep(step));
 }
 
 // Functions
 export async function listWorkflowRunSteps(
+  params: ListWorkflowRunStepsParams & { resolveData: 'none' },
+  config?: APIConfig
+): Promise<PaginatedResponse<StepWithoutData>>;
+export async function listWorkflowRunSteps(
+  params: ListWorkflowRunStepsParams & { resolveData?: 'all' },
+  config?: APIConfig
+): Promise<PaginatedResponse<Step>>;
+export async function listWorkflowRunSteps(
   params: ListWorkflowRunStepsParams,
   config?: APIConfig
-): Promise<PaginatedResponse<Step>> {
+): Promise<PaginatedResponse<Step | StepWithoutData>>;
+export async function listWorkflowRunSteps(
+  params: ListWorkflowRunStepsParams,
+  config?: APIConfig
+): Promise<PaginatedResponse<Step | StepWithoutData>> {
   const {
     runId,
     pagination,
@@ -64,14 +134,14 @@ export async function listWorkflowRunSteps(
   searchParams.set('remoteRefBehavior', remoteRefBehavior);
 
   const queryString = searchParams.toString();
-  const endpoint = `/v1/runs/${runId}/steps${queryString ? `?${queryString}` : ''}`;
+  const endpoint = `/v2/runs/${encodeURIComponent(runId)}/steps${queryString ? `?${queryString}` : ''}`;
 
   const response = (await makeRequest({
     endpoint,
     options: { method: 'GET' },
     config,
     schema: PaginatedResponseSchema(
-      remoteRefBehavior === 'lazy' ? StepWithRefsSchema : StepSchema
+      remoteRefBehavior === 'lazy' ? StepWireWithRefsSchema : StepWireSchema
     ) as any,
   })) as PaginatedResponse<any>;
 
@@ -86,15 +156,14 @@ export async function createStep(
   data: CreateStepRequest,
   config?: APIConfig
 ): Promise<Step> {
-  return makeRequest({
-    endpoint: `/v1/runs/${runId}/steps`,
-    options: {
-      method: 'POST',
-      body: JSON.stringify(data, dateToStringReplacer),
-    },
+  const step = await makeRequest({
+    endpoint: `/v2/runs/${encodeURIComponent(runId)}/steps`,
+    options: { method: 'POST' },
+    data,
     config,
-    schema: StepSchema,
+    schema: StepWireSchema,
   });
+  return deserializeStep(step);
 }
 
 export async function updateStep(
@@ -103,23 +172,41 @@ export async function updateStep(
   data: UpdateStepRequest,
   config?: APIConfig
 ): Promise<Step> {
-  return makeRequest({
-    endpoint: `/v1/runs/${runId}/steps/${stepId}`,
-    options: {
-      method: 'PUT',
-      body: JSON.stringify(data, dateToStringReplacer),
-    },
+  const serialized = serializeError(data);
+  const step = await makeRequest({
+    endpoint: `/v2/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}`,
+    options: { method: 'PUT' },
+    data: serialized,
     config,
-    schema: StepSchema,
+    schema: StepWireSchema,
   });
+  return deserializeStep(step);
 }
 
 export async function getStep(
-  runId: string | undefined,
+  runId: string,
+  stepId: string,
+  params: GetStepParams & { resolveData: 'none' },
+  config?: APIConfig
+): Promise<StepWithoutData>;
+export async function getStep(
+  runId: string,
+  stepId: string,
+  params?: GetStepParams & { resolveData?: 'all' },
+  config?: APIConfig
+): Promise<Step>;
+export async function getStep(
+  runId: string,
   stepId: string,
   params?: GetStepParams,
   config?: APIConfig
-): Promise<Step> {
+): Promise<Step | StepWithoutData>;
+export async function getStep(
+  runId: string,
+  stepId: string,
+  params?: GetStepParams,
+  config?: APIConfig
+): Promise<Step | StepWithoutData> {
   const resolveData = params?.resolveData ?? DEFAULT_RESOLVE_DATA_OPTION;
   const remoteRefBehavior = resolveData === 'none' ? 'lazy' : 'resolve';
 
@@ -127,17 +214,15 @@ export async function getStep(
   searchParams.set('remoteRefBehavior', remoteRefBehavior);
 
   const queryString = searchParams.toString();
-  const endpoint = runId
-    ? `/v1/runs/${runId}/steps/${stepId}${queryString ? `?${queryString}` : ''}`
-    : `/v1/steps/${stepId}${queryString ? `?${queryString}` : ''}`;
+  const endpoint = `/v2/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}${queryString ? `?${queryString}` : ''}`;
 
   const step = await makeRequest({
     endpoint,
     options: { method: 'GET' },
     config,
     schema: (remoteRefBehavior === 'lazy'
-      ? StepWithRefsSchema
-      : StepSchema) as any,
+      ? StepWireWithRefsSchema
+      : StepWireSchema) as any,
   });
 
   return filterStepData(step, resolveData);

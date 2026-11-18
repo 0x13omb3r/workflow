@@ -1,0 +1,856 @@
+import {
+  RunExpiredError,
+  START_HOOK_CANDIDATE_CANCELLED,
+  WorkflowRunCancelledError,
+  WorkflowRunFailedError,
+  WorkflowRunNotCompletedError,
+  WorkflowRunNotFoundError,
+  WorkflowWorldError,
+} from '@workflow/errors';
+import { WORKFLOW_DESERIALIZE, WORKFLOW_SERIALIZE } from '@workflow/serde';
+import {
+  isTerminalWorkflowRunStatus,
+  SPEC_VERSION_CURRENT,
+  type WorkflowRun,
+  type WorkflowRunStatus,
+  type World,
+} from '@workflow/world';
+import { envNumber } from '@workflow/world/env-config';
+import {
+  deriveRunPayloadKeys,
+  type PayloadKey,
+} from '../serialization/encryption.js';
+import {
+  createForwardedWritable,
+  getForwardedWritableEncryptionKey,
+  getRunReadableStream,
+  hydrateRunError,
+  hydrateWorkflowReturnValue,
+  tagForwardedWritableTarget,
+} from '../serialization.js';
+import { getWorkflowRunStreamId } from '../util.js';
+import { afterRunCancelled } from './after-terminal-write.js';
+import { awaitChildRunCompletion } from './child-run-completion.js';
+import { getWorldLazy } from './get-world-lazy.js';
+import { specVersionForRunWrite } from './run-spec-version.js';
+import {
+  type CancelRunOptions,
+  isSingleOrchestratorRun,
+  type StopSleepOptions,
+  type StopSleepResult,
+  wakeRunAfterOutOfBandWrite,
+  wakeUpRun,
+} from './runs.js';
+
+const RETURN_VALUE_POLL_INTERVAL_MS = 1_000;
+
+/** Concurrent run reads in one `Run.readFinishedRunIds` step. */
+const READ_FINISHED_CONCURRENCY = 20;
+const PAYLOAD_TERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
+  'completed',
+  'failed',
+]);
+
+// Give resilient starts up to 10 seconds to create the run.
+const NOT_FOUND_RETRY_DELAYS = [1_000, 3_000, 6_000];
+
+/** @internal */
+export function getReturnValuePollIntervalMs(): number {
+  return envNumber(
+    'WORKFLOW_RETURN_VALUE_POLL_INTERVAL_MS',
+    RETURN_VALUE_POLL_INTERVAL_MS,
+    { integer: true, min: 1 }
+  );
+}
+
+/**
+ * How long a single `runs.waitForTerminalStatus` call may block while waiting
+ * for a run to finish. The wait is re-issued until the run is terminal, so
+ * this is a per-call budget rather than a limit on total wait time: its only
+ * job is to bound one request so a stalled connection cannot hold the awaiting
+ * side forever.
+ *
+ * 50s is the largest budget `world-vercel` can actually request: it clamps to
+ * `REQUEST_TIMEOUT_MS` (60s) minus 10s of headroom, so the budget is always
+ * observed as a *response* (a non-terminal snapshot) rather than as a
+ * client-side timeout. Asking for more is silently reduced to that, so raising
+ * this without also raising `WORKFLOW_REQUEST_TIMEOUT_MS` has no effect.
+ */
+const RETURN_VALUE_WAIT_TIMEOUT_MS = 50_000;
+
+/** @internal */
+export function getReturnValueWaitTimeoutMs(): number {
+  return envNumber(
+    'WORKFLOW_RETURN_VALUE_WAIT_MS',
+    RETURN_VALUE_WAIT_TIMEOUT_MS,
+    { integer: true, min: 1 }
+  );
+}
+
+/**
+ * How many consecutive long-poll calls `await run.returnValue` will make
+ * before falling back to interval polling for the rest of the wait.
+ *
+ * A cap is worth having because a wait that keeps returning non-terminal is
+ * indistinguishable from one that is not working, and interval polling is the
+ * behavior we know is correct. It does **not** end the await: a run legitimately
+ * lasts hours or days, so exhausting the cap switches strategy and keeps
+ * waiting rather than throwing.
+ *
+ * Note the consequence, since it cuts against the reason the long poll exists:
+ * a run still going after `MAX x budget` (~8 minutes at the defaults) spends
+ * the remainder of its life polling once per
+ * `WORKFLOW_RETURN_VALUE_POLL_INTERVAL_MS`, which is more requests than
+ * continuing to long poll would have cost. Runs that outlive the cap are
+ * exactly the ones the request reduction helped most.
+ */
+const RETURN_VALUE_MAX_LONG_POLLS = 10;
+
+/** @internal */
+export function getReturnValueMaxLongPolls(): number {
+  return envNumber(
+    'WORKFLOW_RETURN_VALUE_MAX_LONG_POLLS',
+    RETURN_VALUE_MAX_LONG_POLLS,
+    { integer: true, min: 1 }
+  );
+}
+
+/**
+ * Whether `await run.returnValue` may use the World's long poll
+ * (`runs.waitForTerminalStatus`). Always `true`: the
+ * `WORKFLOW_RETURN_VALUE_LONG_POLL` kill switch is no longer read.
+ *
+ * @deprecated No longer read by the runtime; always returns `true`.
+ * @internal
+ */
+export function isReturnValueLongPollEnabled(): boolean {
+  return true;
+}
+
+/**
+ * A `ReadableStream` extended with workflow-specific helpers.
+ */
+export type WorkflowReadableStream<R = any> = ReadableStream<R> & {
+  /**
+   * Returns the tail index (index of the last known chunk, 0-based) of the
+   * underlying workflow stream. Useful for resolving a negative `startIndex`
+   * into an absolute position, for example, when building reconnection
+   * endpoints that need to inform the client where the stream starts.
+   *
+   * Returns `-1` when no chunks have been written yet.
+   */
+  getTailIndex(): Promise<number>;
+};
+
+/**
+ * Options for configuring a workflow's readable stream.
+ */
+export interface WorkflowReadableStreamOptions {
+  /**
+   * An optional namespace to distinguish between multiple streams associated
+   * with the same workflow run.
+   */
+  namespace?: string;
+  /**
+   * The index number of the starting chunk to begin reading the stream from.
+   * Negative values start from the end (e.g. -3 reads the last 3 chunks).
+   */
+  startIndex?: number;
+  /**
+   * Any asynchronous operations to complete before pausing or terminating the
+   * execution environment
+   * (i.e. using [`waitUntil()`](https://developer.mozilla.org/docs/Web/API/ExtendableEvent/waitUntil) or similar).
+   */
+  ops?: Promise<any>[];
+  /**
+   * The global object to use for hydrating types from the global scope.
+   *
+   * Defaults to {@link [`globalThis`](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/globalThis)}.
+   */
+  global?: Record<string, any>;
+}
+
+/**
+ * Options for configuring a writable onto a workflow run's stream.
+ */
+export interface WorkflowRunWritableStreamOptions {
+  /**
+   * An optional namespace to distinguish between multiple streams associated
+   * with the same workflow run.
+   */
+  namespace?: string;
+  /**
+   * Any asynchronous operations to complete before pausing or terminating the
+   * execution environment
+   * (i.e. using [`waitUntil()`](https://developer.mozilla.org/docs/Web/API/ExtendableEvent/waitUntil) or similar).
+   *
+   * Writes are acknowledged on buffer entry, so a caller that needs them
+   * durable before the environment goes away should pass an array here and
+   * await it after releasing the writer lock.
+   */
+  ops?: Promise<any>[];
+  /**
+   * The global object to use for reducing types from the global scope.
+   *
+   * Defaults to {@link [`globalThis`](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/globalThis)}.
+   */
+  global?: Record<string, any>;
+}
+
+/**
+ * A handler class for a workflow run.
+ */
+export class Run<TResult> {
+  static [WORKFLOW_SERIALIZE](instance: Run<unknown>) {
+    return {
+      runId: instance.runId,
+      resilientStart: instance.#resilientStart,
+      ...(instance.#parentRunId ? { parentRunId: instance.#parentRunId } : {}),
+    };
+  }
+
+  static [WORKFLOW_DESERIALIZE](data: {
+    runId: string;
+    resilientStart?: boolean;
+    parentRunId?: string;
+  }) {
+    return new Run(data.runId, {
+      resilientStart: data.resilientStart,
+      parentRunId: data.parentRunId,
+    });
+  }
+
+  /**
+   * The ID of the workflow run.
+   */
+  runId: string;
+
+  /**
+   * The world object.
+   * @internal
+   */
+  #worldPromise: Promise<World> | undefined;
+  get #lazyWorldPromise() {
+    if (!this.#worldPromise) this.#worldPromise = getWorldLazy();
+    return this.#worldPromise;
+  }
+
+  /**
+   * Cached encryption key resolution. Resolved once on first use and
+   * reused for returnValue, getReadable(), etc.
+   * @internal
+   */
+  #encryptionKeyPromise: Promise<PayloadKey | undefined> | null = null;
+
+  /**
+   * When true, run_created failed and the run may not exist yet (the
+   * resilient start path will create it via run_started). pollReturnValue
+   * retries on WorkflowRunNotFoundError only when this flag is set so
+   * that normal runs fail fast on 404.
+   * @internal
+   */
+  #resilientStart = false;
+
+  /**
+   * The workflow run that started this run with `start()` and that this run
+   * resumes, through the child-run completion hook, when it finishes. Set only
+   * on handles returned by such a `start()`. Inside that parent workflow,
+   * `returnValue` suspends on the hook instead of polling.
+   * @internal
+   */
+  #parentRunId: string | undefined;
+
+  constructor(
+    runId: string,
+    opts?: { resilientStart?: boolean; parentRunId?: string }
+  ) {
+    this.runId = runId;
+    this.#resilientStart = opts?.resilientStart ?? false;
+    this.#parentRunId = opts?.parentRunId;
+  }
+
+  /**
+   * Resolves and caches the encryption key for this run.
+   * The key is the same for the lifetime of a run, so it only needs
+   * to be resolved once.
+   * @internal
+   */
+  #getEncryptionKey(run?: WorkflowRun): Promise<PayloadKey | undefined> {
+    if (!this.#encryptionKeyPromise) {
+      this.#encryptionKeyPromise = (async () => {
+        const world = await this.#lazyWorldPromise;
+        // Checked before the read, not with `?.` around the call: a World
+        // without encryption has nothing to resolve, so it should not pay for
+        // a run it would discard.
+        if (!world.getEncryptionKeyForRun) return undefined;
+
+        let rawKey: Uint8Array | undefined;
+        if (run) {
+          rawKey = await world.getEncryptionKeyForRun(run);
+        } else {
+          // `getEncryptionKeyForRun` reads only the run's id and deployment,
+          // both of which survive `resolveData: 'none'`. The default ('all')
+          // maps to `remoteRefBehavior=resolve` on world-vercel, which makes
+          // the server resolve and return the run's whole input and output
+          // before a `getReadable()` caller can read its first chunk.
+          const { deploymentId } = await world.runs.get(this.runId, {
+            resolveData: 'none',
+          });
+          rawKey = await world.getEncryptionKeyForRun(this.runId, {
+            deploymentId,
+          });
+        }
+        return rawKey ? await deriveRunPayloadKeys(rawKey) : undefined;
+      })();
+    }
+    return this.#encryptionKeyPromise;
+  }
+
+  /**
+   * Defers fetching the run and its encryption key until a readable is first
+   * consumed. The first pull prefetches it so an encrypted first frame can join
+   * the lookup; this also applies to an empty consumed stream.
+   * @internal
+   */
+  #getEncryptionKeyLazily(): () => Promise<PayloadKey | undefined> {
+    return () => this.#getEncryptionKey();
+  }
+
+  /**
+   * Interrupts pending `sleep()` calls, resuming the workflow early.
+   *
+   * @param options - Optional settings to target specific sleep calls by correlation ID.
+   *   If not provided, all pending sleep calls will be interrupted.
+   * @returns A {@link StopSleepResult} object containing the number of sleep calls that were interrupted.
+   *   On a single-orchestrator run it is the number of sleep calls the run's
+   *   orchestrator was asked to complete, which is best-effort while an
+   *   orchestrator invocation of the run is live (see `wakeUpRun`).
+   */
+  async wakeUp(options?: StopSleepOptions): Promise<StopSleepResult> {
+    'use step';
+    return wakeUpRun(await this.#lazyWorldPromise, this.runId, options);
+  }
+
+  /**
+   * Cancels the workflow run.
+   *
+   * @param options - Optional cancellation settings. `cancelReason` records a
+   *   free-text reason (max 512 chars) on the run_cancelled event, surfaced in
+   *   the run detail view.
+   */
+  async cancel(options?: CancelRunOptions): Promise<void> {
+    'use step';
+    const world = await this.#lazyWorldPromise;
+    // The caller is often not the run's executor, so stamp the run's version.
+    // A run that does not exist is cancelled through the World all the same:
+    // a `start({ experimental_hook })` candidate that was admitted but never created its
+    // run (the one a `WorkflowStartError` names) is fenced by it, so it can
+    // never start. Otherwise the World answers `WorkflowRunNotFoundError`.
+    const run = await world.runs
+      .get(this.runId, { resolveData: 'none' })
+      .catch((err: unknown) => {
+        // Only a World with start Hooks can have a candidate with no run
+        // to fence; anywhere else a missing run stays a plain not-found.
+        if (
+          !WorkflowRunNotFoundError.is(err) ||
+          world.capabilities?.atomicStartHook?.active !== true
+        ) {
+          throw err;
+        }
+        return undefined;
+      });
+    const cancelled = {
+      eventType: 'run_cancelled' as const,
+      specVersion: run
+        ? specVersionForRunWrite(run.specVersion)
+        : SPEC_VERSION_CURRENT,
+      ...(options?.cancelReason !== undefined
+        ? { eventData: { cancelReason: options.cancelReason } }
+        : {}),
+    };
+    if (!run) {
+      try {
+        await world.events.create(this.runId, cancelled);
+      } catch (err) {
+        if (
+          WorkflowWorldError.is(err) &&
+          err.code === START_HOOK_CANDIDATE_CANCELLED
+        ) {
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+    if (isSingleOrchestratorRun(run)) {
+      await world.events.create(this.runId, cancelled, { inBand: false });
+    } else {
+      await world.events.create(this.runId, cancelled);
+    }
+    await wakeRunAfterOutOfBandWrite(world, run);
+    await afterRunCancelled(world, run);
+  }
+
+  /**
+   * Whether the workflow run exists.
+   */
+  get exists(): Promise<boolean> {
+    'use step';
+    return this.#lazyWorldPromise.then((world) =>
+      world.runs
+        .get(this.runId, { resolveData: 'none' })
+        .then(() => true)
+        .catch((error) => {
+          if (WorkflowRunNotFoundError.is(error)) {
+            return false;
+          }
+          throw error;
+        })
+    );
+  }
+
+  /**
+   * The status of the workflow run.
+   */
+  get status(): Promise<WorkflowRunStatus> {
+    'use step';
+    return this.#lazyWorldPromise.then((world) =>
+      world.runs
+        .get(this.runId, { resolveData: 'none' })
+        .then((run) => run.status)
+    );
+  }
+
+  /**
+   * The return value of the workflow run, once it completes. Rejects with
+   * `WorkflowRunFailedError` or `WorkflowRunCancelledError` if the run fails
+   * or is cancelled.
+   *
+   * Inside the workflow that started this run, the parent suspends on a system
+   * hook the run resumes when it finishes, so waiting costs no compute and
+   * resumes as soon as the run is done. Everywhere else (host code, steps,
+   * a workflow handed another run's handle) it polls until the run finishes.
+   */
+  get returnValue(): Promise<TResult> {
+    return (
+      awaitChildRunCompletion(
+        this.runId,
+        this.#parentRunId,
+        () => this.readReturnValue(),
+        (runIds) => Run.readFinishedRunIds(runIds)
+      ) ?? this.readReturnValue()
+    );
+  }
+
+  /**
+   * The step behind {@link returnValue}: polls until the run is terminal.
+   * Use `returnValue` instead.
+   * @internal
+   */
+  async readReturnValue(): Promise<TResult> {
+    'use step';
+    return this.#pollReturnValue();
+  }
+
+  /**
+   * Which of `runIds` have finished (completed, failed, or cancelled), in one
+   * step: the batched status read behind the child-run completion hook. A run
+   * that cannot be found is reported as finished, so the caller's
+   * `returnValue` read surfaces the not-found (or retries a resilient start).
+   * @internal
+   */
+  static async readFinishedRunIds(runIds: string[]): Promise<string[]> {
+    'use step';
+    const world = await getWorldLazy();
+    const finished = new Set<string>();
+    let next = 0;
+    const worker = async () => {
+      for (
+        let runId = runIds[next++];
+        runId !== undefined;
+        runId = runIds[next++]
+      ) {
+        try {
+          const run = await world.runs.get(runId, { resolveData: 'none' });
+          if (isTerminalWorkflowRunStatus(run.status)) finished.add(runId);
+        } catch (error) {
+          if (!WorkflowRunNotFoundError.is(error)) throw error;
+          finished.add(runId);
+        }
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(READ_FINISHED_CONCURRENCY, runIds.length) },
+        worker
+      )
+    );
+    // Input order, so the result does not depend on read timing.
+    return runIds.filter((runId) => finished.has(runId));
+  }
+
+  /**
+   * The name of the workflow.
+   */
+  get workflowName(): Promise<string> {
+    'use step';
+    return this.#lazyWorldPromise.then((world) =>
+      world.runs
+        .get(this.runId, { resolveData: 'none' })
+        .then((run) => run.workflowName)
+    );
+  }
+
+  /**
+   * The timestamp when the workflow run was created.
+   */
+  get createdAt(): Promise<Date> {
+    'use step';
+    return this.#lazyWorldPromise.then((world) =>
+      world.runs
+        .get(this.runId, { resolveData: 'none' })
+        .then((run) => run.createdAt)
+    );
+  }
+
+  /**
+   * The timestamp when the workflow run started execution.
+   * Returns undefined if the workflow has not started yet.
+   */
+  get startedAt(): Promise<Date | undefined> {
+    'use step';
+    return this.#lazyWorldPromise.then((world) =>
+      world.runs
+        .get(this.runId, { resolveData: 'none' })
+        .then((run) => run.startedAt)
+    );
+  }
+
+  /**
+   * The timestamp when the workflow run completed.
+   * Returns undefined if the workflow has not completed yet.
+   */
+  get completedAt(): Promise<Date | undefined> {
+    'use step';
+    return this.#lazyWorldPromise.then((world) =>
+      world.runs
+        .get(this.runId, { resolveData: 'none' })
+        .then((run) => run.completedAt)
+    );
+  }
+
+  /**
+   * The readable stream of the workflow run.
+   */
+  get readable(): WorkflowReadableStream {
+    return this.getReadable();
+  }
+
+  /**
+   * Retrieves the workflow run's default readable stream, which reads chunks
+   * written to the corresponding writable stream {@link getWritable}.
+   *
+   * The returned stream has an additional {@link WorkflowReadableStream.getTailIndex | getTailIndex()}
+   * helper that returns the index of the last known chunk. This is useful when
+   * building reconnection endpoints that need to inform clients where the
+   * stream starts.
+   *
+   * @param options - The options for the readable stream.
+   * @returns A `WorkflowReadableStream` for the workflow run.
+   */
+  getReadable<R = any>(
+    options: WorkflowReadableStreamOptions = {}
+  ): WorkflowReadableStream<R> {
+    'use step';
+    const { ops = [], global = globalThis, startIndex, namespace } = options;
+    const name = getWorkflowRunStreamId(this.runId, namespace);
+    // The resolver starts only on the readable's first pull, so construction
+    // is inert. A consumed empty stream still performs the speculative lookup
+    // to keep the first encrypted-frame path concurrent.
+    const encryptionKey = this.#getEncryptionKeyLazily();
+    const stream = getRunReadableStream<R>(
+      global,
+      ops,
+      this.runId,
+      name,
+      startIndex,
+      encryptionKey
+    );
+
+    const worldPromise = this.#lazyWorldPromise;
+    const runId = this.runId;
+    return Object.assign(stream, {
+      getTailIndex: async (): Promise<number> => {
+        const world = await worldPromise;
+        const info = await world.streams.getInfo(runId, name);
+        return info.tailIndex;
+      },
+    });
+  }
+
+  /** The writable stream of the workflow run. */
+  get writable(): WritableStream {
+    return this.getWritable();
+  }
+
+  /**
+   * Returns a writable that appends to this run's stream.
+   *
+   * Initialization is deferred until the first write. The run must already
+   * exist. The writable may be forwarded through `start()` and into steps, but
+   * grants no read access or additional authorization.
+   *
+   * @remarks
+   * `writer.close()` closes the shared stream. Contributors should call
+   * `releaseLock()`, which also drains pending writes.
+   *
+   * @param options - The writable stream options.
+   */
+  getWritable<W = any>(
+    options: WorkflowRunWritableStreamOptions = {}
+  ): WritableStream<W> {
+    'use step';
+    const { ops = [], global = globalThis, namespace } = options;
+    const name = getWorkflowRunStreamId(this.runId, namespace);
+    let targetPromise:
+      | Promise<{
+          key: PayloadKey | undefined;
+          deploymentId?: string;
+          encryptionPublicKey?: string;
+        }>
+      | undefined;
+    let writable: WritableStream<W>;
+
+    const resolveTarget = () => {
+      targetPromise ??= this.#getMetadata().then(async (run) => {
+        const target = {
+          key: await getForwardedWritableEncryptionKey(
+            this.runId,
+            run.deploymentId,
+            run.encryptionPublicKey
+          ),
+          deploymentId: run.deploymentId,
+          encryptionPublicKey: run.encryptionPublicKey,
+        };
+        tagForwardedWritableTarget(writable, target);
+        return target;
+      });
+      return targetPromise;
+    };
+
+    writable = createForwardedWritable<W>({
+      global,
+      ops,
+      runId: this.runId,
+      name,
+      key: () => resolveTarget().then(({ key }) => key),
+    });
+    return writable;
+  }
+
+  /** Reads metadata, briefly retrying resilient starts. @internal */
+  async #getMetadata() {
+    const world = await this.#lazyWorldPromise;
+    const maxRetries = this.#resilientStart ? NOT_FOUND_RETRY_DELAYS.length : 0;
+    let attempt = 0;
+    while (true) {
+      try {
+        return await world.runs.get(this.runId, { resolveData: 'none' });
+      } catch (error) {
+        if (!WorkflowRunNotFoundError.is(error) || attempt >= maxRetries) {
+          throw error;
+        }
+        const delay = NOT_FOUND_RETRY_DELAYS[attempt]!;
+        attempt++;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  /** @internal */
+  async #resolveTerminalReturnValue(run: WorkflowRun): Promise<TResult> {
+    // Expiry is checked before the status branches, and deliberately so.
+    //
+    // Past its retention boundary a run's payloads are gone but its metadata
+    // usually is not, so `run.output` and `run.error` hydrate to an
+    // expired-data placeholder rather than to anything the caller asked for.
+    // Handing that back as if it were the return value — or wrapping it as
+    // the `cause` of a WorkflowRunFailedError — is worse than failing: it is
+    // indistinguishable from the workflow having genuinely returned it.
+    //
+    // A run started with `experimental_retention: 0` reaches this almost
+    // immediately (its purge races, and usually beats, the caller's own read
+    // of the result). An ordinary run reaches it whenever it is read after
+    // the World's default window. Both are the same condition and get the
+    // same terminal, non-retryable error, carrying whatever metadata
+    // survived so the caller can still tell success from failure.
+    //
+    // When even the metadata is gone the World reports the run as missing and
+    // the caller gets WorkflowRunNotFoundError from the read above instead —
+    // there is nothing left here to describe.
+    const expiredAt = run.expiredAt;
+    if (expiredAt != null && expiredAt <= new Date()) {
+      throw new RunExpiredError(
+        `Run "${this.runId}" ${run.status === 'completed' ? 'completed' : `is ${run.status}`}, but its data expired at ${expiredAt.toISOString()} and is no longer readable.`,
+        this.runId,
+        run.status,
+        expiredAt
+      );
+    }
+
+    if (run.status === 'completed') {
+      const encryptionKey = await this.#getEncryptionKey(run);
+      return await hydrateWorkflowReturnValue(
+        run.output,
+        this.runId,
+        encryptionKey
+      );
+    }
+
+    if (run.status === 'cancelled') {
+      throw new WorkflowRunCancelledError(this.runId);
+    }
+
+    if (run.status === 'failed') {
+      // Hydrate the serialized run error so the original thrown value
+      // (with its type identity, cause chain, etc.) is set as the
+      // `cause` on WorkflowRunFailedError.
+      const encryptionKey = await this.#getEncryptionKey(run);
+      let hydratedError: unknown;
+      try {
+        hydratedError = await hydrateRunError(
+          run.error,
+          this.runId,
+          encryptionKey
+        );
+      } catch {
+        // If hydration fails, surface a generic fallback rather than
+        // leaving the user with a raw Uint8Array. The run's errorCode
+        // is still preserved on the thrown WorkflowRunFailedError.
+        hydratedError = new Error('Failed to hydrate workflow run error');
+      }
+      throw new WorkflowRunFailedError(this.runId, hydratedError, {
+        errorCode: run.errorCode,
+      });
+    }
+
+    // Terminal statuses are immutable, but if an inconsistent world returns
+    // a non-terminal full record, resume polling safely.
+    throw new WorkflowRunNotCompletedError(this.runId, run.status);
+  }
+
+  /**
+   * Polls the workflow return value until the workflow run completes.
+   * @internal
+   * @returns The workflow return value.
+   */
+  async #pollReturnValue(): Promise<TResult> {
+    const world = await this.#lazyWorldPromise;
+
+    // When resilientStart is true, run_created failed and the run may
+    // not exist yet. Retry on WorkflowRunNotFoundError up to 3 times
+    // (1s + 3s + 6s = 10s total) to give the queue time to deliver
+    // and the runtime to create the run via run_started.
+    // When resilientStart is false, 404 is a real error: fail fast.
+    let notFoundRetries = 0;
+    const NOT_FOUND_MAX_RETRIES = this.#resilientStart
+      ? NOT_FOUND_RETRY_DELAYS.length
+      : 0;
+
+    // Prefer the World's long poll: one read that the backend holds open
+    // until the run finishes, instead of asking again every second and
+    // paying up to a full interval of quantization on a run that already
+    // ended. Worlds that cannot wait do not implement it (see
+    // `Storage['runs'].waitForTerminalStatus`) and this stays the exact
+    // fixed-interval poll it has always been.
+    const waitForTerminalStatus = world.runs.waitForTerminalStatus?.bind(
+      world.runs
+    );
+
+    // Long polls spent so far. Once the cap is reached the loop keeps waiting
+    // but on the interval path, which is the strategy we know is correct; see
+    // `RETURN_VALUE_MAX_LONG_POLLS`. Never a reason to stop awaiting.
+    let longPolls = 0;
+    const maxLongPolls = getReturnValueMaxLongPolls();
+
+    // NOTE: when this poll runs inside a step (e.g. the step that a parent
+    // workflow uses to await a child workflow's `returnValue`), it blocks
+    // a queue worker slot for as long as the child run takes to finish.
+    // Worker-based worlds like `world-postgres` must be sized to cover the
+    // peak number of such polls in flight; see the `queueConcurrency`
+    // default on the Postgres world and the notes in the eager-processing
+    // changelog for details.
+    while (true) {
+      const iterationStartedAt = Date.now();
+      try {
+        // Metadata only, either way: the status is all this iteration needs,
+        // and payload refs are resolved once below, after a terminal status is
+        // observed.
+        const useLongPoll = waitForTerminalStatus && longPolls < maxLongPolls;
+        if (useLongPoll) longPolls++;
+        const runMetadata = useLongPoll
+          ? await waitForTerminalStatus(this.runId, {
+              timeoutMs: getReturnValueWaitTimeoutMs(),
+              resolveData: 'none',
+            })
+          : await world.runs.get(this.runId, {
+              resolveData: 'none',
+            });
+
+        if (runMetadata.status === 'cancelled') {
+          throw new WorkflowRunCancelledError(this.runId);
+        }
+
+        if (PAYLOAD_TERMINAL_RUN_STATUSES.has(runMetadata.status)) {
+          // The polling read above deliberately skips input/output/error refs.
+          // Resolve payloads only once the run reaches a terminal state.
+          const run = await world.runs.get(this.runId, {
+            resolveData: 'all',
+          });
+          return await this.#resolveTerminalReturnValue(run);
+        }
+
+        // Run not completed yet: sleep and poll again.
+        throw new WorkflowRunNotCompletedError(this.runId, runMetadata.status);
+      } catch (error) {
+        if (WorkflowRunNotCompletedError.is(error)) {
+          // Space consecutive non-terminal observations at least one poll
+          // interval apart. On the plain-poll path that is the familiar fixed
+          // sleep; on the long-poll path the wait has usually already
+          // outlasted the interval and this is a no-op, but it also means a
+          // World whose wait returns early (a backend with no long poll, a
+          // clamped budget) degrades to interval polling instead of spinning.
+          const remainingIntervalMs =
+            getReturnValuePollIntervalMs() - (Date.now() - iterationStartedAt);
+          if (remainingIntervalMs > 0) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, remainingIntervalMs)
+            );
+          }
+          continue;
+        }
+        if (
+          WorkflowRunNotFoundError.is(error) &&
+          notFoundRetries < NOT_FOUND_MAX_RETRIES
+        ) {
+          const delay = NOT_FOUND_RETRY_DELAYS[notFoundRetries]!;
+          notFoundRetries++;
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+}
+
+/**
+ * Retrieves a `Run` object for a given run ID.
+ *
+ * @param runId - The workflow run ID obtained from {@link start}.
+ * @returns A `Run` object.
+ * @throws WorkflowRunNotFoundError if the run ID is not found.
+ */
+export function getRun<TResult>(runId: string): Run<TResult> {
+  return new Run(runId);
+}

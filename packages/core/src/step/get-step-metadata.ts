@@ -1,6 +1,12 @@
+import { throwNotInStepContext } from '../context-errors.js';
 import { contextStorage } from './context-storage.js';
 
 export interface StepMetadata {
+  /**
+   * The name of the step.
+   */
+  stepName: string;
+
   /**
    * Unique identifier for the currently executing step.
    * Useful to use as part of an idempotency key for critical
@@ -32,6 +38,18 @@ export interface StepMetadata {
    * Accessing this property in a workflow function will throw an error.
    */
   attempt: number;
+
+  /**
+   * The maximum number of times the current step can be executed: its `maxRetries` plus one.
+   * The current attempt is the last one when `attempt` is greater than or equal to `maxAttempts`:
+   * an error thrown from it fails the step instead of retrying it.
+   *
+   * @remarks
+   *
+   * Only available inside a step function.
+   * Accessing this property in a workflow function will throw an error.
+   */
+  maxAttempts: number;
 }
 
 /**
@@ -42,8 +60,10 @@ export interface StepMetadata {
 export function getStepMetadata(): StepMetadata {
   const ctx = contextStorage.getStore();
   if (!ctx) {
-    throw new Error(
-      '`getStepMetadata()` can only be called inside a step function'
+    throwNotInStepContext(
+      'getStepMetadata()',
+      'https://workflow-sdk.dev/docs/api-reference/workflow/get-step-metadata',
+      getStepMetadata
     );
   }
   return ctx.stepMetadata;

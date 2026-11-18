@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Workflows SDK + Nitro Example</title>
+  <title>Workflow SDK + Nitro Example</title>
   <style>
     textarea {
       width: 100%;
@@ -20,14 +20,14 @@
 </head>
 
 <body>
-  <h1>Workflows SDK + Nitro Example</h1>
+  <h1>Workflow SDK + Nitro Example</h1>
   <hr />
   <textarea id="output" readonly placeholder="output"></textarea>
 </body>
 <script type="module">
   const outputEl = document.getElementById("output");
 
-  const { runId } = await fetchAndLog('/api/trigger?workflowFile=workflows/0_calc.ts&workflowFn=calc&args=2', {
+  const { runId } = await fetchAndLog('/api/trigger?workflowFile=workflows/0_demo.ts&workflowFn=calc&args=2', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: "",

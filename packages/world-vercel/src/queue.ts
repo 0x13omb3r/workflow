@@ -1,50 +1,1462 @@
-import { handleCallback, send } from '@vercel/queue';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type {
+  ExperimentalHoldOptions,
+  MessageHandler,
+  RetryHandler,
+  Transport,
+} from '@vercel/queue';
 import {
+  ConcurrencyCoalescedPendingError,
+  ConsumerDiscoveryError,
+  QueueClient,
+} from '@vercel/queue';
+import {
+  isSingleOrchestratorMessage,
   MessageId,
+  orchestratorRunIdOf,
+  parseQueueName,
   type Queue,
+  type QueueBatchResult,
+  type QueueHandler,
+  type QueueHoldOptions,
+  type QueueHoldResult,
+  type QueueOptions,
+  type QueuePayload,
   QueuePayloadSchema,
+  SPEC_VERSION_CURRENT,
+  SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT,
+  singleOrchestratorContinuationPayload,
   ValidQueueName,
 } from '@workflow/world';
-import * as z from 'zod';
+import { decode as cborDecode, encode as cborEncode } from 'cbor-x';
+import { z } from 'zod/v4';
+import { missingDeploymentIdMessage } from './deployment-id.js';
+import { getQueueDispatcher } from './http-client.js';
+import { getTransientTransportCode } from './http-core.js';
+import { withQueueSendRetry } from './queue-send-retry.js';
+import { decode as decodeTaggedRunId } from './run-id/index.js';
+import { isKnownRegionCode, REGION_IDS } from './run-id/regions.js';
+import { getTraceContextHeaders } from './telemetry.js';
+import { type APIConfig, getHeaders, getHttpUrl } from './utils.js';
+import { isWsEventsTransportEnabledForWorkflow } from './ws-transport-enabled.js';
 
-const MessageWrapper = z.object({
-  payload: QueuePayloadSchema,
+/**
+ * Messages per `sendBatch` request. VQS caps a batch at 100 and rejects the
+ * whole request above it, so this is the API's ceiling rather than a tuning
+ * knob; `queueBatch` splits anything larger.
+ */
+const MAX_QUEUE_SEND_BATCH = 100;
+
+/**
+ * Mirrors `@vercel/queue`'s own kill switch. `queueBatch` injects trace
+ * context itself (see below), so without this check `off` would still
+ * disable it on the single send and not on the batched one.
+ */
+function isQueueTracePropagationDisabled(): boolean {
+  const value = process.env.VERCEL_QUEUE_TRACE_PROPAGATION?.toLowerCase();
+  return value === 'off' || value === '0' || value === 'false';
+}
+
+/**
+ * Maps one `sendBatch` outcome onto the World's {@link QueueBatchResult}.
+ *
+ * `undefined` means the server returned fewer results than the batch carried.
+ * That is reported as a retryable failure rather than left as a hole the
+ * caller would read as success: republishing under the same idempotency keys
+ * is safe, silently dropping a step's message is not.
+ */
+function toBatchResult(
+  outcome: Awaited<ReturnType<QueueClient['sendBatch']>>[number] | undefined
+): QueueBatchResult {
+  if (outcome === undefined) {
+    return {
+      messageId: null,
+      error: 'Queue batch returned no result for this message',
+      retryable: true,
+    };
+  }
+  if (outcome.status === 'failed') {
+    return {
+      messageId: null,
+      error: outcome.error,
+      retryable: outcome.retryable,
+    };
+  }
+  return {
+    messageId: outcome.messageId ? MessageId.parse(outcome.messageId) : null,
+  };
+}
+
+/**
+ * CBOR-based queue transport. Encodes values with cbor-x on send and
+ * decodes on receive, preserving Uint8Array values natively (workflow
+ * input is a Uint8Array in specVersion >= 2).
+ *
+ * Used for specVersion >= SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT.
+ */
+class CborTransport implements Transport<unknown> {
+  readonly contentType = 'application/cbor';
+
+  serialize(value: unknown): Buffer {
+    return Buffer.from(cborEncode(value));
+  }
+
+  async deserialize(stream: ReadableStream<Uint8Array>): Promise<unknown> {
+    const chunks: Uint8Array[] = [];
+    const reader = stream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+    return cborDecode(Buffer.concat(chunks));
+  }
+}
+
+/**
+ * JSON-based queue transport. Used for specVersion <
+ * SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT to maintain compatibility with
+ * older deployments that expect JSON messages.
+ */
+class JsonTransport implements Transport<unknown> {
+  readonly contentType = 'application/json';
+
+  serialize(value: unknown): Buffer {
+    return Buffer.from(JSON.stringify(value));
+  }
+
+  async deserialize(stream: ReadableStream<Uint8Array>): Promise<unknown> {
+    const chunks: Uint8Array[] = [];
+    const reader = stream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString());
+  }
+}
+
+/**
+ * Dual transport for the queue handler. Serializes with CBOR (handler
+ * re-enqueues target the same new deployment) but deserializes with
+ * CBOR-first, falling back to JSON for messages from older deployments.
+ */
+class DualTransport implements Transport<unknown> {
+  readonly contentType = 'application/cbor';
+
+  serialize(value: unknown): Buffer {
+    return Buffer.from(cborEncode(value));
+  }
+
+  async deserialize(stream: ReadableStream<Uint8Array>): Promise<unknown> {
+    const chunks: Uint8Array[] = [];
+    const reader = stream.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+    const buffer = Buffer.concat(chunks);
+    try {
+      return cborDecode(buffer);
+    } catch {
+      return JSON.parse(buffer.toString());
+    }
+  }
+}
+
+interface QueueInvocationContext {
+  collectStepIds: boolean;
+  requestId?: string;
+  stepIds: Set<string>;
+  /** When the request began, epoch ms; shared by its coalesced re-runs. */
+  startedAt: number;
+}
+
+// per-copy-ok: the route wrapper and the World hook exported from this module
+// share the same module copy through the World instance, so the context never
+// has to cross a copy boundary.
+const invocationStorage = new AsyncLocalStorage<QueueInvocationContext>();
+
+const WORKFLOW_STEP_IDS_HEADER = 'x-vercel-internal-workflow-step-ids';
+// Keep the response header and downstream request-log cardinality bounded.
+const MAX_WORKFLOW_STEP_IDS = 10;
+
+export function recordStepExecution(stepId: string): void {
+  const invocation = invocationStorage.getStore();
+  if (
+    invocation?.collectStepIds &&
+    invocation.stepIds.size < MAX_WORKFLOW_STEP_IDS
+  ) {
+    invocation.stepIds.add(stepId);
+  }
+}
+
+function attachStepIds(
+  response: Response,
+  invocation: QueueInvocationContext
+): Response {
+  if (invocation.stepIds.size === 0) return response;
+
+  const headers = new Headers(response.headers);
+  headers.set(
+    WORKFLOW_STEP_IDS_HEADER,
+    JSON.stringify(Array.from(invocation.stepIds))
+  );
+  return new Response(response.body, {
+    headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+}
+
+const MessageWrapper = z.compile(
+  z.object({
+    payload: QueuePayloadSchema,
+    queueName: ValidQueueName,
+    /**
+     * The deployment ID to use when re-enqueueing the message.
+     * This ensures the message is processed by the same deployment.
+     */
+    deploymentId: z.string().optional(),
+  })
+);
+
+/**
+ * Message lifetime: delays and retention.
+ *
+ * A timer (a sleep's wake), and every continuation of a spec-8 run (a
+ * `{ timeoutSeconds }` handler result), is a NEW message sent with
+ * `delaySeconds`. VQS caps a message's delay at its retention, which
+ * defaults to 24 hours, so a delayed message sent without
+ * `retentionSeconds` is clamped to
+ * {@link MAX_DELAY_SECONDS} (23 hours by default, leaving a buffer before the
+ * default TTL). The runtime chains timers for longer sleeps: when one fires
+ * early it schedules the next for the remaining time.
+ *
+ * A message sent WITH `retentionSeconds` (a step's execution message, which
+ * is retried in place for its whole retry span) lives that long, capped at
+ * the VQS maximum of 7 days, and its delay may use all of it but a buffer.
+ *
+ * `MAX_DELAY_SECONDS` can be overridden via an environment variable for
+ * testing.
+ */
+/** Kept between a message's delay and its expiry, so it is not delivered
+ *  just as it expires. */
+const RETENTION_DELAY_BUFFER_SECONDS = 60 * 60;
+
+/**
+ * Retention of a message sent without `retentionSeconds` (every orchestrator
+ * message): the queue's default.
+ */
+export const DEFAULT_MESSAGE_RETENTION_SECONDS = 24 * 60 * 60;
+
+const MAX_DELAY_SECONDS = Number(
+  process.env.VERCEL_QUEUE_MAX_DELAY_SECONDS ||
+    // 23 hours: a 1h buffer before the default retention.
+    DEFAULT_MESSAGE_RETENTION_SECONDS - RETENTION_DELAY_BUFFER_SECONDS
+);
+
+/** VQS bounds on `retentionSeconds`. */
+const MIN_RETENTION_SECONDS = 60;
+const MAX_RETENTION_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * The `delaySeconds` / `retentionSeconds` a send carries. Exported for unit
+ * tests.
+ */
+export function resolveMessageLifetime(opts?: QueueOptions): {
+  delaySeconds?: number;
+  retentionSeconds?: number;
+} {
+  const retentionSeconds =
+    opts?.retentionSeconds !== undefined &&
+    Number.isFinite(opts.retentionSeconds)
+      ? Math.min(
+          Math.max(Math.ceil(opts.retentionSeconds), MIN_RETENTION_SECONDS),
+          MAX_RETENTION_SECONDS
+        )
+      : undefined;
+  const requestedDelay =
+    opts?.delaySeconds !== undefined &&
+    Number.isFinite(opts.delaySeconds) &&
+    opts.delaySeconds > 0
+      ? Math.ceil(opts.delaySeconds)
+      : undefined;
+  const maxDelay =
+    retentionSeconds === undefined
+      ? MAX_DELAY_SECONDS
+      : Math.max(retentionSeconds - RETENTION_DELAY_BUFFER_SECONDS, 0);
+  const delaySeconds =
+    requestedDelay === undefined
+      ? undefined
+      : Math.min(requestedDelay, maxDelay) || undefined;
+  return {
+    ...(delaySeconds !== undefined ? { delaySeconds } : {}),
+    ...(retentionSeconds !== undefined ? { retentionSeconds } : {}),
+  };
+}
+
+/**
+ * Thrown out of the VQS callback when the workflow handler resolved with
+ * `{ timeoutSeconds }` for a single-orchestrator run's message (spec >= 9):
+ * the callback's `retry` hook turns it into `{ afterSeconds }`, which leaves
+ * the message unacknowledged and makes VQS deliver the SAME message (same
+ * id, next `deliveryCount`) again after that delay. VQS clamps the delay to
+ * what it supports (5s to 900s per hop); the runtime tolerates an early
+ * redelivery by checking the log and asking again.
+ *
+ * `{ timeoutSeconds: 0 }` is a handoff: the lease change carries
+ * `experimental_handoff`, the redelivery starts at once, and VQS counts it
+ * toward neither its retry backoff nor `maxAttempts`, and reports it in the
+ * next delivery's handoff count, which `attempt` subtracts.
+ *
+ * A spec-8 run's `{ timeoutSeconds }` never gets here: it continues on a new
+ * message (see `createQueueHandler`).
+ */
+class RedeliverSameMessage extends Error {
+  readonly handoff: boolean;
+  constructor(readonly afterSeconds: number) {
+    super(
+      afterSeconds === 0
+        ? 'hand the message off to its next delivery'
+        : `redeliver the same message after ${afterSeconds}s`
+    );
+    this.name = 'RedeliverSameMessage';
+    this.handoff = afterSeconds === 0;
+  }
+}
+
+/**
+ * How long before its message expires a single-orchestrator run stops
+ * handing the message off and continues on a new one (see
+ * {@link orchestratorMessageRotation}). A handoff keeps the message, and so
+ * its expiry: retention is counted from the first send, and an orchestrator
+ * message is sent with the default retention
+ * ({@link DEFAULT_MESSAGE_RETENTION_SECONDS}), so a run that hands off for
+ * that long without a quiet pass would lose its message, and every message
+ * coalesced into it. The margin leaves room for the delivery that rotates to
+ * run out its function's deadline, and for redeliveries before it.
+ */
+export const ORCHESTRATOR_ROTATION_EXPIRY_MARGIN_SECONDS = 4 * 60 * 60;
+
+/**
+ * The most handoffs the queue makes of one message; past them a handoff is an
+ * ordinary reschedule, which counts as an attempt (see `RetryDirective` in
+ * `@vercel/queue`).
+ */
+export const QUEUE_MAX_HANDOFFS_PER_MESSAGE = 10_000;
+
+/**
+ * Handoffs short of {@link QUEUE_MAX_HANDOFFS_PER_MESSAGE} at which a
+ * single-orchestrator run continues on a new message instead.
+ */
+export const ORCHESTRATOR_ROTATION_HANDOFF_MARGIN = 100;
+
+/**
+ * Delay of the new message a rotation sends: due after the old message's
+ * acknowledgment, so the queue does not coalesce it into the delivery that
+ * sent it.
+ */
+export const ORCHESTRATOR_ROTATION_DELAY_SECONDS = 1;
+
+/**
+ * Why a single-orchestrator message asked to hand off continues on a new
+ * message instead, or `undefined` to hand it off:
+ *
+ * - `'expiry'`: it expires within
+ *   {@link ORCHESTRATOR_ROTATION_EXPIRY_MARGIN_SECONDS} (by the queue's
+ *   `expiresAt`, else `createdAt` plus the default retention);
+ * - `'handoff-bound'`: it is within {@link ORCHESTRATOR_ROTATION_HANDOFF_MARGIN}
+ *   handoffs of {@link QUEUE_MAX_HANDOFFS_PER_MESSAGE}.
+ *
+ * Exported for unit tests.
+ */
+export function orchestratorMessageRotation(
+  metadata: {
+    createdAt?: Date;
+    expiresAt?: Date;
+    experimental_handoffCount?: number;
+  },
+  nowMs = Date.now()
+): 'expiry' | 'handoff-bound' | undefined {
+  const createdAtMs = metadata.createdAt?.getTime();
+  const expiresAtMs =
+    metadata.expiresAt?.getTime() ??
+    (createdAtMs === undefined
+      ? undefined
+      : createdAtMs + DEFAULT_MESSAGE_RETENTION_SECONDS * 1000);
+  if (
+    expiresAtMs !== undefined &&
+    nowMs >= expiresAtMs - ORCHESTRATOR_ROTATION_EXPIRY_MARGIN_SECONDS * 1000
+  ) {
+    return 'expiry';
+  }
+  if (
+    (metadata.experimental_handoffCount ?? 0) >=
+    QUEUE_MAX_HANDOFFS_PER_MESSAGE - ORCHESTRATOR_ROTATION_HANDOFF_MARGIN
+  ) {
+    return 'handoff-bound';
+  }
+  return undefined;
+}
+
+/**
+ * Logs what the queue did with each handoff `client` asks for: `accepted`,
+ * `not_immediate` (applied as an ordinary reschedule), or `limit_reached`
+ * (past the per-message bound, so counted as an attempt). `@vercel/queue`
+ * reads the outcome from the lease change but does not hand it to the
+ * `retry` hook, so the client's API object is wrapped where it exposes one.
+ */
+function observeHandoffOutcomes(client: QueueClient): void {
+  const api = (client as unknown as Record<symbol, unknown>)[
+    Symbol.for('@vercel/queue.apiClient')
+  ] as
+    | {
+        changeVisibility?: (options: {
+          messageId: string;
+          experimental_handoff?: boolean;
+        }) => Promise<{ experimental_handoff?: string } | undefined>;
+      }
+    | undefined;
+  const changeVisibility = api?.changeVisibility;
+  if (!api || typeof changeVisibility !== 'function') {
+    warnHandoffOutcomesUnobserved();
+    return;
+  }
+  api.changeVisibility = async (options) => {
+    const result = await changeVisibility.call(api, options);
+    if (options.experimental_handoff) {
+      logHandoffOutcome(options.messageId, result?.experimental_handoff);
+    }
+    return result;
+  };
+}
+
+// per-copy-ok: one warning per module copy is enough, and a copy that
+// warned again would only repeat it.
+let handoffOutcomesWarned = false;
+
+/**
+ * Warns, once, that this `@vercel/queue` exposes no API client to observe
+ * (see {@link observeHandoffOutcomes}): handoffs still work, but their
+ * outcomes go unlogged. `queue-api-client.test.ts` pins the hook against the
+ * installed version.
+ */
+function warnHandoffOutcomesUnobserved(): void {
+  if (handoffOutcomesWarned) return;
+  handoffOutcomesWarned = true;
+  console.warn(
+    '[workflow] This @vercel/queue version exposes no API client to observe, so the outcome of each handoff is not logged'
+  );
+}
+
+/**
+ * What a send-retry log line names: the run a message is for, or the runs of a
+ * batch. It carries them because the queue may never have seen the failed
+ * send, so this line can be its only record.
+ */
+function sendRetrySubject(payloads: readonly QueuePayload[]): string {
+  const runIds = [
+    ...new Set(
+      payloads.flatMap((payload) =>
+        'runId' in payload && typeof payload.runId === 'string'
+          ? [payload.runId]
+          : []
+      )
+    ),
+  ];
+  const runs =
+    runIds.length === 0
+      ? ''
+      : runIds.length <= 5
+        ? ` for run ${runIds.map((id) => `"${id}"`).join(', ')}`
+        : ` for ${runIds.length} runs (first "${runIds[0]}")`;
+  return payloads.length > 1 ? ` (${payloads.length} messages${runs})` : runs;
+}
+
+/** An error's name, message and transport code, without its stack. */
+function describeSendError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const code = getTransientTransportCode(error);
+  return `${error.name}: ${error.message}${code ? ` (${code})` : ''}`;
+}
+
+/** Hooks that log a send's re-sends and, if they did not help, its failure. */
+function sendRetryLogging(
+  queueName: string,
+  payloads: readonly QueuePayload[]
+): Parameters<typeof withQueueSendRetry>[1] {
+  const subject = sendRetrySubject(payloads);
+  return {
+    onRetry: (error, attempt, delayMs) =>
+      console.warn(
+        `[workflow] Queue send to "${queueName}"${subject} failed on attempt ${attempt}; re-sending in ${delayMs}ms: ${describeSendError(error)}`
+      ),
+    onExhausted: (error, attempts) =>
+      console.error(
+        `[workflow] Queue send to "${queueName}"${subject} still failed after ${attempts} attempts: ${describeSendError(error)}`
+      ),
+  };
+}
+
+/** Exported for unit tests. */
+export function logHandoffOutcome(
+  messageId: string,
+  outcome: string | undefined
+): void {
+  const line = `[workflow] Handoff of message "${messageId}": ${outcome ?? 'unreported'}`;
+  if (outcome === 'limit_reached') {
+    console.warn(
+      `${line}; the queue's handoff bound for this message is reached, so further handoffs count as attempts`
+    );
+  } else if (outcome === 'not_immediate') {
+    console.info(`${line}; redelivered as an ordinary reschedule`);
+  } else {
+    console.debug(line);
+  }
+}
+
+/**
+ * Handler re-runs per delivery when its acknowledgment finds orchestrator
+ * messages coalesced into it (see {@link concurrencyKeyOf}). Each re-run
+ * is a replay that read the log those messages' senders committed to, and a
+ * run whose messages keep arriving faster than a replay finishes would
+ * otherwise re-run until the invocation's deadline, which the orchestrator
+ * checks and hands off at. The bound also ends a delivery whose every pass
+ * is refused by the in-band fence: each refused pass sends one wake, which is
+ * coalesced into the same delivery. Past the bound, `@vercel/queue` throws
+ * `ConcurrencyCoalescedPendingError`, and the `retry` hook hands the message
+ * off: redelivered at once, not counted as an attempt.
+ */
+const MAX_COALESCED_RERUNS = 32;
+
+/**
+ * Whether `metadata` is the last coalesced re-run `@vercel/queue` gives one
+ * delivery (`MAX_COALESCED_RERUNS`). If its acknowledgment is refused again,
+ * the library hands the message off with no further call into the handler.
+ * Exported for unit tests.
+ */
+export function isLastCoalescedRerun(metadata: {
+  experimental_coalesced?: { rerun: number };
+}): boolean {
+  return (metadata.experimental_coalesced?.rerun ?? 0) >= MAX_COALESCED_RERUNS;
+}
+
+/** Exported for unit tests. */
+export { MAX_COALESCED_RERUNS };
+
+/**
+ * The longest redelivery delay VQS honors for one hop (it clamps
+ * `afterSeconds` to [5s, 900s]). Exported for unit tests.
+ */
+export const MAX_REDELIVERY_DELAY_SECONDS = 900;
+
+const HANDLER_ERROR_RETRY_AFTER_SECONDS = 1;
+// Ceiling for the per-redelivery backoff. This value is the `retry-after` we
+// hand to VQS, which clamps it into [5s, MAX_SQS_DELAY_SECONDS=900s] for the
+// first 32 deliveries and then applies its own exponential growth (also capped
+// at 900s); see vqs-server `calculateBackoffDelay`. Capping our base at 60s
+// (the old value) wasted that headroom: a run stuck behind a sustained backend
+// outage exhausted its delivery budget in ~3.7h. Ramping to the 900s ceiling
+// instead stretches survival to ~9–10h (across `MAX_QUEUE_DELIVERIES` = 48
+// attempts), so transient outages don't fail otherwise-healthy runs. Spanning
+// the full ~24h message-visibility window would require a higher delivery cap,
+// not a higher ceiling: VQS clamps every hop at 900s, so going above it here
+// is pointless.
+const HANDLER_ERROR_MAX_RETRY_AFTER_SECONDS = MAX_REDELIVERY_DELAY_SECONDS;
+const HANDLER_ERROR_RETRY_JITTER_RATIO = 0.25;
+
+function getErrorRetryAfterSeconds(error: unknown): number | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+
+  // Read structurally rather than with instanceof: errors can cross VM and
+  // bundled-module realms before they reach the queue callback. This covers
+  // ThrottleError, TooEarlyError, and retryable WorkflowWorldError variants
+  // without coupling the final retry boundary to their constructors.
+  const retryAfter = (error as { retryAfter?: unknown }).retryAfter;
+  if (
+    typeof retryAfter !== 'number' ||
+    !Number.isFinite(retryAfter) ||
+    retryAfter <= 0
+  ) {
+    return undefined;
+  }
+
+  // VQS ultimately schedules through SQS, whose per-hop delay ceiling is 900s.
+  // Round upward so a fractional server delay is never retried early.
+  return Math.min(Math.ceil(retryAfter), HANDLER_ERROR_MAX_RETRY_AFTER_SECONDS);
+}
+
+function getHandlerErrorRetryAfterSeconds(
+  error: unknown,
+  deliveryCount: number
+): number {
+  const backoffSeconds = Math.min(
+    Math.max(HANDLER_ERROR_RETRY_AFTER_SECONDS, 2 ** (deliveryCount - 1)),
+    HANDLER_ERROR_MAX_RETRY_AFTER_SECONDS
+  );
+  const jitterSeconds = Math.floor(
+    Math.random() *
+      (Math.ceil(backoffSeconds * HANDLER_ERROR_RETRY_JITTER_RATIO) + 1)
+  );
+  const jitteredBackoffSeconds = Math.max(
+    HANDLER_ERROR_RETRY_AFTER_SECONDS,
+    backoffSeconds - jitterSeconds
+  );
+
+  // Jitter only the delivery-count backoff. Applying it after this max could
+  // turn Retry-After: 120 into an earlier retry, defeating server load shed.
+  return Math.max(
+    jitteredBackoffSeconds,
+    getErrorRetryAfterSeconds(error) ?? HANDLER_ERROR_RETRY_AFTER_SECONDS
+  );
+}
+
+/**
+ * Default region used when no explicit override, no tagged run ID, and no
+ * `VERCEL_REGION` env var are available. `iad1` preserves the historical
+ * behavior from before per-message regional routing existed.
+ */
+const FALLBACK_REGION = 'iad1';
+
+/**
+ * Extract the workflow run ID from a queue payload, returning `undefined` for
+ * payloads that don't carry one.
+ *
+ * Health-check payloads usually have no run ID, but a probe issued to prepare a
+ * cross-deployment `start()` carries the run id it is about to create. Reading
+ * it here is intentional: it routes the probe to the region the run will live
+ * in, matching the invoke that follows.
+ */
+function getRunIdFromPayload(payload: QueuePayload): string | undefined {
+  if ('runId' in payload && typeof payload.runId === 'string') {
+    return payload.runId;
+  }
+  return undefined;
+}
+
+/**
+ * The workflow name a queue name carries: every message for a run, workflow
+ * and step alike, goes to `__wkf_workflow_<workflowName>` (with an optional
+ * namespace prefix). `undefined` for a name that isn't a workflow topic.
+ */
+function getWorkflowNameFromQueueName(queueName: string): string | undefined {
+  try {
+    return parseQueueName(queueName as ValidQueueName).id;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Bind this run's events channel to one invocation of the flow route. This is
+ * the only pair of calls that opens one: nothing else in the SDK does, so every
+ * other writer (`start()` writing `run_created` from an arbitrary request
+ * handler, where a lone write would not repay a handshake) stays on HTTP.
+ *
+ * Both halves are no-ops on the HTTP default, and the gate is checked before the
+ * import so a deployment on the default never loads `ws`.
+ */
+const wsEventsChannelForInvocation = (
+  runId: string | undefined,
+  workflowName: string | undefined,
+  config: APIConfig | undefined
+) => {
+  /** This invocation's release, once the open has resolved one. */
+  let claim: Promise<(() => void) | undefined> | undefined;
+
+  return {
+    /**
+     * Unawaited and failure-proof: callers treat the handshake as free. The
+     * refcount therefore rises a microtask late, so a write racing the import
+     * finds no channel and goes over HTTP: one frame, not the invocation,
+     * since `close` awaits this same promise and so cannot release ahead of
+     * the claim it is releasing.
+     */
+    open(): void {
+      if (!runId || !isWsEventsTransportEnabledForWorkflow(workflowName)) {
+        return;
+      }
+      claim = import('./ws-transport.js')
+        .then(({ openWsChannel }) =>
+          openWsChannel(runId, config, { workflowName })
+        )
+        .catch(() => undefined);
+    },
+    /**
+     * Awaited, unlike the open: work scheduled after the handler returns is not
+     * guaranteed to run, and an open socket is not `unref`'d, so skipping this
+     * stops the process exiting and keeps a server invocation pinned.
+     *
+     * Releases the claim the open returned rather than re-resolving the run,
+     * which is what keeps a channel this invocation never opened (a later
+     * invocation's, registered under the same URL after ours was evicted) out
+     * of reach of our release.
+     */
+    async close(): Promise<void> {
+      const release = await claim;
+      release?.();
+    },
+  };
+};
+
+/**
+ * Workflow run IDs are prefixed with `wrun_` before the underlying ULID.
+ * Strip that prefix so the payload can be fed to the tagged-ULID decoder.
+ */
+const RUN_ID_PREFIX = 'wrun_';
+
+/**
+ * Decode the embedded region from a tagged workflow run ID, returning
+ * `undefined` if the value is not a tagged ULID or carries an unknown region.
+ */
+function regionFromTaggedRunId(runId: string | undefined): string | undefined {
+  if (!runId) return undefined;
+  const ulid = runId.startsWith(RUN_ID_PREFIX)
+    ? runId.slice(RUN_ID_PREFIX.length)
+    : runId;
+  try {
+    const decoded = decodeTaggedRunId(ulid);
+    if (!decoded.tagged) return undefined;
+    if (decoded.regionId === REGION_IDS.unknown) return undefined;
+    return decoded.region ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve the region the message should be sent to, in order of preference:
+ *   1. Explicit `opts.region` override.
+ *   2. Region embedded in the payload's tagged run ID.
+ *   3. `VERCEL_REGION` environment variable.
+ *   4. {@link FALLBACK_REGION} (preserves pre-regional behavior).
+ *
+ * The `opts.region` override and `VERCEL_REGION` are arbitrary strings, so
+ * each is validated against the known region table and ignored (falling
+ * through to the next source) when it isn't a routable region code. This keeps
+ * a bad override (e.g. `start({ region: 'xyz9' })`) from
+ * clobbering the payload-derived region with an undeliverable destination.
+ */
+function resolveTargetRegion(
+  payload: QueuePayload,
+  opts?: QueueOptions
+): string {
+  if (isKnownRegionCode(opts?.region)) return opts.region;
+  const fromRunId = regionFromTaggedRunId(getRunIdFromPayload(payload));
+  if (fromRunId) return fromRunId;
+  const fromEnv = process.env.VERCEL_REGION;
+  if (isKnownRegionCode(fromEnv)) return fromEnv;
+  return FALLBACK_REGION;
+}
+
+/**
+ * Extract known identifiers from a queue payload and return them as VQS headers.
+ * This ensures observability headers are always set without relying on callers.
+ */
+function getHeadersFromPayload(
+  payload: QueuePayload
+): Record<string, string> | undefined {
+  const headers: Record<string, string> = {};
+
+  if ('runId' in payload && typeof payload.runId === 'string') {
+    headers['x-vercel-workflow-run-id'] = payload.runId;
+  }
+  if ('stepId' in payload && typeof payload.stepId === 'string') {
+    headers['x-vercel-workflow-step-id'] = payload.stepId;
+  }
+
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+/**
+ * A flow (workflow) topic: every flow message of a workflow, orchestrator or
+ * step, spec 8 or spec 9, goes to one shared topic (`__wkf_workflow_<name>`),
+ * whose consumer has no `maxConcurrency`. A spec-9 run's orchestrator
+ * messages carry its run id as their concurrency key there (see
+ * {@link concurrencyKeyOf}), which keeps that run to one orchestrator
+ * invocation at a time; a spec-8 run's messages carry none.
+ *
+ * The match allows an optional queue namespace prefix
+ * (`__<namespace>_wkf_workflow_`, see `@workflow/builders` constants).
+ */
+const FLOW_TOPIC_PATTERN = /^__([a-z][a-z0-9]*_)?wkf_workflow_/;
+
+/**
+ * The concurrency key of a flow message: the run id, for an orchestrator
+ * message of a single-orchestrator run (spec >= 9, by the payload's own
+ * spec stamp, see `isSingleOrchestratorMessage`). VQS keeps one delivery per
+ * key active and coalesces the key's other messages into it.
+ *
+ * `undefined` for everything else: a step message, a health check, and a
+ * spec-8 run's message (keying it would serialize it, and turn a wake into a
+ * coalesced re-run inside the running invocation).
+ */
+function concurrencyKeyOf(
   queueName: ValidQueueName,
-});
+  payload: QueuePayload
+): string | undefined {
+  if (!FLOW_TOPIC_PATTERN.test(queueName)) return undefined;
+  if (!isSingleOrchestratorMessage(payload)) return undefined;
+  return orchestratorRunIdOf(payload);
+}
 
-export function createQueue(): Queue {
-  const queue: Queue['queue'] = async (queueName, x, opts) => {
-    const encoded = MessageWrapper.encode({
-      payload: x,
-      queueName,
-    });
-    const sanitizedQueueName = queueName.replace(/[^A-Za-z0-9-_]/g, '-');
-    const { messageId } = await send(sanitizedQueueName, encoded, opts);
-    return { messageId: MessageId.parse(messageId) };
+/**
+ * The consumer group a held message is claimed for when the send names none
+ * (`QueueHoldOptions.consumerGroup`): the one the Workflow SDK's generated
+ * queue triggers subscribe with (`consumer: 'default'`), so a hold that
+ * lapses is delivered to the route that would have received the message
+ * anyway.
+ */
+export const HOLD_CONSUMER_GROUP = 'default';
+
+/** Vercel Queues' pattern for a consumer group name. */
+const CONSUMER_GROUP_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * The consumer group Vercel subscribes a `queue/v2beta` trigger with when the
+ * Function is configured in `vercel.json` / `vercel.ts` (`functions[pattern]
+ * .experimentalTriggers`). There the trigger takes no `consumer`: the build
+ * names the group after the function's pattern, prefixed by the service name
+ * in a multi-service project, escaping every character outside
+ * `[A-Za-z0-9-]` (`_` → `__`, `/` → `_S`, `.` → `_D`, anything else → `_`
+ * and its char code in hex). For example `app/api/libfx/route.ts` →
+ * `app_Sapi_Slibfx_Sroute_Dts`.
+ *
+ * Pass it as `experimental_hold.consumerGroup` for a message such a Function
+ * consumes. Mirrors `@vercel/build-utils`; a test pins it.
+ */
+export function vercelTriggerConsumerGroup(
+  functionPattern: string,
+  serviceName?: string
+): string {
+  const path = serviceName
+    ? `${serviceName}~${functionPattern}`
+    : functionPattern;
+  let result = '';
+  for (const char of path) {
+    if (char === '_') result += '__';
+    else if (char === '/') result += '_S';
+    else if (char === '.') result += '_D';
+    else if (/[A-Za-z0-9-]/.test(char)) result += char;
+    else {
+      result += `_${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`;
+    }
+  }
+  return result;
+}
+
+/** Vercel Queues' bounds on a hold's lease. */
+const MIN_HOLD_VISIBILITY_SECONDS = 30;
+const MAX_HOLD_VISIBILITY_SECONDS = 3600;
+
+/**
+ * The `experimental_hold` a send carries for `QueueOptions.experimental_hold`,
+ * or `undefined` without one. The lease is clamped to what Vercel Queues
+ * accepts and to the message's retention, so a caller's value never turns
+ * into a rejected send. Exported for unit tests.
+ *
+ * @throws {TypeError} With `delaySeconds`: a held message is delivered to its
+ *   sender now, so there is nothing to delay.
+ */
+export function resolveHoldOptions(
+  opts: QueueOptions | undefined,
+  lifetime: { delaySeconds?: number; retentionSeconds?: number }
+): ExperimentalHoldOptions | undefined {
+  const requestedHold = opts?.experimental_hold;
+  if (!requestedHold) return undefined;
+  // `true` is shorthand for the defaults.
+  const hold: QueueHoldOptions = requestedHold === true ? {} : requestedHold;
+  if (lifetime.delaySeconds !== undefined) {
+    throw new TypeError(
+      'experimental_hold cannot be combined with delaySeconds: a held message runs in the process that sent it, now'
+    );
+  }
+  const consumerGroup = hold.consumerGroup ?? HOLD_CONSUMER_GROUP;
+  if (!CONSUMER_GROUP_PATTERN.test(consumerGroup)) {
+    throw new TypeError(
+      `experimental_hold.consumerGroup must match ${CONSUMER_GROUP_PATTERN}: "${consumerGroup}"`
+    );
+  }
+  const requested = hold.visibilityTimeoutSeconds;
+  if (requested === undefined || !Number.isFinite(requested)) {
+    return { consumerGroup };
+  }
+  const ceiling = Math.min(
+    MAX_HOLD_VISIBILITY_SECONDS,
+    lifetime.retentionSeconds ?? DEFAULT_MESSAGE_RETENTION_SECONDS
+  );
+  return {
+    consumerGroup,
+    visibilityTimeoutSeconds: Math.min(
+      Math.max(Math.ceil(requested), MIN_HOLD_VISIBILITY_SECONDS),
+      ceiling
+    ),
+  };
+}
+
+type QueueFunction = (
+  queueName: ValidQueueName,
+  payload: QueuePayload,
+  opts?: QueueOptions
+) => ReturnType<Queue['queue']>;
+
+export function createQueue(config?: APIConfig): Queue {
+  const { baseUrl, usingProxy } = getHttpUrl(config);
+  const headers = getHeaders(config, { usingProxy });
+
+  const cborTransport = new CborTransport();
+  const jsonTransport = new JsonTransport();
+  const dualTransport = new DualTransport();
+
+  /**
+   * Options common to every `QueueClient` instantiation. `region` is
+   * intentionally omitted here: `queue()` resolves it per-send from the
+   * payload / opts, and the handler client leaves it unset so the SDK
+   * auto-detects `VERCEL_REGION` (follow-up acks are routed to the region
+   * from the incoming `ce-vqsregion` header regardless).
+   */
+  const clientOptions = {
+    dispatcher: getQueueDispatcher(config),
+    transport: dualTransport,
+    ...(usingProxy && {
+      // final path will be /queues-proxy/api/v3/topic/...
+      // and the proxy will strip the /queues-proxy prefix before forwarding to VQS
+      resolveBaseUrl: () => new URL(`${baseUrl}/queues-proxy`),
+      token: config?.token,
+    }),
+    headers: Object.fromEntries(headers.entries()),
   };
 
-  const createQueueHandler: Queue['createQueueHandler'] = (prefix, handler) => {
-    return handleCallback({
-      [`${prefix}*`]: {
-        default: (body, meta) => {
-          const { payload, queueName } = MessageWrapper.parse(body);
-          return handler(payload, {
-            queueName,
-            messageId: MessageId.parse(meta.messageId),
-            attempt: meta.deliveryCount,
-          });
+  /**
+   * Resolves everything a send needs from one (payload, opts) pair: the
+   * routing dimensions that decide WHICH client the message goes through
+   * (region / deploymentId / transport / physical topic) and the per-message
+   * arguments. Shared by `queue` and `queueBatch` so a batched send routes
+   * byte-for-byte the same way the single send would have.
+   */
+  const prepareSend = (
+    queueName: ValidQueueName,
+    payload: QueuePayload,
+    opts?: QueueOptions
+  ) => {
+    // Check if we have a deployment ID either from options or environment
+    const deploymentId = opts?.deploymentId ?? process.env.VERCEL_DEPLOYMENT_ID;
+    if (!deploymentId) {
+      throw new Error(
+        `${missingDeploymentIdMessage('Enqueuing a workflow message')} ` +
+          'Callers outside a deployment can instead pass an explicit deploymentId in options.'
+      );
+    }
+
+    // Select transport based on the target run's specVersion:
+    // CBOR for specVersion >= 3 (CBOR transport), JSON for older ones.
+    const useCbor =
+      (opts?.specVersion ?? SPEC_VERSION_CURRENT) >=
+      SPEC_VERSION_SUPPORTS_CBOR_QUEUE_TRANSPORT;
+
+    // Resolve the destination region. Explicit `opts.region` wins, otherwise
+    // we decode it from the payload's tagged run ID so messages produced by
+    // `start()` land in the same region the run was created in. Falls back
+    // to the `VERCEL_REGION` env var, then `iad1` to preserve historical
+    // behavior for legacy / untagged run IDs.
+    const region = resolveTargetRegion(payload, opts);
+
+    const topic = queueName.replace(/[^A-Za-z0-9-_]/g, '-');
+    const concurrencyKey = concurrencyKeyOf(queueName, payload);
+
+    return {
+      deploymentId,
+      useCbor,
+      region,
+      topic,
+      // The CborTransport handles CBOR encoding inside serialize(),
+      // preserving Uint8Array values (workflow input in specVersion >= 2).
+      wrapper: {
+        payload,
+        // The queue name the message was sent to: the handler dispatches by
+        // it, and a re-enqueue sends to it again.
+        queueName,
+        // Store deploymentId in the message so it can be preserved when re-enqueueing
+        deploymentId: opts?.deploymentId,
+      },
+      sendOptions: {
+        // Set on a step's execution message and on a wait's timer; a wake
+        // carries none (see `QueueOptions.idempotencyKey`). Passed through
+        // as given.
+        idempotencyKey: opts?.idempotencyKey,
+        ...(concurrencyKey !== undefined && {
+          experimental_concurrencyKey: concurrencyKey,
+        }),
+        ...resolveMessageLifetime(opts),
+        headers: {
+          ...getHeadersFromPayload(payload),
+          ...opts?.headers,
         },
       },
-    });
+    };
   };
 
+  const clientFor = (route: {
+    region: string;
+    deploymentId: string;
+    useCbor: boolean;
+  }) =>
+    new QueueClient({
+      ...clientOptions,
+      // When sending through the api.vercel.com proxy, the fixed
+      // `resolveBaseUrl` above replaces the queue SDK's own
+      // region -> `<region>.vercel-queue.com` base-URL resolution, so
+      // the per-send resolved region must travel as a header instead:
+      // the proxy forwards the send to that region's VQS dataplane
+      // host when `x-vercel-queue-region` is present (vercel/api#79056).
+      ...(usingProxy && {
+        headers: {
+          ...clientOptions.headers,
+          'x-vercel-queue-region': route.region,
+        },
+      }),
+      region: route.region,
+      deploymentId: route.deploymentId,
+      transport: route.useCbor ? cborTransport : jsonTransport,
+    });
+
+  const queue: QueueFunction = async (
+    queueName,
+    payload,
+    opts?: QueueOptions
+  ) => {
+    const prepared = prepareSend(queueName, payload, opts);
+    const client = clientFor(prepared);
+    const resolvedHold = resolveHoldOptions(opts, prepared.sendOptions);
+    // A held message runs in this process, so this deployment's handler would
+    // run a message pinned to another deployment. Send that one plain: its
+    // own deployment receives it.
+    const pinnedElsewhere =
+      resolvedHold !== undefined &&
+      prepared.deploymentId !== process.env.VERCEL_DEPLOYMENT_ID;
+    const hold = pinnedElsewhere ? undefined : resolvedHold;
+    // A held run's handoffs go through this client's API client.
+    if (hold) observeHandoffOutcomes(client);
+    // A repeated `idempotencyKey` is accepted rather than rejected: the send
+    // returns a fresh message ID and only one of the messages is delivered, so
+    // there is no conflict for the caller to handle here.
+    // Re-sent after a transient failure (see queue-send-retry.ts): a failed
+    // `start()` send would otherwise leave a created run that never runs.
+    const sent = await withQueueSendRetry(
+      () =>
+        client.send(prepared.topic, prepared.wrapper, {
+          ...prepared.sendOptions,
+          ...(hold && { experimental_hold: hold }),
+        }),
+      sendRetryLogging(queueName, [payload])
+    );
+    const { messageId, experimental_held, experimental_notHeld } = sent;
+    let holdResult: QueueHoldResult | undefined;
+    if (experimental_held) {
+      holdResult = {
+        status: 'held',
+        messageId: MessageId.parse(experimental_held.messageId),
+        leaseExpiresAt: experimental_held.leaseExpiresAt,
+        // The held message goes through the same callback and retry
+        // directives as a pushed delivery of it (`createQueueHandler`), so a
+        // `{ timeoutSeconds }` result, a handoff and a rejection mean what
+        // they mean there. Under an invocation context like a pushed
+        // delivery's, so its coalesced re-runs share one inline budget: the
+        // enclosing delivery's when it is consumed inside one, else one that
+        // starts now.
+        consume: (handler) =>
+          invocationStorage.run(
+            invocationStorage.getStore() ?? {
+              collectStepIds: false,
+              requestId: undefined,
+              stepIds: new Set(),
+              startedAt: Date.now(),
+            },
+            () =>
+              experimental_held.consume(
+                deliveryCallback(handler),
+                deliveryOptions
+              )
+          ),
+        release: (delaySeconds) => experimental_held.release(delaySeconds),
+      };
+    } else if (experimental_notHeld || pinnedElsewhere) {
+      holdResult = {
+        status: 'not_held',
+        reason: experimental_notHeld?.reason ?? 'unsupported',
+      };
+    }
+    return {
+      // messageId may be null when the queue fails over to a different region:
+      // the event is ingested but the responding region cannot return an ID.
+      messageId: messageId ? MessageId.parse(messageId) : null,
+      ...(holdResult && { experimental_hold: holdResult }),
+    };
+  };
+
+  const queueBatch: NonNullable<Queue['queueBatch']> = async (
+    queueName,
+    messages
+  ) => {
+    const results = new Array<QueueBatchResult>(messages.length);
+    if (messages.length === 0) return results;
+
+    // Trace context has to be attached per MESSAGE here, not per request.
+    //
+    // `send()` gets this for free: the SDK injects into the headers it is
+    // about to send, and for a single message those headers ARE the message's
+    // headers, so VQS stores the `traceparent` and re-emits it at delivery as
+    // `x-vercel-queue-traceparent` — which is what lets a consumer attach a
+    // span link back to this producer. `sendBatch` injects into the multipart
+    // REQUEST headers instead, and the per-part headers it builds never see
+    // it, so a batched message would arrive with no producer context and the
+    // consumer's `vqs.process` span would have no link.
+    //
+    // One injection for the whole call: every message in a batch is published
+    // under the same active span, which is exactly what the single send would
+    // have recorded on each of them.
+    const traceHeaders = isQueueTracePropagationDisabled()
+      ? {}
+      : await getTraceContextHeaders();
+
+    // Group by the routing dimensions a single VQS request cannot span. In
+    // the case this exists for — one run's fan-out to one logical queue —
+    // every message lands in one group, so this is one request per
+    // MAX_QUEUE_SEND_BATCH messages. Mixed input still works, it just costs
+    // one request per distinct route.
+    const groups = new Map<
+      string,
+      {
+        route: { region: string; deploymentId: string; useCbor: boolean };
+        entries: {
+          index: number;
+          topic: string;
+          /** The World payload, for logging; `message` carries its wrapper. */
+          payload: QueuePayload;
+          message: Parameters<QueueClient['sendBatch']>[1][number];
+        }[];
+      }
+    >();
+    for (const [index, entry] of messages.entries()) {
+      const prepared = prepareSend(queueName, entry.message, entry.opts);
+      const key = `${prepared.region} ${prepared.deploymentId} ${prepared.useCbor} ${prepared.topic}`;
+      const group = groups.get(key) ?? {
+        route: prepared,
+        entries: [],
+      };
+      group.entries.push({
+        index,
+        topic: prepared.topic,
+        payload: entry.message,
+        message: {
+          payload: prepared.wrapper,
+          ...prepared.sendOptions,
+          // Trace headers last, matching the single send: the SDK injects
+          // after it has applied the caller's `opts.headers`.
+          headers: { ...prepared.sendOptions.headers, ...traceHeaders },
+        },
+      });
+      groups.set(key, group);
+    }
+
+    await Promise.all(
+      [...groups.values()].map(async ({ route, entries }) => {
+        const client = clientFor(route);
+        for (
+          let offset = 0;
+          offset < entries.length;
+          offset += MAX_QUEUE_SEND_BATCH
+        ) {
+          const chunk = entries.slice(offset, offset + MAX_QUEUE_SEND_BATCH);
+          const sent = await withQueueSendRetry(
+            () =>
+              client.sendBatch(
+                // biome-ignore lint/style/noNonNullAssertion: chunks are non-empty
+                chunk[0]!.topic,
+                chunk.map((entry) => entry.message)
+              ),
+            sendRetryLogging(
+              queueName,
+              chunk.map((entry) => entry.payload)
+            )
+          );
+          for (const [position, entry] of chunk.entries()) {
+            results[entry.index] = toBatchResult(sent[position]);
+          }
+        }
+      })
+    );
+    return results;
+  };
+
+  /**
+   * The `@vercel/queue` callback that runs `handler` on one delivery: a
+   * pushed one (`createQueueHandler`) or a message the queue held for its
+   * sender (`experimental_hold.consume`), which runs the same way.
+   */
+  const deliveryCallback =
+    (handler: QueueHandler): MessageHandler<unknown> =>
+    async (message, metadata) => {
+      if (!message || !metadata) {
+        return;
+      }
+
+      const invocation = invocationStorage.getStore();
+      const requestId = invocation?.requestId;
+      // The CborTransport handles CBOR decoding inside deserialize(),
+      // so message is already a plain object with Uint8Array values intact.
+      const { payload, queueName, deploymentId } =
+        MessageWrapper.parse(message);
+
+      // Earliest point in an invocation where the run id is known, so the WS
+      // handshake happens here instead of on the runtime's first event write
+      // (which would record a `step_started` later than the work it
+      // timestamps). This path also absorbs `ws`'s module init.
+      const wsEvents = wsEventsChannelForInvocation(
+        getRunIdFromPayload(payload),
+        getWorkflowNameFromQueueName(queueName),
+        config
+      );
+      const collectStepIds = !(
+        'stepId' in payload && typeof payload.stepId === 'string'
+      );
+      wsEvents.open();
+
+      try {
+        const runHandler = () =>
+          handler(payload, {
+            queueName,
+            // Stable across redeliveries of one message, including the
+            // ones a `{ timeoutSeconds }` result asks for below.
+            messageId: MessageId.parse(metadata.messageId),
+            // A handed-off delivery is not an attempt (see
+            // `RedeliverSameMessage`), and neither is a coalesced re-run.
+            attempt: Math.max(
+              1,
+              metadata.deliveryCount - (metadata.experimental_handoffCount ?? 0)
+            ),
+            // A coalesced re-run reports the next count: it must read the
+            // log, as a redelivery does (`Queue.createQueueHandler`).
+            deliveryCount:
+              metadata.deliveryCount +
+              (metadata.experimental_coalesced?.rerun ?? 0),
+            createdAt: metadata.createdAt,
+            requestId,
+            ...(invocation && { invocationStartedAt: invocation.startedAt }),
+          });
+        const result = await (invocation
+          ? invocationStorage.run({ ...invocation, collectStepIds }, runHandler)
+          : runHandler());
+
+        /**
+         * Continues a spec 9 orchestrator message close to its expiry, or
+         * to its handoff bound (`orchestratorMessageRotation`), on a new
+         * message, and returns `true` once it was sent; `false` when the
+         * message is not due or is not an orchestrator message. A step
+         * message keeps its own (its idempotency key would drop a copy).
+         *
+         * The new message is a continuation (spec stamp, run context, so
+         * the same concurrency key, and what the message is a wake for),
+         * never a copy: the run's start message carries `runInput`, which
+         * on a first delivery selects the runtime's fresh-start path. It is
+         * delayed past this delivery's acknowledgment. Callers rotate only
+         * once the runtime sent every message its committed writes owe, so
+         * this message's id owes nothing more.
+         */
+        const rotateIfDue = async (): Promise<boolean> => {
+          if ('invoke' in payload && payload.invoke === true) return false;
+          const rotation = orchestratorMessageRotation(metadata);
+          const continuation =
+            rotation === undefined
+              ? undefined
+              : singleOrchestratorContinuationPayload(payload);
+          if (rotation === undefined || continuation === undefined) {
+            return false;
+          }
+          await queue(queueName, continuation, {
+            deploymentId,
+            delaySeconds: ORCHESTRATOR_ROTATION_DELAY_SECONDS,
+            specVersion: continuation.runSpecVersion,
+          });
+          console.info(
+            `[workflow] Continuing run "${getRunIdFromPayload(payload)}" on a new message instead of handing off message "${metadata.messageId}" (${rotation}; handoffs: ${metadata.experimental_handoffCount ?? 0})`
+          );
+          return true;
+        };
+
+        // The last coalesced re-run of a delivery that acknowledges. If
+        // more messages were coalesced into it meanwhile, `@vercel/queue`
+        // refuses the acknowledgment and hands the message off itself
+        // (`ConcurrencyCoalescedPendingError` in `retry` below), which
+        // keeps the message's expiry and handoff count and cannot send.
+        // So a message due for rotation is continued on a new one here,
+        // before that acknowledgment. If the acknowledgment then succeeds,
+        // the continuation is one extra wake, which replays from the log.
+        if (
+          isLastCoalescedRerun(metadata) &&
+          !(
+            typeof result === 'object' &&
+            result !== null &&
+            'timeoutSeconds' in result &&
+            typeof result.timeoutSeconds === 'number'
+          ) &&
+          (await rotateIfDue())
+        ) {
+          return;
+        }
+
+        if (
+          !('invoke' in payload && payload.invoke === true) &&
+          typeof result === 'object' &&
+          result !== null &&
+          'timeoutSeconds' in result &&
+          typeof result.timeoutSeconds === 'number'
+        ) {
+          if (!isSingleOrchestratorMessage(payload)) {
+            // A spec-8 run continues on a NEW message. When timeoutSeconds
+            // is 0, skip delaySeconds entirely for immediate re-enqueue.
+            // Otherwise, clamp to one continuation hop (23h by default).
+            // Longer sleeps chain delayed messages until the full duration
+            // has elapsed. A new message starts with a fresh retention and
+            // delivery count, so a long sleep or retry chain is bounded by
+            // neither VQS's 900s redelivery delay nor the delivery cap.
+            const delaySeconds =
+              result.timeoutSeconds > 0
+                ? Math.min(result.timeoutSeconds, MAX_DELAY_SECONDS)
+                : undefined;
+
+            // Send new message BEFORE acknowledging current message.
+            // This ensures crash safety: if process dies after send but before ack,
+            // we may get a duplicate invocation but won't lose the scheduled wakeup.
+            await queue(queueName, payload, { deploymentId, delaySeconds });
+            return;
+          }
+          // A single-orchestrator run: leave this message unacknowledged
+          // and have VQS deliver it again after the delay (a step retried
+          // in place, an orchestrator delivery deferred for load). The same
+          // message keeps its id, so a redelivery of the delivery that
+          // created a step still recognizes itself. `0` (or less) is a
+          // handoff. A non-finite delay is no handoff: a handoff is not an
+          // attempt, so a handler that kept answering one would be
+          // redelivered at once forever. It is the longest redelivery
+          // instead, which the delivery cap counts.
+          const afterSeconds = Number.isFinite(result.timeoutSeconds)
+            ? Math.max(0, Math.ceil(result.timeoutSeconds))
+            : MAX_REDELIVERY_DELAY_SECONDS;
+          // A handoff of a message close to its expiry, or to exhausting
+          // its handoffs, continues on a new message instead, and this one
+          // is acknowledged.
+          if (afterSeconds === 0 && (await rotateIfDue())) return;
+          throw new RedeliverSameMessage(afterSeconds);
+        }
+      } finally {
+        // The only point in the SDK that knows an invocation has no writes
+        // left. In a `finally` so a failed handler closes too, since the
+        // retry arrives as a new invocation and opens its own channel.
+        await wsEvents.close();
+      }
+    };
+
+  /** Retry directives for {@link deliveryCallback}. */
+  const deliveryOptions: {
+    experimental_maxCoalescedReruns: number;
+    retry: RetryHandler;
+  } = {
+    // Without an explicit retry directive, @vercel/queue leaves failed
+    // handler messages invisible until the default 300s visibility timeout
+    // expires. Start retrying after 1s, then back off by delivery count
+    // with jitter so an outage or poison message cannot hot-loop or
+    // redrive in lockstep. Workflow handlers are event-sourced and must
+    // remain idempotent because queue retries can happen close together.
+    experimental_maxCoalescedReruns: MAX_COALESCED_RERUNS,
+    retry: (error, { messageId, deliveryCount }) => {
+      if (error instanceof RedeliverSameMessage) {
+        // A requested redelivery, not a failure: no backoff, no log line.
+        return error.handoff
+          ? { afterSeconds: 0, experimental_handoff: true }
+          : { afterSeconds: error.afterSeconds };
+      }
+      if (error instanceof ConcurrencyCoalescedPendingError) {
+        // The handler finished, but messages kept being coalesced into
+        // the delivery through every re-run: a busy run, not a failing
+        // one. Hand the message off: its next delivery replays from the
+        // log, which holds what those messages were sent for, and it is
+        // not counted as an attempt.
+        // A message due for rotation was already continued on a new one
+        // by its last re-run (see `isLastCoalescedRerun`).
+        console.debug(
+          `[workflow] Handing off message "${messageId}" with coalesced messages still pending after ${MAX_COALESCED_RERUNS} re-runs (delivery ${deliveryCount})`
+        );
+        return { afterSeconds: 0, experimental_handoff: true };
+      }
+      const afterSeconds = getHandlerErrorRetryAfterSeconds(
+        error,
+        deliveryCount
+      );
+      console.error(
+        `[workflow] Queue handler failed for message "${messageId}" on delivery attempt ${deliveryCount}; retrying in ${afterSeconds}s:`,
+        error
+      );
+      return { afterSeconds };
+    },
+  };
+
+  const createQueueHandler: Queue['createQueueHandler'] = (
+    _prefix,
+    handler
+  ) => {
+    const client = new QueueClient(clientOptions);
+    observeHandoffOutcomes(client);
+    const vqsHandler = client.handleCallback(
+      deliveryCallback(handler),
+      deliveryOptions
+    );
+
+    return async (req: Request) => {
+      const rawId = req.headers.get('x-vercel-id');
+      const requestId = rawId?.trim() || undefined;
+      const invocation: QueueInvocationContext = {
+        collectStepIds: false,
+        requestId,
+        stepIds: new Set(),
+        startedAt: Date.now(),
+      };
+      const response = await invocationStorage.run(invocation, () =>
+        vqsHandler(req)
+      );
+      return attachStepIds(response, invocation);
+    };
+  };
+
+  // `start()` resolves the current deployment before writing anything, so this
+  // is where a Vercel world running outside a deployment fails: ahead of any
+  // state write, and regardless of whether credentials happen to be valid.
   const getDeploymentId: Queue['getDeploymentId'] = async () => {
     const deploymentId = process.env.VERCEL_DEPLOYMENT_ID;
     if (!deploymentId) {
-      throw new Error('VERCEL_DEPLOYMENT_ID environment variable is not set');
+      throw new Error(missingDeploymentIdMessage('Starting a workflow run'));
     }
     return deploymentId;
   };
 
-  return { queue, createQueueHandler, getDeploymentId };
+  const isDeploymentUnavailableError: Queue['isDeploymentUnavailableError'] = (
+    error
+  ) => error instanceof ConsumerDiscoveryError;
+
+  return {
+    // The runtime does not check deliveries with a key, because two layers
+    // protect the route: only Vercel Queues can trigger it, and the handler
+    // takes a message ID and retrieves and leases the message through the
+    // queue, so a request cannot carry its own payload. Do not copy 'skip'
+    // into a World that lacks either layer.
+    queueAuthMode: 'skip',
+    queue,
+    queueBatch,
+    createQueueHandler,
+    getDeploymentId,
+    isDeploymentUnavailableError,
+  };
 }

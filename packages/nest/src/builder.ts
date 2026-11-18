@@ -1,0 +1,187 @@
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { BaseBuilder, createBaseBuilderConfig } from '@workflow/builders';
+import { join } from 'pathe';
+import { rewriteTsImportsInContent } from './cjs-rewrite.js';
+
+export interface NestBuilderOptions {
+  /**
+   * Working directory for the NestJS application
+   * @default process.cwd()
+   */
+  workingDir?: string;
+  /**
+   * Directories to scan for workflow files
+   * @default ['src']
+   */
+  dirs?: string[];
+  /**
+   * Output directory for generated workflow bundles
+   * @default '.nestjs/workflow'
+   */
+  outDir?: string;
+  /**
+   * Enable watch mode for development.
+   *
+   * @deprecated Not implemented. `createCombinedBundle` hands back live esbuild
+   * contexts in watch mode and this builder discards them, so nothing rebuilds
+   * and the contexts leak. The option is pinned off until watch is wired up;
+   * use `nest start --watch`, which re-runs the startup build.
+   */
+  watch?: boolean;
+  /**
+   * SWC module compilation type.
+   * Set to 'commonjs' if your NestJS project compiles to CJS via SWC.
+   * When 'commonjs', the builder rewrites externalized imports in the
+   * steps bundle to use require() via createRequire, avoiding ESM/CJS
+   * named-export interop issues with SWC's _export() wrapper pattern.
+   * @default 'es6'
+   */
+  moduleType?: 'es6' | 'commonjs';
+  /**
+   * Directory where NestJS compiles .ts source files to .js (relative to workingDir).
+   * Used when moduleType is 'commonjs' to resolve compiled file paths.
+   * This should match the `outDir` in your tsconfig.json.
+   * @default 'dist'
+   */
+  distDir?: string;
+  /**
+   * Controls how source maps are emitted for workflow bundles. Accepts the
+   * same values as esbuild's `sourcemap` option: `true`/`'inline'` (default),
+   * `'linked'`, `'external'`, `'both'`, or `false` to omit source maps.
+   * Can also be set via the `WORKFLOW_SOURCEMAP` environment variable.
+   */
+  sourcemap?: boolean | 'inline' | 'linked' | 'external' | 'both';
+  /**
+   * Route prefix the workflow endpoints are served under, stamped into the
+   * generated flow route so the runtime generates matching callback URLs.
+   */
+  basePath?: string;
+}
+
+export class NestLocalBuilder extends BaseBuilder {
+  #outDir: string;
+  #moduleType: 'es6' | 'commonjs';
+  #distDir: string;
+  #dirs: string[];
+  #workingDir: string;
+
+  constructor(options: NestBuilderOptions = {}) {
+    const workingDir = options.workingDir ?? process.cwd();
+    const outDir = options.outDir ?? join(workingDir, '.nestjs/workflow');
+    const dirs = options.dirs ?? ['src'];
+    super({
+      ...createBaseBuilderConfig({
+        workingDir,
+        // Pinned off: see the `watch` option's deprecation note.
+        watch: false,
+        dirs,
+        sourcemap: options.sourcemap,
+      }),
+      basePath: options.basePath,
+      // Use 'standalone' as base target - we handle the specific bundling ourselves
+      buildTarget: 'standalone',
+      stepsBundlePath: join(outDir, 'steps.mjs'),
+      workflowsBundlePath: join(outDir, 'workflows.mjs'),
+      webhookBundlePath: join(outDir, 'webhook.mjs'),
+    });
+    this.#outDir = outDir;
+    this.#moduleType = options.moduleType ?? 'es6';
+    this.#distDir = options.distDir ?? 'dist';
+    this.#dirs = dirs;
+    this.#workingDir = workingDir;
+  }
+
+  get outDir(): string {
+    return this.#outDir;
+  }
+
+  override async build(): Promise<void> {
+    const inputFiles = await this.getInputFiles();
+    await mkdir(this.#outDir, { recursive: true });
+
+    const { manifest } = await this.createCombinedBundle({
+      inputFiles,
+      stepsOutfile: join(this.#outDir, 'steps.mjs'),
+      flowOutfile: join(this.#outDir, 'workflows.mjs'),
+      format: 'esm',
+      bundleFinalOutput: false,
+      externalizeNonSteps: true,
+      // The WorkflowController loads these bundles straight off disk with
+      // Node's ESM loader, with no bundler in between. An externalized local
+      // import therefore has to be something Node itself can resolve, and a
+      // plain `.ts` helper imported by a step is not: Node only runs
+      // TypeScript from 22.18 on, and its type stripping still rejects the
+      // enums, parameter properties and decorators a NestJS codebase is full
+      // of. Bundling those dependencies keeps the output loadable on every
+      // supported Node.
+      //
+      // CommonJS projects keep externalizing them, because
+      // `#rewriteStepsBundleForCjs` rewrites those imports to `require()` the
+      // compiled files in `distDir` — a path with its own CI coverage.
+      bundleTransitiveLocalStepDependencies: this.#moduleType !== 'commonjs',
+    });
+
+    // When the NestJS project compiles to CJS via SWC, the ESM steps bundle
+    // can't import named exports from CJS files because cjs-module-lexer
+    // doesn't recognize SWC's _export() wrapper pattern.
+    // Rewrite externalized .ts imports to use require() via createRequire.
+    if (this.#moduleType === 'commonjs') {
+      await this.#rewriteStepsBundleForCjs();
+    }
+
+    await this.createWebhookBundle({
+      outfile: join(this.#outDir, 'webhook.mjs'),
+      bundle: false,
+    });
+
+    // Generate manifest
+    await this.createManifest({
+      workflowBundlePath: join(this.#outDir, 'workflows.mjs'),
+      manifestDir: this.#outDir,
+      manifest,
+    });
+
+    // Create .gitignore to exclude generated files
+    if (!process.env.VERCEL_DEPLOYMENT_ID) {
+      await writeFile(join(this.#outDir, '.gitignore'), '*\n');
+    }
+  }
+
+  /**
+   * Rewrite externalized .ts/.tsx imports in the steps bundle to use require()
+   * for CommonJS compatibility.
+   *
+   * When NestJS compiles to CJS via SWC, the ESM steps bundle can't import
+   * named exports from CJS files because cjs-module-lexer doesn't recognize
+   * SWC's _export() wrapper pattern. This rewrites the imports to use
+   * createRequire() and points them to the compiled .js files in distDir.
+   */
+  async #rewriteStepsBundleForCjs(): Promise<void> {
+    const stepsPath = join(this.#outDir, 'steps.mjs');
+    const stepsContent = await readFile(stepsPath, 'utf-8');
+
+    const { content: rewritten, matchCount } = rewriteTsImportsInContent(
+      stepsContent,
+      {
+        outDir: this.#outDir,
+        workingDir: this.#workingDir,
+        distDir: this.#distDir,
+        dirs: this.#dirs,
+      }
+    );
+
+    if (matchCount === 0) {
+      console.warn(
+        '[@workflow/nest] No .ts/.tsx imports found to rewrite for CommonJS. ' +
+          "If you expected externalized imports, esbuild's output format may have changed."
+      );
+      return;
+    }
+
+    // Write the rewritten bundle as-is. Do NOT prepend a `createRequire` shim:
+    // `require` is already declared by the ESM interop banner `createStepsBundle`
+    // emits, and a second declaration in the same module scope makes the bundle
+    // fail to parse (#3778). Covered by builder.test.ts.
+    await writeFile(stepsPath, rewritten);
+  }
+}

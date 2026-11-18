@@ -1,0 +1,390 @@
+---
+title: Worlds
+description: Configure the Workflow backend that stores runs and delivers queue messages.
+type: reference
+summary: Select and configure Local, Postgres, Vercel, or custom Worlds.
+related:
+  - /worlds/local
+  - /worlds/postgres
+  - /worlds/vercel
+---
+
+A [World](/docs/deploying) stores workflow state and delivers queue messages.
+
+## Selecting a World
+
+### `WORKFLOW_TARGET_WORLD`
+
+- Surface: environment variable
+- Default: `local` outside Vercel; automatic Vercel World inside Vercel deployments
+- Selects a non-default World module.
+
+Outside Vercel, Workflow defaults to the Local World. On Vercel, leave `WORKFLOW_TARGET_WORLD` unset for the normal case; Workflow detects the Vercel deployment and selects the Vercel World automatically.
+
+The World is selected when your app **runs**, from the environment of the process serving it, so changing `WORKFLOW_TARGET_WORLD` takes effect on the next start without a rebuild. Detection keys off `VERCEL_DEPLOYMENT_ID`, which Vercel sets in every deployed function and nothing else sets: with it, the Vercel World; without it, the Local World.
+
+Broader signals are deliberately ignored. `vercel env pull` writes `VERCEL=1` into `.env.local`, so a dev server or a production server started on your own machine sees it while running against a writable filesystem, where the Local World is the right choice. Set `WORKFLOW_TARGET_WORLD=vercel` explicitly if you want such a process to talk to the Vercel World; starting a run then fails with an error naming the missing `VERCEL_DEPLOYMENT_ID`.
+
+A deployment that pins `WORKFLOW_TARGET_WORLD=local` warns at startup and fails on its first write, because a Vercel deployment's filesystem is read-only.
+
+A deployment can land on the Local World without pinning anything, and without that warning, if the project has cleared **Enable access to System Environment Variables** under **Settings**, then **Environment Variables**. That checkbox is what makes Vercel expose `VERCEL_DEPLOYMENT_ID` to your build and your functions; with it off, there is no signal to detect, so detection and the warning both see an ordinary non-Vercel process. See [System environment variables](/worlds/vercel#system-environment-variables) for how to confirm and fix it.
+
+Set `WORKFLOW_TARGET_WORLD` only when you want to use a custom or self-hosted World:
+
+- `local`: Alias for `@workflow/world-local`.
+- `@workflow/world-postgres`: Postgres World package.
+- `./my-world.ts`: Local module exporting a World, `createWorld()`, or a default factory.
+- Any package specifier: Custom World package.
+
+The `vercel` alias exists for manual selection and tooling, but deployed Vercel apps do not need to set it.
+
+Export a configured World from a module when you need factory options instead of pure environment configuration:
+
+```typescript title="my-world.ts" lineNumbers
+import { createWorld } from "@workflow/world-postgres";
+
+export default createWorld({
+  connectionString: process.env.DATABASE_URL!,
+  jobPrefix: "myapp_",
+});
+```
+
+```bash title=".env"
+WORKFLOW_TARGET_WORLD="./my-world.ts"
+```
+
+## Local World
+
+The Local World is the default outside Vercel and is intended for development.
+
+### `dataDir`
+
+- Environment variable: `WORKFLOW_LOCAL_DATA_DIR`
+- Default: `.workflow-data`
+- Directory where runs, steps, events, hooks, streams, and the local manifest are written.
+- Also holds the app's queue key (`queue-auth-key`), which the CLI and web UI read to send deliveries, so point them at the same directory. See [`WORKFLOW_QUEUE_AUTH`](/worlds/local#workflow_queue_auth).
+
+### `baseUrl`
+
+- Environment variable: `WORKFLOW_LOCAL_BASE_URL`
+- Default: inferred from the app port
+- Full base URL used when queue messages call back into the app.
+- Overrides `port` and `PORT`.
+
+### `port`
+
+- Environment variable: `PORT`
+- Default: auto-detected
+- Local app port used to build the callback URL when `baseUrl` is unset.
+
+### `WORKFLOW_LOCAL_QUEUE_CONCURRENCY`
+
+- Factory option: none
+- Default: `1000`
+- Maximum number of concurrent local queue message handlers.
+
+### `WORKFLOW_LOCAL_QUEUE_MAX_VISIBILITY`
+
+- Factory option: none
+- Default: unlimited
+- Maximum seconds a local queue message stays hidden before the handler rechecks the run.
+
+### `WORKFLOW_LOCAL_HEADERS_TIMEOUT_MS`
+
+- Factory option: none
+- Default: `0` (no deadline)
+- Maximum milliseconds to wait for a local queue handler to begin responding before the durable message is redelivered. A value below your longest inline step re-executes that step while it is still running.
+
+### `WORKFLOW_LOCAL_BODY_TIMEOUT_MS`
+
+- Factory option: none
+- Default: `0` (no deadline)
+- Maximum gap in milliseconds between response body chunks from a local queue handler before the durable message is redelivered.
+
+### `recoverActiveRuns`
+
+- Environment variable: `WORKFLOW_LOCAL_RECOVER_ACTIVE_RUNS`
+- Default: `true`
+- Re-enqueues pending and running local runs when the World starts. Set the environment variable to `0` or `false` to skip recovery; the factory option wins when both are set.
+
+### `WORKFLOW_LOCAL_SQLITE_KEEP_CONNECTIONS`
+
+- Factory option: none
+- Default: `1`, except on Windows, where it is `brief`
+- How long a process keeps its connection to the Local World's SQLite database (`world.db`) open between operations.
+- `1` keeps the connection until it has been idle for a few seconds. `brief` closes it once a burst of operations ends, so the data directory stays removable while the app runs. `0` opens and closes a connection for every operation, which is slower. Any other value uses the default.
+
+### `WORKFLOW_LOCAL_HOOK_RETENTION_LIMIT_DAYS`
+
+- Factory option: none
+- Default: `30`
+- Maximum [`experimental_minRetention`](/docs/api-reference/workflow/create-hook#keep-a-token-unavailable-after-the-run-ends) accepted by the Local World, in days.
+- Set this to the same limit as your production World so oversized values fail during local development.
+
+### `tag`
+
+- Environment variable: none
+- Default: unset
+- Scopes local storage files to a tag, mainly for test isolation.
+
+### `streamFlushIntervalMs`
+
+- Environment variable fallback: `WORKFLOW_STREAM_FLUSH_INTERVAL_MS`
+- Default: `0` (dispatch the leading chunk of an idle stream immediately)
+- Group-commit window for the leading chunk of an idle stream; a positive value trades first-chunk latency for larger groups. The `WORKFLOW_STREAM_FLUSH_INTERVAL_MS` environment variable, when set, overrides this option; otherwise the World option governs, including the first chunk.
+
+### `WORKFLOW_MAX_EVENTS`
+
+- Default: `25000`
+- Per-run event ceiling reported to the runtime. A run whose event log reaches it fails with `MAX_EVENTS_EXCEEDED`, bounding a runaway loop. See [`WORKFLOW_MAX_EVENTS_OVERRIDE`](/docs/configuration/runtime-tuning#workflow_max_events_override) for the runtime-side clamp.
+- Runs started on the QuickJS engine with snapshotting enabled are exempt, matching the Vercel World. See [max-events-exceeded](/docs/errors/max-events-exceeded).
+
+## Postgres World
+
+The Postgres World is a self-hosted durable backend for long-running server processes.
+
+### `connectionString`
+
+- Environment variable: `WORKFLOW_POSTGRES_URL`, then `DATABASE_URL`
+- Default: `postgres://world:world@localhost:5432/world`
+- PostgreSQL connection string used by the runtime World.
+- The `bootstrap` migration command uses the same precedence.
+
+### `pool`
+
+- Environment variable: none
+- Default: new `pg.Pool`
+- Existing `pg.Pool` to use instead of constructing one from `connectionString`.
+- The World attaches no `'error'` listeners to a pool you pass. Listen on the pool and on each client it connects, or a connection the server ends will end the process. See [passing a `pg.Pool`](/worlds/postgres#programmatic-configuration).
+
+### `jobPrefix`
+
+- Environment variable: `WORKFLOW_POSTGRES_JOB_PREFIX`
+- Default: `workflow_`
+- Prefix for Graphile Worker job names.
+- Use a distinct prefix for each application that shares a database. `start()` re-enqueues only the active runs created under this prefix, plus runs created by earlier versions, which have no prefix. See [`WORKFLOW_POSTGRES_JOB_PREFIX`](/worlds/postgres#workflow_postgres_job_prefix).
+
+### `queueConcurrency`
+
+- Environment variable: `WORKFLOW_POSTGRES_WORKER_CONCURRENCY`
+- Default: `50`
+- Number of concurrent workers polling for jobs.
+- Also bounds concurrent `returnValue` polls that run inside steps. A parent workflow awaiting a child it started suspends on a system hook instead and holds no worker (see [Child Workflows](/cookbook/advanced/child-workflows#how-the-parent-waits)).
+
+### `pollInterval`
+
+- Environment variable: `WORKFLOW_POSTGRES_POLL_INTERVAL_MS`
+- Default: `500`
+- Milliseconds between idle job fetches per worker.
+
+### `applicationManagedShutdown`
+
+- Environment variable: `WORKFLOW_POSTGRES_APPLICATION_MANAGED_SHUTDOWN` (`1` enables)
+- Default: `false`
+- Whether the application coordinates shutdown instead of Graphile Worker responding automatically.
+- Set to `true` only when the application awaits `world.close()` before closing its workflow HTTP server and caller-owned pool.
+- Prevents Graphile Worker's default handler from terminating the process before the application's remaining cleanup finishes.
+
+### `jobLockStaleSeconds`
+
+- Environment variable: `WORKFLOW_POSTGRES_JOB_LOCK_STALE_SECONDS`
+- Default: unset. Every delivery renews its job lock, and jobs keep Graphile Worker's fixed 4 hour reset.
+- Seconds a running delivery's job lock may go unrenewed before another process releases any of this World's jobs for redelivery, whoever holds it.
+- `30` is a good value when more than one process shares the database. Use the same value on every process, and keep it well above the longest a process can block its event loop.
+- `0` turns renewal and release off, and leaves recovery to Graphile Worker's fixed 4 hour reset and to restarts.
+- Set it only once every process that shares the database runs a version that includes this option. A process on an earlier version neither renews its locks nor fences its acknowledgement on the lock holder, so while it shares the database with a process that has this set, its deliveries that run longer than the window are redelivered, and finishing one can delete the redelivered job. The default is safe for this: it never releases the job of a holder that did not register as renewing. See [Postgres World: `WORKFLOW_POSTGRES_JOB_LOCK_STALE_SECONDS`](/worlds/postgres#workflow_postgres_job_lock_stale_seconds).
+
+### `maxPoolSize`
+
+- Environment variable: `WORKFLOW_POSTGRES_MAX_POOL_SIZE`
+- Default: `pg` default
+- Maximum size of the internal `pg.Pool` when the World creates the pool.
+
+### `enableInvoke`
+
+- Environment variable: `WORKFLOW_POSTGRES_INVOKE` (`1` enables)
+- Default: `false`
+- Experimental. Delivers hook resumes to the run's executor instead of writing the hook event and enqueueing a wake-up. Apply the migrations and upgrade producers and workers together before enabling it. See [experimental invocation delivery](/worlds/postgres#experimental-invocation-delivery).
+
+### `WORKFLOW_POSTGRES_HEADERS_TIMEOUT_MS`
+
+- Factory option: none
+- Default: `0` (no deadline)
+- Maximum time a queue delivery waits for the workflow handler to begin responding before it is failed and redelivered.
+- A delivery runs the workflow inline, so a deadline shorter than your longest inline step redelivers a healthy delivery and runs its steps twice. See [`WORKFLOW_POSTGRES_HEADERS_TIMEOUT_MS`](/worlds/postgres#workflow_postgres_headers_timeout_ms).
+
+### `WORKFLOW_POSTGRES_BODY_TIMEOUT_MS`
+
+- Factory option: none
+- Default: `0` (no deadline)
+- Maximum gap between response body chunks from the workflow handler before the delivery is failed and redelivered. The same caution as `WORKFLOW_POSTGRES_HEADERS_TIMEOUT_MS` applies.
+
+### `WORKFLOW_POSTGRES_HOOK_RETENTION_LIMIT_DAYS`
+
+- Factory option: none
+- Default: `30`
+- Maximum [`experimental_minRetention`](/docs/api-reference/workflow/create-hook#keep-a-token-unavailable-after-the-run-ends) accepted by the Postgres World, in days.
+- Set this to the same limit as your production World so oversized values fail during development.
+
+### `namespace`
+
+- Environment variable fallback: `WORKFLOW_QUEUE_NAMESPACE`
+- Default: none
+- Queue topic namespace. For example, `custom` changes `__wkf_*` topics to `__custom_wkf_*`.
+
+### `streamFlushIntervalMs`
+
+- Environment variable fallback: `WORKFLOW_STREAM_FLUSH_INTERVAL_MS`
+- Default: `0` (dispatch the leading chunk of an idle stream immediately)
+- Group-commit window for the leading chunk of an idle stream; a positive value trades first-chunk latency for larger groups. The `WORKFLOW_STREAM_FLUSH_INTERVAL_MS` environment variable, when set, overrides this option; otherwise the World option governs, including the first chunk.
+
+## Vercel World
+
+The Vercel World is configured automatically inside Vercel deployments. The platform provides the deployment ID, project ID, request authentication, queue integration, storage, and encryption material.
+
+Most applications should not set `WORKFLOW_VERCEL_*` variables on Vercel. They configure tooling that talks to a Vercel Workflow project from outside a deployment, such as the Workflow CLI, the web user interface (UI), continuous integration (CI), or tests. The runtime warns if these variables are set in a deployed Vercel Function because they do not control runtime configuration there.
+
+The entries below are the individual knobs. For a walkthrough of authenticating a local script or a CI job with a Vercel auth token — which variables are needed together, and how to pass them to the World factory — see [Connecting from outside a deployment](/worlds/vercel#connecting-from-outside-a-deployment).
+
+Platform-provided values such as `VERCEL_DEPLOYMENT_ID`, `VERCEL_PROJECT_ID`, and `VERCEL_DEPLOYMENT_KEY` are read by the runtime inside Vercel deployments. Do not set them yourself; keep [system environment variables](/worlds/vercel#system-environment-variables) enabled for the project so that Vercel provides them.
+
+### `token`
+
+- Environment variable: `WORKFLOW_VERCEL_AUTH_TOKEN` (the `workflow` CLI falls back to your Vercel CLI login)
+- CLI flag: `--authToken` or `-a`
+- Default: inferred when possible
+- Vercel API token for external tooling. Keep it secret.
+- Only meaningful alongside `projectConfig.projectId` and `projectConfig.teamId` — set all three together. Supplying both IDs but no token throws rather than failing later with a `401`.
+
+### `projectConfig.environment`
+
+- Environment variable: `WORKFLOW_VERCEL_ENV`
+- CLI flag: `--env` or `-e`
+- Default: `production`
+- Vercel environment targeted by tooling. Accepts `production`, `preview`, or a custom environment's **slug** — configure the slug, not the environment's ID.
+- The CLI accepts only `production` or `preview`; see [Environment variables](/worlds/vercel#environment-variables) for what other values do.
+
+### `projectConfig.projectId`
+
+- Environment variable: `WORKFLOW_VERCEL_PROJECT`
+- CLI flag: `--project`
+- Default: inferred from `.vercel/project.json` when possible
+- Vercel project ID.
+
+### `projectConfig.teamId`
+
+- Environment variable: `WORKFLOW_VERCEL_TEAM`
+- CLI flag: `--team`
+- Default: inferred from `.vercel/project.json` when possible
+- Vercel team ID.
+
+### `WORKFLOW_VERCEL_PROJECT_NAME`
+
+- Factory option: `projectConfig.projectName`
+- CLI flag: none
+- Default: inferred when possible
+- Project slug used for dashboard links.
+
+### `WORKFLOW_VERCEL_BACKEND_URL`
+
+- Factory option: none
+- CLI flag: none
+- Default: `https://api.vercel.com/v1/workflow`
+- Workflow API proxy URL for external tooling.
+- The Vercel World doesn't follow HTTP redirects, so the URL must answer directly. A `3xx` response fails the request.
+
+### `VERCEL_WORKFLOW_SERVER_URL`
+
+- Factory option: none
+- CLI flag: none
+- Default: unset
+- Direct Vercel World backend URL override for testing or custom infrastructure. Normal deployments do not need it.
+
+### `VERCEL_QUEUE_MAX_DELAY_SECONDS`
+
+- Factory option: none
+- CLI flag: none
+- Default: `82800` (23 hours)
+- Maximum delay for one Vercel Queues continuation message when implementing `sleep()`.
+- Longer sleeps schedule another continuation when the first one fires.
+
+`VERCEL_QUEUE_MAX_DELAY_SECONDS` defaults to 23 hours because Vercel Queues message delays are capped by the message TTL, and the default TTL is 24 hours. Workflow stays inside that default and chains continuation messages for longer sleeps.
+
+### `WORKFLOW_REQUEST_TIMEOUT_MS`
+
+- Factory option: none
+- CLI flag: none
+- Default: `60000`
+- Clamp: `10000` to `120000` (values outside are clamped, with a warning)
+- Per-request timeout for Vercel World HTTP calls to its backend.
+- At the `10000` floor the run-status long poll disables itself, because its budget is this value minus 10s of headroom.
+
+### `WORKFLOW_STREAMS_TRANSPORT`
+
+- Factory option: none
+- CLI flag: none
+- Default: `ws`
+- Stream writes upgrade to a WebSocket (`workflow-stream-ws/v1`). Set to `http` (case-insensitive, surrounding whitespace ignored) to opt out; any other value, including unset, empty, or `ws`, uses the WebSocket. Stream reads always use HTTP.
+- A writer's first two write groups go over HTTP, and the socket opens in the background after that, so no write waits for the upgrade. The server accepts or declines each upgrade; a declined or failed upgrade leaves that writer on HTTP for its lifetime.
+- Ignored when the World is configured with `projectConfig` and routes through the `api-workflow` proxy, which does not forward a WebSocket upgrade, so stream writes stay on HTTP.
+- The server pings idle sockets to keep them open, and the client must answer. The `ws` library the Vercel World uses does so automatically.
+- Each WebSocket message is at most `WORKFLOW_WS_MAX_MESSAGE_BYTES`. Larger write groups are sent as several ordered requests, and a single chunk too large for one message is written over HTTP.
+- A throttled (429) socket write or close is retried after the server's `Retry-After`, as over HTTP. It moves to HTTP if the connection ends during the wait or the cumulative wait passes 30 seconds.
+
+### `WORKFLOW_EVENTS_TRANSPORT`
+
+- Factory option: none
+- CLI flag: none
+- Default: `ws`
+- Ships workflow run events to the Vercel World over a WebSocket instead of one HTTP request each. Set to `http` (case-insensitive, surrounding whitespace ignored) to opt out; any other value, including unset or empty, uses the WebSocket.
+- Ignored when the World is configured with `projectConfig` and routes through the `api-workflow` proxy: that endpoint is an HTTP-only REST gateway and does not forward a WebSocket upgrade, so events stay on HTTP.
+
+### `WORKFLOW_EVENTS_TRANSPORT_WS_OVERRIDE_WORKFLOWS`
+
+- Factory option: none
+- CLI flag: none
+- Default: none
+- Comma-separated workflows whose runs use the WebSocket events transport even when `WORKFLOW_EVENTS_TRANSPORT` is `http`. Each entry is a function name (`processOrder`) or a full workflow name (`workflow//./src/workflows/order//processOrder`), matched exactly and case-sensitively.
+- Has no effect unless `WORKFLOW_EVENTS_TRANSPORT=http`, since every workflow already uses the WebSocket by default.
+- See [`WORKFLOW_EVENTS_TRANSPORT_WS_OVERRIDE_WORKFLOWS`](/worlds/vercel#workflow_events_transport_ws_override_workflows) for details.
+
+### `WORKFLOW_WS_MAX_MESSAGE_BYTES`
+
+- Factory option: none
+- CLI flag: none
+- Default: `12582912` (12 MiB)
+- Clamp: `2097152` to `16777216` (values outside are clamped, with a warning)
+- Largest WebSocket message the Vercel World sends, header included, for both the events and stream-write transports. The ceiling is the 16 MiB WebSocket message limit.
+- Events: a larger frame is sent as several messages and rebuilt on the other side.
+- Stream writes: a larger write group is split into several ordered write requests; a single chunk too large for one message is written over HTTP, as are the rest of that writer's writes.
+
+### `WORKFLOW_H2_MULTIPLEX`
+
+- Factory option: none
+- CLI flag: none
+- Default: enabled
+- On the Vercel World, lets concurrent event-log requests share one HTTP/2 connection instead of one connection per in-flight request.
+- Set `0` to take the event-log requests off HTTP/2 entirely, back to one request per HTTP/1.1 connection. Use this as the kill switch if HTTP/2 turns out to be at fault for event delivery problems.
+- Only `0` turns it off; other values, including `false`, are ignored.
+- Has no effect when [`WORKFLOW_NODE_HTTP`](/docs/configuration/runtime-tuning#workflow_node_http) is enabled (which takes the whole HTTP/2 path away) or when a custom `dispatcher` is passed to `createWorld()` (its own settings apply).
+
+### `WORKFLOW_VERCEL_QUEUE_TIMEOUT_MS`
+
+- Factory option: none
+- CLI flag: none
+- Default: `30000`
+- Total deadline for one request the Vercel World's queue client makes, measured from the moment it is handed to the transport, so it also covers time the request spends waiting for a free connection.
+- Clamped to `[5000, 120000]`.
+- This is the only request path the World cannot bound with `WORKFLOW_REQUEST_TIMEOUT_MS`, because the queue client makes its own calls and accepts no override for them. Without a deadline here, a queue acknowledgement that never completes holds the invocation until the platform kills it, and a killed invocation never acknowledges, so the message is redelivered.
+- Keep it below the queue's visibility-renewal interval (60 seconds) so a failed call has room to surface and be retried before the message lease lapses.
+- Has no effect when [`WORKFLOW_NODE_HTTP`](/docs/configuration/runtime-tuning#workflow_node_http) is enabled (only undici's default 300-second timeouts apply) or when a custom `dispatcher` is passed to `createWorld()` (its own limits apply).
+
+### `WORKFLOW_VERCEL_QUEUE_CONNECTIONS`
+
+- Factory option: none
+- CLI flag: none
+- Default: `64`
+- Connections the Vercel World's queue client may open to the queue service.
+- Clamped to `[1, 1024]`.
+- Sized much higher than the World's other connection pools on purpose. The queue client makes roughly two small requests per invocation, so its concurrency tracks how many invocations a compute instance is serving at once rather than any per-request fan-out. Lower it only if you have a reason to cap sockets; too low turns invocation concurrency into the limit on how fast messages can be acknowledged.
+- Has no effect when [`WORKFLOW_NODE_HTTP`](/docs/configuration/runtime-tuning#workflow_node_http) is enabled (only undici's default 300-second timeouts apply) or when a custom `dispatcher` is passed to `createWorld()` (its own limits apply).

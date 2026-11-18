@@ -1,0 +1,122 @@
+import { hydrateWorkflowReturnValue } from '@workflow/core/serialization';
+import { expect, test, vi } from 'vitest';
+import type { Hook } from '../workflows/hooks.ts';
+import { jsonlines } from './jsonlines.mjs';
+import { createFetcher, startServer } from './util.mjs';
+
+export function hooks(world: string) {
+  test.each(['completed', 'failed'] as const)(
+    'releases non-retained hook tokens when a run is %s',
+    { timeout: 60_000 },
+    async (status) => {
+      const server = await startServer({ world }).then(createFetcher);
+      const token = `terminal-${status}-${Date.now().toString(36)}`;
+      for (const expected of [status, 'completed']) {
+        const { runId } = await server.invoke(
+          'workflows/hooks.ts',
+          'registerUntilTerminal',
+          [token, expected === 'failed']
+        );
+        await vi.waitFor(
+          async () => {
+            expect((await server.getRun(runId)).status).toBe(expected);
+          },
+          { interval: 200, timeout: 25_000 }
+        );
+        const events = await server.getEvents(runId);
+        expect(
+          events.filter((event) => event.eventType === 'hook_created')
+        ).toHaveLength(1);
+        expect(
+          events.filter((event) => event.eventType === 'hook_disposed')
+        ).toHaveLength(0);
+      }
+    }
+  );
+
+  test('hooks', { timeout: 60_000 }, async () => {
+    const server = await startServer({ world }).then(createFetcher);
+    const token = Date.now().toString(36);
+    const customData = `my-custom-data-${token}`;
+    const result = await server.invoke(
+      'workflows/hooks.ts',
+      'collectWithHook',
+      [token, customData]
+    );
+    expect(result.runId).toMatch(/^wrun_.+/);
+    const readable = await server.getReadable(result.runId);
+    const events = jsonlines(readable);
+    const hookCreated = Promise.withResolvers<void>();
+    const hookResumedEvents = [] as unknown[];
+
+    (async () => {
+      for await (const obj of events) {
+        if (obj?.event === 'hookCreated') {
+          hookCreated.resolve();
+          continue;
+        }
+
+        if (obj?.event === 'hookResumed') {
+          hookResumedEvents.push(obj.payload);
+          continue;
+        }
+
+        console.log('unhandled event', obj);
+      }
+    })().catch(() => {
+      // ignore errors for reading stream
+    });
+
+    await hookCreated.promise;
+
+    (async () => {
+      await server.resumeHook<typeof Hook>(token, {
+        data: 'first payload',
+      });
+      await server.resumeHook<typeof Hook>(token, {
+        data: 'second payload',
+      });
+      await server.resumeHook<typeof Hook>(token, {
+        data: 'third payload',
+        done: true,
+      });
+    })();
+
+    const run = await vi.waitFor(
+      async () => {
+        const run = await server.getRun(result.runId);
+        expect(run).toMatchObject<Partial<typeof run>>({
+          status: 'completed',
+        });
+        return run;
+      },
+      {
+        interval: 200,
+        timeout: 59_000,
+      }
+    );
+
+    const output = await hydrateWorkflowReturnValue(
+      run.output!,
+      run.runId,
+      undefined
+    );
+    expect(output).toEqual({
+      collected: [
+        {
+          data: 'first payload',
+          metadata: { customData },
+        },
+        {
+          data: 'second payload',
+          metadata: { customData },
+        },
+        {
+          data: 'third payload',
+          metadata: { customData },
+          done: true,
+        },
+      ],
+    });
+  });
+}

@@ -4,17 +4,32 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "outputs": ["dist/**"]
+      "env": ["WORKFLOW_PUBLIC_MANIFEST"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/packages/tsconfig/base.json",
+        "$TURBO_ROOT$/pnpm-workspace.yaml",
+        "$TURBO_ROOT$/.node-version"
+      ],
+      "outputs": [
+        "dist/**",
+        "build",
+        ".svelte-kit",
+        ".vercel/output",
+        ".output/**"
+      ]
     },
     "dev": {
       "dependsOn": ["^build"],
-      "outputs": ["dist/**"]
+      "cache": false
     },
     "typecheck": {
-      "dependsOn": ["^build"]
+      "dependsOn": ["^build"],
+      "cache": false
     },
     "test": {
-      "dependsOn": ["^build"]
+      "dependsOn": ["^build"],
+      "cache": false
     },
     "clean": {
       "cache": false

@@ -1,0 +1,159 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "!*"
+  pull_request:
+
+concurrency:
+  # Unique group for this workflow and branch
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  biome:
+    name: Biome
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        with:
+          install: true
+          require-lockfile: true
+          runtime: node@24
+          cache: true
+
+      - name: Biome check
+        run: pnpm exec biome ci --max-diagnostics=200
+
+  no-test-overrides:
+    name: No Test Overrides
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check WORKFLOW_SERVER_URL_OVERRIDE is empty
+        run: |
+          # Ensure the test override constant is not accidentally set
+          FILE="packages/world-vercel/src/utils.ts"
+          if grep -q "const WORKFLOW_SERVER_URL_OVERRIDE = '';" "$FILE"; then
+            echo "✓ WORKFLOW_SERVER_URL_OVERRIDE is empty (safe to merge)"
+          else
+            echo "✗ ERROR: WORKFLOW_SERVER_URL_OVERRIDE is set to a non-empty value!"
+            echo "  This constant must be empty string before merging to main."
+            echo ""
+            echo "  Current value:"
+            grep "const WORKFLOW_SERVER_URL_OVERRIDE" "$FILE" || true
+            exit 1
+          fi
+
+  no-unrun-tests:
+    name: No Unrun Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js 24.x
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+
+      # `turbo test` only runs a package's tests if that package declares a
+      # `test` script, so a suite can exist for months without ever running.
+      # See #3731.
+      - name: Check every test file is run by turbo test or a CI lane
+        run: node scripts/check-no-unrun-tests.mjs
+
+      # Compiled tests and declaration maps that point at an unpublished
+      # `src/` add weight to every install and are read by no consumer.
+      - name: Check publishable packages exclude tests and orphaned maps
+        run: node scripts/check-published-files.mjs
+
+  scripts-tests:
+    name: CI Scripts Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js 24.x
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+
+      # Suites under `scripts/` are named file by file: the rest of that
+      # directory is vitest files, which `node --test` cannot import.
+      - name: Run CI script unit tests
+        run: node --test ".github/scripts/**/*.test.js" ".github/actions/**/*.test.js" "scripts/trusted-sources-headers.test.mjs"
+
+  changesets:
+    name: Changesets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        with:
+          install: true
+          require-lockfile: true
+          runtime: node@24
+          cache: true
+
+      # `changeset version` (release.yml) assembles a release plan from every
+      # pending changeset before it bumps anything. A changeset it cannot
+      # place in that plan, such as one that mixes an `ignore`d private
+      # package with published ones, fails the Release job on main and blocks
+      # publishing until it is fixed (#3963). Run the same assembly here.
+      - name: Check pending changesets assemble into a release plan
+        run: node scripts/check-changesets.mjs
+
+      # The Release job's trusted publishing cannot create a package on npm,
+      # so a public package that has never been published fails the release
+      # and holds back the packages after it (see scripts/check-published.mjs).
+      - name: Check every public package already exists on npm
+        run: node scripts/check-published.mjs --packages-exist
+
+      # release.yml refuses to publish while any public package's version is
+      # outside the branch's release major (0.x experimental packages aside),
+      # and a package that lands with another major blocks every release on
+      # main until it is fixed. Run the same guard here, with the release
+      # major read from release.yml so the two cannot disagree.
+      - name: Check package versions match the release major
+        run: |
+          RELEASE_VERSION=$(sed -n 's/^ *RELEASE_VERSION: *\([0-9][0-9]*\) *$/\1/p' .github/workflows/release.yml)
+          node .github/scripts/check-release-major.js "${RELEASE_VERSION:?RELEASE_VERSION not found in release.yml}"
+
+  docs-links:
+    name: Docs Links
+    runs-on: ubuntu-latest
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+        with:
+          install: true
+          require-lockfile: true
+          runtime: node@24
+          cache: true
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Validate docs links
+        run: bun ./scripts/lint.ts
+        working-directory: docs

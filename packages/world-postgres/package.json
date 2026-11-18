@@ -1,16 +1,24 @@
 {
   "name": "@workflow/world-postgres",
-  "version": "4.0.1-beta.3",
+  "version": "5.3.0",
   "description": "A reference World implementation based on PostgreSQL",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "bootstrap": "./bin/setup.js",
+    "workflow-postgres-setup": "./bin/setup-deprecated.js"
+  },
   "files": [
-    "dist"
+    "dist",
+    "bin",
+    "src/drizzle/migrations",
+    "!dist/**/*.test.*",
+    "!dist/**/*.d.ts.map"
   ],
   "publishConfig": {
     "access": "public"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/vercel/workflow.git",
@@ -20,37 +28,52 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./schema": {
+      "types": "./dist/drizzle/schema.d.ts",
+      "default": "./dist/drizzle/schema.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    },
+    "./migrations/*.sql": "./src/drizzle/migrations/*.sql"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && chmod +x bin/setup.js bin/setup-deprecated.js",
     "dev": "tsc --watch",
     "clean": "tsc --build --clean && rm -rf dist",
-    "test": "vitest run",
+    "test": "vitest run --config=../../vitest.config.ts",
     "typecheck": "tsc --noEmit",
-    "db:push": "pnpm exec drizzle-kit --version && drizzle-kit push"
+    "db:push": "node dist/cli.js"
   },
   "dependencies": {
-    "@vercel/queue": "0.0.0-alpha.23",
     "@workflow/errors": "workspace:*",
+    "@workflow/utils": "workspace:*",
     "@workflow/world": "workspace:*",
     "@workflow/world-local": "workspace:*",
-    "drizzle-orm": "^0.31.2",
-    "pg-boss": "^11.0.7",
-    "postgres": "^3.4.7",
-    "ulid": "^3.0.1",
+    "cbor-x": "1.6.9",
+    "dotenv": "17.4.2",
+    "drizzle-orm": "0.45.4",
+    "graphile-worker": "0.16.6",
+    "pg": "8.23.1",
+    "ulid": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {
-    "@testcontainers/postgresql": "^11.7.1",
+    "@testcontainers/postgresql": "11.14.0",
     "@types/node": "catalog:",
+    "@types/pg": "8.23.1",
+    "@vercel/queue": "catalog:",
     "@workflow/errors": "workspace:*",
     "@workflow/tsconfig": "workspace:*",
     "@workflow/world-testing": "workspace:*",
-    "drizzle-kit": "^0.22.7",
+    "drizzle-kit": "0.31.11",
+    "typescript": "catalog:",
+    "undici": "catalog:",
     "vitest": "catalog:"
   },
   "keywords": [],
   "author": "",
-  "packageManager": "pnpm@10.15.1"
+  "packageManager": "pnpm@11.28.11"
 }

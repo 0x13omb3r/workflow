@@ -1,0 +1,71 @@
+// Workflow Attributes started as the MVP described in `./attributes-mvp.md`,
+// which records its design, trade-offs and implementation decisions.
+import { FatalError } from '@workflow/errors';
+import { normalizeAttributeChanges } from './attribute-changes.js';
+import { getWorldLazy } from './runtime/get-world-lazy.js';
+import { specVersionForRunWrite } from './runtime/run-spec-version.js';
+import { contextStorage } from './step/context-storage.js';
+import type { SetAttributesOptions } from './workflow/set-attributes.js';
+
+export type { SetAttributesOptions };
+
+/**
+ * Host-side implementation for `setAttributes`. Workflow bodies resolve
+ * to `./workflow/set-attributes.ts` via the `workflow` package-exports
+ * condition; step bodies resolve here and can perform the world write
+ * directly because they already run in host context.
+ *
+ * Plain application code still has no active workflow run, so it throws
+ * a clear `FatalError`.
+ */
+export async function setAttributes(
+  attrs: Record<string, string | undefined>,
+  options: SetAttributesOptions = {}
+): Promise<void> {
+  const store = contextStorage.getStore();
+  const runId = store?.workflowMetadata?.workflowRunId;
+  if (!runId) {
+    throw new FatalError(
+      "setAttributes() must be called from a 'use workflow' or 'use step' function. " +
+        'Calling it from plain host code is not supported.'
+    );
+  }
+
+  const writer = {
+    type: 'step' as const,
+    stepId: store.stepMetadata.stepId,
+    attempt: store.stepMetadata.attempt,
+  };
+  const changes = normalizeAttributeChanges(attrs, options, writer);
+  if (changes.length === 0) return;
+
+  // Turbo optimistic start runs the step body before the backgrounded
+  // `run_started` is durable. Order this `attr_set` after the run exists so it
+  // never reaches the World before the run does (which would be rejected as
+  // run-not-found). A no-op outside turbo (barrier undefined) and on the await
+  // path. A rejection fails this call instead of writing: a refused
+  // `run_started` can mean another orchestrator holds the run, and the
+  // attribute would land on a run whose log never records this step.
+  if (store.runReadyBarrier) await store.runReadyBarrier;
+
+  const world = await getWorldLazy();
+  // Deliberately unguarded, unlike the attr_set a suspension writes: this call
+  // runs inside a step body, which holds no replay snapshot, so there is no
+  // event log to compare against and nothing a precondition could fence. It is
+  // a genuinely out-of-band write from the event log's point of view.
+  await world.events.create(
+    runId,
+    {
+      eventType: 'attr_set',
+      specVersion: specVersionForRunWrite(store.runSpecVersion),
+      eventData: {
+        changes,
+        writer,
+        ...(options.allowReservedAttributes === true
+          ? { allowReservedAttributes: true }
+          : {}),
+      },
+    },
+    { inBand: false }
+  );
+}

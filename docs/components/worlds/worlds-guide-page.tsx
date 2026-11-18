@@ -1,0 +1,142 @@
+import type { TableOfContents } from 'fumadocs-core/toc';
+import { createRelativeLink } from 'fumadocs-ui/mdx';
+import type { Metadata } from 'next';
+import { notFound } from 'next/navigation';
+import type { ComponentProps, ComponentType, ReactNode } from 'react';
+import { getMDXComponents } from '@/components/geistdocs/mdx-components';
+import { v4WorldsSource, worldsSource } from '@/lib/geistdocs/source';
+import { rewriteHrefForVersion } from '@/lib/geistdocs/version-href';
+import type { DocsVersionId } from '@/lib/geistdocs/versions';
+import { WorldDetailToc } from './WorldDetailToc';
+import { WorldVersionSelect } from './WorldVersionSelect';
+
+const VERSION_SOURCES = {
+  v5: worldsSource,
+  v4: v4WorldsSource,
+} as const;
+
+const VERSION_PREFIXES = {
+  v5: '',
+  v4: '/v4',
+} as const;
+
+export async function generateWorldsGuideMetadata(
+  slug: string,
+  version: DocsVersionId
+): Promise<Metadata> {
+  const page = VERSION_SOURCES[version].getPage([slug]);
+
+  if (!page) {
+    return { title: 'Worlds | Workflow SDK' };
+  }
+
+  const versionPrefix = VERSION_PREFIXES[version];
+  const isMaintenance = version === 'v4';
+
+  return {
+    title: `${page.data.title}${isMaintenance ? ' · v4' : ''} | Workflow SDK`,
+    description: page.data.description,
+    openGraph: {
+      images: ['/og/worlds'],
+    },
+    alternates: {
+      canonical: `/worlds/${slug}`,
+      types: {
+        'text/markdown': `${versionPrefix}/worlds/${slug}.md`,
+      },
+    },
+    ...(isMaintenance
+      ? {
+          robots: {
+            index: false,
+            follow: true,
+          },
+        }
+      : {}),
+  };
+}
+
+export async function WorldsGuidePage({
+  slug,
+  version,
+}: {
+  slug: string;
+  version: DocsVersionId;
+}) {
+  const source = VERSION_SOURCES[version];
+  const versionPrefix = VERSION_PREFIXES[version];
+  const page = source.getPage([slug]);
+
+  if (!page) {
+    notFound();
+  }
+
+  const pageData = page.data as typeof page.data & {
+    body: ComponentType<{ components?: Record<string, unknown> }>;
+    toc: TableOfContents;
+  };
+  const MDX = pageData.body;
+
+  const tocItems: { id: string; title: ReactNode }[] = pageData.toc
+    .filter((item) => item.depth === 2)
+    .map((item) => ({
+      id: item.url.slice(1), // Remove leading #
+      title: item.title,
+    }));
+
+  // Content links are authored against the raw /docs/... and /worlds/... URL
+  // spaces; on the maintenance route they are rewritten into the /v4 view.
+  const RelativeLink = createRelativeLink(
+    source as unknown as Parameters<typeof createRelativeLink>[0],
+    page
+  );
+  const VersionedLink = (props: ComponentProps<'a'>) => (
+    <RelativeLink
+      {...props}
+      href={rewriteHrefForVersion(props.href, versionPrefix)}
+    />
+  );
+
+  return (
+    <div className="[&_h1]:tracking-tighter [&_h2]:tracking-tighter [&_h3]:tracking-tighter">
+      <div className="mx-auto w-full max-w-[1080px] px-4">
+        {/* Header */}
+        <div className="mt-[var(--fd-nav-height)] pt-10 sm:pt-16">
+          <div className="flex flex-col gap-6 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h1 className="text-heading-40 sm:text-heading-48">
+                {page.data.title}
+              </h1>
+              <p className="mt-4 max-w-2xl text-gray-900 sm:text-lg">
+                {page.data.description}
+              </p>
+            </div>
+            <div className="w-full sm:w-56 shrink-0">
+              <WorldVersionSelect current={version} />
+            </div>
+          </div>
+        </div>
+
+        {/* Content + TOC Grid */}
+        <div className="relative grid grid-cols-1 lg:grid-cols-[1fr_200px] gap-8 lg:gap-12">
+          <main className="min-w-0">
+            <div className="py-8 sm:py-12 prose prose-neutral dark:prose-invert max-w-none">
+              <MDX
+                components={getMDXComponents({
+                  a: VersionedLink,
+                })}
+              />
+            </div>
+          </main>
+
+          {/* TOC Sidebar - sticky on desktop, hidden on mobile */}
+          <aside className="hidden lg:block pt-8 sm:pt-12">
+            <div className="sticky top-24">
+              <WorldDetailToc items={tocItems} />
+            </div>
+          </aside>
+        </div>
+      </div>
+    </div>
+  );
+}

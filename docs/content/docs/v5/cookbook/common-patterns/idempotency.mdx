@@ -1,0 +1,94 @@
+---
+title: Idempotency
+description: Make step retries safe and coordinate duplicate workflow starts with hook tokens.
+type: guide
+summary: Use step IDs for retry-safe external calls, and use deterministic hook tokens when duplicate requests must route to one active workflow.
+---
+
+<CopyPrompt
+  text="Make this workflow's side effects idempotent. For retry-safe external calls, read the deterministic step ID inside the &quot;use step&quot; function with `getStepMetadata()` from `workflow` and pass `stepId` as the idempotency key to the external API (for example Stripe's `Idempotency-Key` header) so step retries deduplicate. For duplicate workflow starts, derive a deterministic hook token from the domain key (for example `order:${orderId}`): in the API route, look up the active hook with `getHookByToken(token)` from `workflow/api` (catching `HookNotFoundError` from `workflow/errors`) and reuse its `runId`, otherwise call `start(...)`; inside the workflow, create the hook with the same token and check `await hook.getConflict()` before duplicate-sensitive work. Verify retried steps deduplicate, duplicate starts reuse the active run, and conflicts are handled."
+/>
+
+Use idempotency when a retry or duplicate request should not repeat the underlying work. In Workflow, there are two common patterns: use the step ID for retry-safe external calls, and use hook tokens to coordinate duplicate workflow starts.
+
+## When to use this
+
+- A step charges a payment, sends an email, enqueues work, or creates an external record.
+- A route may receive duplicate requests that should map to one active workflow run.
+
+## Step idempotency
+
+Every step has a unique, deterministic `stepId` available via `getStepMetadata()`. Pass this as the idempotency key to external APIs:
+
+```typescript
+import { getStepMetadata } from "workflow";
+
+export async function createCharge(
+  customerId: string,
+  amount: number
+): Promise<{ id: string }> {
+  "use step";
+
+  const { stepId } = getStepMetadata(); // [!code highlight]
+
+  // Stripe uses the idempotency key to deduplicate requests.
+  // If this step is retried, Stripe returns the same charge.
+  const charge = await fetch("https://api.stripe.com/v1/charges", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
+      "Idempotency-Key": stepId, // [!code highlight]
+    },
+    body: new URLSearchParams({
+      amount: String(amount),
+      currency: "usd",
+      customer: customerId,
+    }),
+  });
+
+  if (!charge.ok) {
+    const error = await charge.json();
+    throw new Error(`Charge failed: ${error.message}`);
+  }
+
+  return charge.json();
+}
+```
+
+See [Step Idempotency](/docs/foundations/idempotency#step-idempotency) for why `stepId` is stable across retries and how to think about external API conflicts.
+
+## Run idempotency
+
+For duplicate workflow-start requests, derive a hook token from your domain key and pass it to `start()`. Exactly one run owns the token, and a duplicate start throws `HookConflictError` naming the owner instead of creating a run:
+
+```typescript
+import { start } from "workflow/api";
+import { HookConflictError } from "workflow/errors";
+import { processOrder } from "./workflows/process-order";
+
+export async function POST(request: Request) {
+  const { orderId } = await request.json();
+
+  try {
+    const run = await start(processOrder, [orderId], {
+      experimental_hook: { token: `order:${orderId}` }, // [!code highlight]
+    });
+    return Response.json({ runId: run.runId, reused: false });
+  } catch (error) {
+    if (!HookConflictError.is(error)) throw error;
+    return Response.json({ runId: error.conflictingRunId, reused: true }); // [!code highlight]
+  }
+}
+```
+
+The run's start Hook can be resumed as soon as `start()` returns, so a duplicate request that carries data can `resumeHook()` the owner on a conflict, and the workflow reads it with `createHook({ token })`. See [Run idempotency](/docs/foundations/idempotency#run-idempotency) for the full pattern, retention, and World support, and for coordinating inside the workflow with `hook.getConflict()` on Worlds without atomic start Hooks.
+
+## Key APIs
+
+- [`"use workflow"`](/docs/foundations/workflows-and-steps#workflow-functions): Declares the orchestrator function.
+- [`"use step"`](/docs/foundations/workflows-and-steps#step-functions): Declares step functions with full Node.js access.
+- [`getStepMetadata()`](/docs/api-reference/workflow/get-step-metadata): Provides the deterministic `stepId` for idempotency keys.
+- [`createHook()`](/docs/api-reference/workflow/create-hook): Creates a hook with an optional deterministic token.
+- [`getHookByToken()`](/docs/api-reference/workflow-api/get-hook-by-token): Finds the hook that owns a token.
+- [`resumeHook()`](/docs/api-reference/workflow-api/resume-hook): Resumes the active hook when the duplicate request carries data.
+- [`start()`](/docs/api-reference/workflow-api/start): Starts a new workflow run, at most once per `experimental_hook.token`.

@@ -1,0 +1,283 @@
+---
+title: resumeHook
+description: Resume a paused workflow by sending a payload to a hook token.
+type: reference
+summary: Use resumeHook to send a payload to a hook token and resume a paused workflow.
+prerequisites:
+  - /docs/foundations/hooks
+related:
+  - /docs/api-reference/workflow-api/resume-webhook
+  - /docs/foundations/idempotency
+---
+
+Resumes a workflow run by sending a payload to a hook identified by its token. You can also pass a `Hook` from an earlier `getHookByToken()` or `resumeHook()` call to skip the token lookup. See [Reuse a resolved hook](#reuse-a-resolved-hook).
+
+It durably writes the `hook_received` event and only then publishes a workflow wake. The call resolves only after both operations succeed, in that order.
+
+`resumeHook()` throws `HookNotFoundError` when no hook holds the token or when its `hook_received` write is refused because the hook was disposed or the run ended.
+
+A run started with [`start({ experimental_hook })`](/docs/api-reference/workflow-api/start#prevent-duplicate-starts) has its start Hook from the moment it is admitted, so `resumeHook()` with that token works right away, even before the run starts executing. Payloads sent before the workflow calls `createHook({ token })` are kept and delivered in order once it does. See [Start or route to the owner](/docs/foundations/idempotency#start-or-route-to-the-owner).
+
+Other errors can occur before or after persistence. A lost write response leaves
+the write's outcome unknown; a failed workflow wake can leave an already durable
+event waiting for a later wake. Calling `resumeHook()` again creates a new
+`resumeId` and can append a second `hook_received`. Callers that need at-most-once
+behavior across separate invocations must retain and deduplicate their own request key.
+
+<Callout type="warn">
+`resumeHook` is a runtime function that must be called from outside a workflow function.
+</Callout>
+
+<Callout type="warn">
+`resumeHook()` does not check who is calling it. Authenticate the caller and confirm they may resume this hook before calling it; knowing the token is not enough. The examples below omit that check for brevity. See [Hook and webhook security](/docs/foundations/hooks#security).
+</Callout>
+
+```typescript lineNumbers
+import { resumeHook } from "workflow/api";
+
+export async function POST(request: Request) {
+  const { token, data } = await request.json();
+
+  try {
+    const result = await resumeHook(token, data); // [!code highlight]
+    return Response.json({
+      runId: result.runId
+    });
+  } catch (error) {
+    return new Response("Hook not found", { status: 404 });
+  }
+}
+```
+
+## API signature
+
+### Parameters
+
+<TSDoc
+definition={`
+import { resumeHook } from "workflow/api";
+export default resumeHook;`}
+showSections={["parameters"]}
+/>
+
+### Returns
+
+Returns a `Promise<ResumedHook>`, a `Hook` (from `workflow/api`) extended with an optional `resilientResume` flag. Resolving means the payload is durably recorded as `hook_received` and the workflow wake was accepted. `resilientResume` is retained for source compatibility and is no longer set by any path. Resuming never reads the hook's metadata, so the resolved hook's `metadata` is a Promise that hydrates on first access, exactly as with [`getHookByToken()`](/docs/api-reference/workflow-api/get-hook-by-token): `await hook.metadata` to read it. The resolved hook:
+
+<TSDoc
+definition={`
+import type { Hook } from "workflow/api";
+export default Hook;`}
+showSections={["returns"]}
+/>
+
+## Examples
+
+### Reuse a resolved hook
+
+Pass the `Hook` returned by `getHookByToken()` to `resumeHook()` to skip the
+token lookup on later deliveries. Store the Hook alongside your application's
+session state; JSON and other ordinary serializers are supported.
+
+```typescript
+import { getHookByToken, resumeHook } from 'workflow/api';
+
+// Resolve once; save the returned JSON alongside your server-side session.
+export async function prepareSession(token: string): Promise<string> {
+  const hook = await getHookByToken(token);
+  return JSON.stringify(hook);
+}
+
+// Load that JSON for later deliveries, then save the updated snapshot.
+export async function deliverMessage(storedHook: string, message: unknown): Promise<string> {
+  const hook = await resumeHook(JSON.parse(storedHook), message);
+  return JSON.stringify(hook);
+}
+```
+
+A Hook object targets that specific hook and its force-claim successor. It does
+not send to an unrelated hook that later happens to use the same token. Hooks
+without `resumeContext` keep the existing run-lookup behavior. The
+[Vercel World](/worlds/vercel) supports guarded delivery. Other Worlds accept a
+Hook object and deliver it through their existing path.
+
+A stored Hook contains its **token** and is at least as sensitive as that token.
+Keep it server-side, or sign the **whole object** before returning it to a client;
+also encrypt it if the token must remain secret. The deployment ID controls both
+the payload encryption key and the deployment that is woken, so authenticating
+only the IDs is insufficient. Trace carriers may contain private baggage; omit
+them before exposing a snapshot to a client. Schema validation is not authentication.
+
+The SDK handles a definite refusal of the first send by looking up the token
+and falling back to ordinary delivery. It retries admission throttles and
+503 `run-spec-version-changed` or `start-hook-run-pending`, retaining the delivery identity. Other 503s
+are uncertain even with `Retry-After` and are never resent. A refusal after a
+retried send is also surfaced without fallback, because an earlier send may
+have committed. Do not implement fallback yourself.
+
+| Outcome | Meaning |
+| --- | --- |
+| `HookNotFoundError` | The hook cannot receive this message; the SDK has already checked for a live token or an eligible successor. |
+| `HookForceClaimedError` | The SDK follows supported ownership redirects automatically. |
+| Any other error | The write may already have committed. Do not call `resumeHook()` again as a new delivery. |
+
+### Basic API route
+
+Using `resumeHook` in a basic API route to resume a hook:
+
+```typescript lineNumbers
+import { resumeHook } from "workflow/api";
+
+export async function POST(request: Request) {
+  const { token, data } = await request.json();
+
+  try {
+    const result = await resumeHook(token, data); // [!code highlight]
+
+    return Response.json({
+      success: true,
+      runId: result.runId
+    });
+  } catch (error) {
+    return new Response("Hook not found", { status: 404 });
+  }
+}
+```
+
+### With type safety
+
+Defining a payload type and using `resumeHook` to resume a hook with type safety:
+
+```typescript lineNumbers
+import { resumeHook } from "workflow/api";
+
+type ApprovalPayload = {
+  approved: boolean;
+  comment: string;
+};
+
+export async function POST(request: Request) {
+  const { token, approved, comment } = await request.json();
+
+  try {
+    const result = await resumeHook<ApprovalPayload>(token, { // [!code highlight]
+      approved, // [!code highlight]
+      comment, // [!code highlight]
+    }); // [!code highlight]
+
+    return Response.json({ runId: result.runId });
+  } catch (error) {
+    return Response.json({ error: "Invalid token" }, { status: 404 });
+  }
+}
+```
+
+### Server action (Next.js)
+
+Using `resumeHook` in Next.js server actions to resume a hook:
+
+```typescript lineNumbers
+"use server";
+
+import { resumeHook } from "workflow/api";
+
+export async function approveRequest(token: string, approved: boolean) {
+  try {
+    const result = await resumeHook(token, { approved });
+    return result.runId;
+  } catch (error) {
+    throw new Error("Invalid approval token");
+  }
+}
+```
+
+### Webhook handler
+
+Using `resumeHook` in a generic webhook handler to resume a hook:
+
+```typescript lineNumbers
+import { resumeHook } from "workflow/api";
+
+// Generic webhook handler that forwards data to a hook
+export async function POST(request: Request) {
+  const url = new URL(request.url);
+  const token = url.searchParams.get("token");
+
+  if (!token) {
+    return Response.json({ error: "Missing token" }, { status: 400 });
+  }
+
+  try {
+    const body = await request.json();
+    const result = await resumeHook(token, body);
+
+    return Response.json({ success: true, runId: result.runId });
+  } catch (error) {
+    return Response.json({ error: "Hook not found" }, { status: 404 });
+  }
+}
+```
+
+### Resume or start
+
+A common endpoint shape is "resume or start": one route that resumes the active workflow run for a business key if one exists, or starts a new run otherwise. This comes up when the workflow uses a deterministic hook token as its idempotency key, for example, one active run per order or conversation.
+
+On a World that supports [`start({ experimental_hook })`](/docs/api-reference/workflow-api/start#prevent-duplicate-starts), flip the order: start with the token first, and on `HookConflictError` resume the owner's start Hook, which accepts payloads right away. See [Start or route to the owner](/docs/foundations/idempotency#start-or-route-to-the-owner). Without it, use the pattern below.
+
+`resumeHook()` is the resume half of that flow. Try it first; if it throws `HookNotFoundError`, no active run owns the token yet, so start the workflow. One subtlety: `start()` returns before the new run executes and registers its hook, so you cannot resume immediately after starting. Retry the resume until the hook is registered: if you drop the payload and only start the workflow, the data from this request is lost.
+
+```typescript lineNumbers
+import { resumeHook, start } from "workflow/api";
+import { HookNotFoundError } from "workflow/errors";
+import { processOrder } from "./workflows/process-order";
+
+type OrderRequest = { confirmed: boolean };
+
+async function resumeWithRetry(token: string, payload: OrderRequest) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return await resumeHook(token, payload); // [!code highlight]
+    } catch (error) {
+      if (!HookNotFoundError.is(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  throw new Error("Workflow did not register its hook in time");
+}
+
+export async function POST(request: Request) {
+  const { orderId, confirmed } = await request.json();
+  const token = `order:${orderId}`;
+  const payload = { confirmed };
+
+  try {
+    // An active run already owns this token: resume it.
+    const hook = await resumeHook(token, payload); // [!code highlight]
+    return Response.json({ runId: hook.runId, reused: true });
+  } catch (error) {
+    if (!HookNotFoundError.is(error)) throw error;
+  }
+
+  // No hook yet: start a new run, then retry the resume so this
+  // request's payload still reaches the workflow.
+  const run = await start(processOrder, [orderId]); // [!code highlight]
+  const resumed = await resumeWithRetry(token, payload);
+
+  // A concurrent request can win the race between `start()` and hook
+  // registration; the resume always reaches the actual active owner.
+  return Response.json({
+    runId: resumed.runId,
+    reused: resumed.runId !== run.runId,
+  });
+}
+```
+
+See [Run idempotency](/docs/foundations/idempotency#run-idempotency) for the full pattern, including how the workflow claims the token with `hook.getConflict()` and how concurrent starts converge on one active owner.
+
+## Related functions
+
+- [`getHookByToken()`](/docs/api-reference/workflow-api/get-hook-by-token): Get hook details before resuming.
+- [`createHook()`](/docs/api-reference/workflow/create-hook): Create a hook in a workflow.
+- [`defineHook()`](/docs/api-reference/workflow/define-hook): Type-safe hook helper.
+- [Idempotency](/docs/foundations/idempotency): Deduplicate step side effects and workflow starts.

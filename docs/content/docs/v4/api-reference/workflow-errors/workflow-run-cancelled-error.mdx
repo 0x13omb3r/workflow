@@ -1,0 +1,56 @@
+---
+title: WorkflowRunCancelledError
+description: Thrown when awaiting the return value of a canceled workflow run.
+type: reference
+summary: Catch WorkflowRunCancelledError when awaiting run.returnValue on a run that was canceled.
+related:
+  - /docs/api-reference/workflow-errors/workflow-run-failed-error
+  - /docs/api-reference/workflow-errors/workflow-run-not-found-error
+---
+
+`WorkflowRunCancelledError` is thrown when awaiting `run.returnValue` on a workflow run that was explicitly canceled via `run.cancel()`. Canceled runs do not produce a return value.
+
+You can check for cancellation before awaiting by inspecting `run.status`.
+
+```typescript lineNumbers
+import { WorkflowRunCancelledError } from "workflow/errors"
+declare const run: { status: Promise<string>; returnValue: Promise<any> }; // @setup
+
+try {
+  const result = await run.returnValue;
+} catch (error) {
+  if (WorkflowRunCancelledError.is(error)) { // [!code highlight]
+    console.log(`Run ${error.runId} was cancelled`);
+  }
+}
+```
+
+## API signature
+
+### Properties
+
+<TSDoc
+definition={`
+interface WorkflowRunCancelledError {
+  /** The ID of the canceled run. */
+  runId: string;
+  /** The error message. */
+  message: string;
+}
+export default WorkflowRunCancelledError;`}
+/>
+
+### Static methods
+
+#### `WorkflowRunCancelledError.is(value)`
+
+Type-safe check for `WorkflowRunCancelledError` instances. Preferred over `instanceof` because it works across module boundaries and VM contexts.
+
+```typescript
+import { WorkflowRunCancelledError } from "workflow/errors"
+declare const error: unknown; // @setup
+
+if (WorkflowRunCancelledError.is(error)) {
+  // error is typed as WorkflowRunCancelledError
+}
+```

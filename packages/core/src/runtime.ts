@@ -1,750 +1,758 @@
-import { waitUntil } from '@vercel/functions';
 import {
+  EntityConflictError,
   FatalError,
-  RetryableError,
-  WorkflowAPIError,
-  WorkflowRunCancelledError,
-  WorkflowRunFailedError,
-  WorkflowRunNotCompletedError,
-  WorkflowRuntimeError,
+  RUN_ERROR_CODES,
+  RunExpiredError,
 } from '@workflow/errors';
-import type {
-  Event,
-  WorkflowRun,
-  WorkflowRunStatus,
-  World,
-} from '@workflow/world';
-import { WorkflowSuspension } from './global.js';
-import { runtimeLogger } from './logger.js';
-import { getStepFunction } from './private.js';
-import { getWorld, getWorldHandlers } from './runtime/world.js';
 import {
-  type Serializable,
-  type StepInvokePayload,
-  StepInvokePayloadSchema,
-  type WorkflowInvokePayload,
+  resolveWorkflowTargetWorld,
+  setWorkflowBasePath,
+} from '@workflow/utils';
+import { workflowDisplayName } from '@workflow/utils/parse-name';
+import {
+  type Event,
+  getQueueTopicPrefix,
+  type RunInput,
+  resolveQueueNamespace,
+  SPEC_VERSION_SINGLE_ORCHESTRATOR,
+  WORKFLOW_FLOW_ROUTE,
   WorkflowInvokePayloadSchema,
-} from './schemas.js';
+  type WorkflowRun,
+  type World,
+} from '@workflow/world';
+import { isRetryableWorldError } from './classify-error.js';
+import { describeError } from './describe-error.js';
+import { type Logger, runtimeLogger } from './logger.js';
+import { afterRunFailed } from './runtime/after-terminal-write.js';
+import { getComputeInstanceId } from './runtime/compute-instance.js';
+import { getMaxQueueDeliveries } from './runtime/constants.js';
+import type { Orchestrator } from './runtime/delivery.js';
 import {
-  dehydrateStepArguments,
-  dehydrateStepReturnValue,
-  getExternalRevivers,
-  hydrateStepArguments,
-  hydrateWorkflowReturnValue,
-} from './serialization.js';
-// TODO: move step handler out to a separate file
-import { contextStorage } from './step/context-storage.js';
+  getQueueOverhead,
+  handleHealthCheckMessage,
+  memoizeEncryptionKey,
+  parseHealthCheckPayload,
+  withHealthCheck,
+} from './runtime/helpers.js';
+import { withRunInputs } from './runtime/invocations.js';
+import {
+  authorizeQueueDelivery,
+  createQueueAuthRefusalLogger,
+  logQueueAuthSetting,
+} from './runtime/queue-auth.js';
+import { ReplayBudget } from './runtime/replay-budget.js';
+import { resumeTrackingFromMessage } from './runtime/resume-latency.js';
+import { resolveRunSpec } from './runtime/run-spec-routing.js';
+import { spec8Orchestrator } from './runtime/spec8/delivery.js';
+
+import { getWorld } from './runtime/world.js';
+
+import { dehydrateRunError, type PayloadKey } from './serialization.js';
+
 import * as Attribute from './telemetry/semantic-conventions.js';
-import { serializeTraceCarrier, trace, withTraceContext } from './telemetry.js';
-import { getErrorName, getErrorStack, isInstanceOf } from './types.js';
 import {
-  buildWorkflowSuspensionMessage,
-  getWorkflowRunStreamId,
-} from './util.js';
-import { runWorkflow } from './workflow.js';
+  buildInvocationSpanLinks,
+  getNextTraceCarrier,
+  getSpanKind,
+  getWorkflowTraceMode,
+  isUsableTraceCarrier,
+  recordQueueDeliveryRefused,
+  trace,
+  withTraceContext,
+  withWorkflowBaggage,
+} from './telemetry.js';
 
 export type { Event, WorkflowRun };
+
+// per-copy-ok: caches this copy's own dynamic import of its spec 9 module,
+// which is per-copy as well.
+let spec9OrchestratorModule: Promise<Orchestrator> | undefined;
+
+/**
+ * The orchestrator that drives a run of `specVersion` (see
+ * `runtime/delivery.ts`). The spec 9 one is loaded on the first spec 9
+ * delivery: spec 9 runs are opt-in, so a process that only drives spec 8 runs
+ * never evaluates it.
+ */
+async function orchestratorForSpecVersion(
+  specVersion: number
+): Promise<Orchestrator> {
+  if (specVersion < SPEC_VERSION_SINGLE_ORCHESTRATOR) return spec8Orchestrator;
+  spec9OrchestratorModule ??= import('./runtime/spec9/delivery.js').then(
+    (module) => module.spec9Orchestrator,
+    (error) => {
+      // A failed load is not cached, so the next delivery tries again.
+      spec9OrchestratorModule = undefined;
+      throw error;
+    }
+  );
+  return spec9OrchestratorModule;
+}
+
 export { WorkflowSuspension } from './global.js';
 export {
+  type HealthCheckOptions,
+  type HealthCheckResult,
+  healthCheck,
+} from './runtime/helpers.js';
+export {
+  type PrecompiledQuickJSModules,
+  setPrecompiledQuickJSModules,
+} from './runtime/quickjs-precompiled.js';
+export {
   getHookByToken,
+  type Hook,
+  type ResumedHook,
   resumeHook,
   resumeWebhook,
 } from './runtime/resume-hook.js';
-export { type StartOptions, start } from './runtime/start.js';
-
+export {
+  getRun,
+  Run,
+  type WorkflowReadableStream,
+  type WorkflowReadableStreamOptions,
+  type WorkflowRunWritableStreamOptions,
+} from './runtime/run.js';
+export {
+  type CancelRunOptions,
+  cancelRun,
+  cancelRuns,
+  listStreams,
+  pendingWakeUpWaits,
+  type ReadStreamOptions,
+  type RecreateRunOptions,
+  type ReenqueueRunOptions,
+  readStream,
+  recreateRunFromExisting,
+  reenqueueRun,
+  type StopSleepOptions,
+  type StopSleepResult,
+  wakeUpRun,
+} from './runtime/runs.js';
+export {
+  type DynamicStartOptions,
+  type DynamicWorkflowOptions,
+  type DynamicWorkflowStepReference,
+  type StartHookOptions,
+  type StartOptions,
+  type StartOptionsBase,
+  type StartOptionsWithDeploymentId,
+  type StartOptionsWithoutDeploymentId,
+  start,
+} from './runtime/start.js';
 export {
   createWorld,
+  createWorldFromModule,
   getWorld,
   getWorldHandlers,
   setWorld,
+  type WorldFactoryModule,
 } from './runtime/world.js';
 
 /**
- * Options for configuring a workflow's readable stream.
+ * Refuse a queue delivery whose run was created in a different environment than
+ * this deployment runs in.
+ *
+ * `start()` performs two writes that must land in the same tenant: the
+ * `run_created` event, attributed to whatever environment the *caller*
+ * authenticates as, and the queue message, pinned to a *deployment*. A
+ * misconfigured caller can split them, writing the run to one environment
+ * while addressing the message to a deployment in another. The consumer then
+ * finds no run under its own tenant and the backend's resilient start
+ * (`run_started` creates the run when `run_created` was never seen) mints a
+ * SECOND copy of the same run id in this environment. Both copies are real: the
+ * creator's sits pending forever, this one executes, and every subsequent
+ * cross-tenant queue ack fails to find its message.
+ *
+ * Nothing external is needed to catch this: the creator's environment rides the
+ * message in `runInput.environment` and this process already knows its own. So
+ * compare them and stop BEFORE `run_started`, the write that would create the
+ * fork. Refusing after it would be too late.
+ *
+ * Returns `true` when the caller must abandon the delivery. Skipped whenever
+ * either side is unknown, which keeps every existing setup on its current
+ * behavior: worlds with no environment dimension (`world-local`,
+ * `world-postgres`) don't implement `getEnvironment`, and runs started by an
+ * older SDK carry no `environment` field.
  */
-export interface WorkflowReadableStreamOptions {
-  /**
-   * An optional namespace to distinguish between multiple streams associated
-   * with the same workflow run.
-   */
-  namespace?: string;
-  /**
-   * The index number of the starting chunk to begin reading the stream from.
-   */
-  startIndex?: number;
-  /**
-   * Any asynchronous operations that need to be performed before the execution
-   * environment is paused / terminated
-   * (i.e. using [`waitUntil()`](https://developer.mozilla.org/docs/Web/API/ExtendableEvent/waitUntil) or similar).
-   */
-  ops?: Promise<any>[];
-  /**
-   * The global object to use for hydrating types from the global scope.
-   *
-   * Defaults to {@link [`globalThis`](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/globalThis)}.
-   */
-  global?: Record<string, any>;
-}
-
-/**
- * A handler class for a workflow run.
- */
-export class Run<TResult> {
-  /**
-   * The ID of the workflow run.
-   */
+function refuseCrossEnvironmentDelivery({
+  world,
+  runInput,
+  runId,
+  runLogger,
+}: {
+  world: World;
+  runInput: RunInput | undefined;
   runId: string;
+  runLogger: Logger;
+}): boolean {
+  const creatorEnvironment = runInput?.environment;
+  if (!creatorEnvironment) return false;
 
-  /**
-   * The world object.
-   * @internal
-   */
-  private world: World;
-
-  constructor(runId: string) {
-    this.runId = runId;
-    this.world = getWorld();
+  const currentEnvironment = world.getEnvironment?.();
+  if (!currentEnvironment || currentEnvironment === creatorEnvironment) {
+    return false;
   }
 
-  /**
-   * Cancels the workflow run.
-   */
-  async cancel(): Promise<void> {
-    await this.world.runs.cancel(this.runId);
-  }
-
-  /**
-   * The status of the workflow run.
-   */
-  get status(): Promise<WorkflowRunStatus> {
-    return this.world.runs.get(this.runId).then((run) => run.status);
-  }
-
-  /**
-   * The return value of the workflow run.
-   * Polls the workflow return value until it is completed.
-   */
-  get returnValue(): Promise<TResult> {
-    return this.pollReturnValue();
-  }
-
-  /**
-   * The name of the workflow.
-   */
-  get workflowName(): Promise<string> {
-    return this.world.runs.get(this.runId).then((run) => run.workflowName);
-  }
-
-  /**
-   * The timestamp when the workflow run was created.
-   */
-  get createdAt(): Promise<Date> {
-    return this.world.runs.get(this.runId).then((run) => run.createdAt);
-  }
-
-  /**
-   * The timestamp when the workflow run started execution.
-   * Returns undefined if the workflow has not started yet.
-   */
-  get startedAt(): Promise<Date | undefined> {
-    return this.world.runs.get(this.runId).then((run) => run.startedAt);
-  }
-
-  /**
-   * The timestamp when the workflow run completed.
-   * Returns undefined if the workflow has not completed yet.
-   */
-  get completedAt(): Promise<Date | undefined> {
-    return this.world.runs.get(this.runId).then((run) => run.completedAt);
-  }
-
-  /**
-   * The readable stream of the workflow run.
-   */
-  get readable(): ReadableStream {
-    return this.getReadable();
-  }
-
-  /**
-   * Retrieves the workflow run's default readable stream, which reads chunks
-   * written to the corresponding writable stream {@link getWritable}.
-   *
-   * @param options - The options for the readable stream.
-   * @returns The `ReadableStream` for the workflow run.
-   */
-  getReadable<R = any>(
-    options: WorkflowReadableStreamOptions = {}
-  ): ReadableStream<R> {
-    const { ops = [], global = globalThis, startIndex, namespace } = options;
-    const name = getWorkflowRunStreamId(this.runId, namespace);
-    return getExternalRevivers(global, ops).ReadableStream({
-      name,
-      startIndex,
-    }) as ReadableStream<R>;
-  }
-
-  /**
-   * Polls the workflow return value every 1 second until it is completed.
-   * @internal
-   * @returns The workflow return value.
-   */
-  private async pollReturnValue(): Promise<TResult> {
-    while (true) {
-      try {
-        const run = await this.world.runs.get(this.runId);
-
-        if (run.status === 'completed') {
-          return hydrateWorkflowReturnValue(run.output, [], globalThis);
-        }
-
-        if (run.status === 'cancelled') {
-          throw new WorkflowRunCancelledError(this.runId);
-        }
-
-        if (run.status === 'failed') {
-          throw new WorkflowRunFailedError(
-            this.runId,
-            run.error ?? 'Unknown error'
-          );
-        }
-
-        throw new WorkflowRunNotCompletedError(this.runId, run.status);
-      } catch (error) {
-        if (error instanceof WorkflowRunNotCompletedError) {
-          await new Promise((resolve) => setTimeout(resolve, 1_000));
-          continue;
-        }
-        throw error;
-      }
+  runLogger.error(
+    `Refusing to run this workflow: it was created in the "${creatorEnvironment}" ` +
+      `environment but this deployment runs in "${currentEnvironment}". ` +
+      'Executing it here would create a second copy of the same run id in ' +
+      'both environments — one pending forever, one running — so the queue ' +
+      'message is being discarded without executing and without retrying. ' +
+      'The client that called start() wrote the run to its own environment ' +
+      'but addressed the queue message to a deployment in another one. Check ' +
+      'that the environment that client authenticates as (WORKFLOW_VERCEL_ENV ' +
+      "for CLI and CI clients, or the OIDC token's environment inside a " +
+      'deployment) matches the environment of the deployment it targets. The ' +
+      `run it created is still pending in "${creatorEnvironment}" and will ` +
+      'not run.',
+    {
+      workflowRunId: runId,
+      creatorEnvironment,
+      currentEnvironment,
+      pinnedDeploymentId: runInput?.deploymentId,
     }
-  }
+  );
+  return true;
 }
 
 /**
- * Retrieves a `Run` object for a given run ID.
+ * Log when a `start()`-enqueued message pinned to one deployment is delivered
+ * to a different one.
  *
- * @param runId - The workflow run ID obtained from {@link start}.
- * @returns A `Run` object.
- * @throws WorkflowRunNotFoundError if the run ID is not found.
+ * A first-delivery message carries `runInput.deploymentId` (the deployment
+ * `start()` addressed it to), so comparing that against this handler's own
+ * deployment detects mis-delivery directly. This is a DIAGNOSTIC, not a gate:
+ * it warns and lets the invocation proceed, deliberately.
+ *
+ * Why this one only warns while its environment sibling above refuses: a
+ * differing deployment id is not by itself evidence of the fork we care about.
+ * The environment pair is exact (two named environments that disagree) and it
+ * is the dimension the run's tenant is keyed on. Deployment ids disagree for
+ * benign reasons too: `world-local` derives its id from the installed package
+ * version (`dpl_local@<version>`), so upgrading the SDK mid-run changes it with
+ * nothing wrong. Refusing on that signal would strand correct runs, and
+ * refusing before `run_started` leaves no server-side record to explain why.
+ * Anyone tempted to promote this to a hard failure has to handle that first.
+ *
+ * Skipped unless BOTH ids are known: `getDeploymentId()` throws in worlds that
+ * require a deployment and have none, and a re-enqueued message carries no
+ * `runInput` at all.
  */
-export function getRun<TResult>(runId: string): Run<TResult> {
-  return new Run(runId);
-}
+async function warnOnDeploymentPinningMismatch({
+  world,
+  runInput,
+  runId,
+  runLogger,
+}: {
+  world: World;
+  runInput: RunInput | undefined;
+  runId: string;
+  runLogger: Logger;
+}): Promise<void> {
+  const pinnedDeploymentId = runInput?.deploymentId;
+  if (!pinnedDeploymentId) return;
 
-/**
- * Loads all workflow run events by iterating through all pages of paginated results.
- * This ensures that *all* events are loaded into memory before running the workflow.
- * Events must be in chronological order (ascending) for proper workflow replay.
- */
-async function getAllWorkflowRunEvents(runId: string): Promise<Event[]> {
-  const allEvents: Event[] = [];
-  let cursor: string | null = null;
-  let hasMore = true;
-
-  const world = getWorld();
-  while (hasMore) {
-    const response = await world.events.list({
-      runId,
-      pagination: {
-        sortOrder: 'asc', // Required: events must be in chronological order for replay
-        cursor: cursor ?? undefined,
-      },
-    });
-
-    allEvents.push(...response.data);
-    hasMore = response.hasMore;
-    cursor = response.cursor;
+  let currentDeploymentId: string | undefined;
+  try {
+    currentDeploymentId = await world.getDeploymentId();
+  } catch {
+    // Worlds that require a deployment id throw when there isn't one. That is
+    // not a mismatch: there is nothing to compare against.
+    return;
+  }
+  if (!currentDeploymentId || currentDeploymentId === pinnedDeploymentId) {
+    return;
   }
 
-  return allEvents;
-}
-
-/**
- * Function that creates a single route which handles any workflow execution
- * request and routes to the appropriate workflow function.
- *
- * @param workflowCode - The workflow bundle code containing all the workflow
- * functions at the top level.
- * @returns A function that can be used as a Vercel API route.
- */
-export function workflowEntrypoint(workflowCode: string) {
-  return getWorldHandlers().createQueueHandler(
-    '__wkf_workflow_',
-    async (message_, metadata) => {
-      const { runId, traceCarrier: traceContext } =
-        WorkflowInvokePayloadSchema.parse(message_);
-      // Extract the workflow name from the topic name
-      const workflowName = metadata.queueName.slice('__wkf_workflow_'.length);
-
-      // Invoke user workflow within the propagated trace context
-      return await withTraceContext(traceContext, async () => {
-        const world = getWorld();
-        return trace(`WORKFLOW ${workflowName}`, async (span) => {
-          span?.setAttributes({
-            ...Attribute.WorkflowName(workflowName),
-            ...Attribute.WorkflowOperation('execute'),
-            ...Attribute.QueueName(metadata.queueName),
-          });
-
-          // TODO: validate `workflowName` exists before consuming message?
-
-          span?.setAttributes({
-            ...Attribute.WorkflowRunId(runId),
-            ...Attribute.WorkflowTracePropagated(!!traceContext),
-          });
-
-          let workflowStartedAt = -1;
-          try {
-            let workflowRun = await world.runs.get(runId);
-
-            if (workflowRun.status === 'pending') {
-              workflowRun = await world.runs.update(runId, {
-                // This sets the `startedAt` timestamp at the database level
-                status: 'running',
-              });
-            }
-
-            // At this point, the workflow is "running" and `startedAt` should
-            // definitely be set.
-            if (!workflowRun.startedAt) {
-              throw new Error(
-                `Workflow run "${runId}" has no "startedAt" timestamp`
-              );
-            }
-            workflowStartedAt = +workflowRun.startedAt;
-
-            span?.setAttributes({
-              ...Attribute.WorkflowRunStatus(workflowRun.status),
-              ...Attribute.WorkflowStartedAt(workflowStartedAt),
-            });
-
-            if (workflowRun.status !== 'running') {
-              // Workflow has already completed or failed, so we can skip it
-              console.warn(
-                `Workflow "${runId}" has status "${workflowRun.status}", skipping`
-              );
-
-              // TODO: for `cancel`, we actually want to propagate a WorkflowCancelled event
-              // inside the workflow context so the user can gracefully exit. this is SIGTERM
-              // TODO: furthermore, there should be a timeout or a way to force cancel SIGKILL
-              // so that we actually exit here without replaying the workflow at all, in the case
-              // the replaying the workflow is itself failing.
-
-              return;
-            }
-
-            // Load all events into memory before running
-            const events = await getAllWorkflowRunEvents(workflowRun.runId);
-
-            const result = await runWorkflow(workflowCode, workflowRun, events);
-
-            // Update the workflow run with the result
-            await world.runs.update(runId, {
-              status: 'completed',
-              output: result as Serializable,
-            });
-
-            span?.setAttributes({
-              ...Attribute.WorkflowRunStatus('completed'),
-              ...Attribute.WorkflowEventsCount(events.length),
-            });
-          } catch (err) {
-            if (isInstanceOf(err, WorkflowSuspension)) {
-              const suspensionMessage = buildWorkflowSuspensionMessage(
-                runId,
-                err.stepCount,
-                err.hookCount
-              );
-              if (suspensionMessage) {
-                // Note: suspensionMessage logged only in debug mode to avoid production noise
-                // console.debug(suspensionMessage);
-              }
-              // Process each operation in the queue (steps and hooks)
-              for (const queueItem of err.steps) {
-                if (queueItem.type === 'step') {
-                  // Handle step operations
-                  const ops: Promise<void>[] = [];
-                  const dehydratedArgs = dehydrateStepArguments(
-                    queueItem.args,
-                    err.globalThis
-                  );
-
-                  try {
-                    const step = await world.steps.create(runId, {
-                      stepId: queueItem.correlationId,
-                      stepName: queueItem.stepName,
-                      input: dehydratedArgs as Serializable[],
-                    });
-
-                    waitUntil(Promise.all(ops));
-
-                    await world.queue(
-                      `__wkf_step_${queueItem.stepName}`,
-                      {
-                        workflowName,
-                        workflowRunId: runId,
-                        workflowStartedAt,
-                        stepId: step.stepId,
-                        traceCarrier: await serializeTraceCarrier(),
-                      } satisfies StepInvokePayload,
-                      {
-                        idempotencyKey: queueItem.correlationId,
-                      }
-                    );
-                  } catch (err) {
-                    if (
-                      isInstanceOf(err, WorkflowAPIError) &&
-                      err.status === 409
-                    ) {
-                      // Step already exists, so we can skip it
-                      console.warn(
-                        `Step "${queueItem.stepName}" with correlation ID "${queueItem.correlationId}" already exists, skipping: ${err.message}`
-                      );
-                      continue;
-                    }
-                    throw err;
-                  }
-                } else if (queueItem.type === 'hook') {
-                  // Handle hook operations
-                  try {
-                    // Create hook in database
-                    const hookMetadata =
-                      typeof queueItem.metadata === 'undefined'
-                        ? undefined
-                        : dehydrateStepArguments(
-                            queueItem.metadata,
-                            err.globalThis
-                          );
-                    await world.hooks.create(runId, {
-                      hookId: queueItem.correlationId,
-                      token: queueItem.token,
-                      metadata: hookMetadata,
-                    });
-
-                    // Create hook_created event in event log
-                    await world.events.create(runId, {
-                      eventType: 'hook_created',
-                      correlationId: queueItem.correlationId,
-                    });
-                  } catch (err) {
-                    if (isInstanceOf(err, WorkflowAPIError)) {
-                      if (err.status === 409) {
-                        // Hook already exists (duplicate hook_id constraint), so we can skip it
-                        console.warn(
-                          `Hook with correlation ID "${queueItem.correlationId}" already exists, skipping: ${err.message}`
-                        );
-                        continue;
-                      } else if (err.status === 410) {
-                        // Workflow has already completed, so no-op
-                        console.warn(
-                          `Workflow run "${runId}" has already completed, skipping hook "${queueItem.correlationId}": ${err.message}`
-                        );
-                        continue;
-                      }
-                    }
-                    throw err;
-                  }
-                }
-              }
-              span?.setAttributes({
-                ...Attribute.WorkflowRunStatus('pending_steps'),
-                ...Attribute.WorkflowStepsCreated(err.steps.length),
-              });
-            } else {
-              const errorName = getErrorName(err);
-              const errorStack = getErrorStack(err);
-              console.error(
-                `${errorName} while running "${runId}" workflow:\n\n${errorStack}`
-              );
-              await world.runs.update(runId, {
-                status: 'failed',
-                error: String(err),
-                // TODO: include error codes when we define them
-                // TODO: serialize/include the error name and stack?
-              });
-              span?.setAttributes({
-                ...Attribute.WorkflowRunStatus('failed'),
-                ...Attribute.WorkflowErrorName(errorName),
-                ...Attribute.WorkflowErrorMessage(String(err)),
-              });
-            }
-          }
-        }); // End withTraceContext
-      });
+  runLogger.error(
+    'Queue message was delivered to a deployment it was not pinned to. ' +
+      'The run was created targeting a different deployment, so this ' +
+      'invocation may be replaying against code the run was not started on. ' +
+      'Continuing — this is expected if the Workflow SDK version changed ' +
+      'mid-run in local development, where the deployment id is derived from ' +
+      'that version.',
+    {
+      workflowRunId: runId,
+      pinnedDeploymentId,
+      currentDeploymentId,
     }
   );
 }
 
 /**
- * A single route that handles any step execution request and routes to the
- * appropriate step function. We may eventually want to create different bundles
- * for each step, this is temporary.
+ * Creates a single route which handles workflow execution requests,
+ * executing steps inline when possible to reduce function invocations
+ * and queue overhead.
+ *
+ * The handler loops: replay workflow → execute step inline → replay → ...
+ * until the workflow completes, times out, or encounters non-step suspensions.
+ * The design is described in `./runtime/eager-processing.md`.
+ *
+ * @param workflowCode - The workflow bundle code containing all workflow functions
+ * @returns A function that can be used as a Vercel API route
  */
-export const stepEntrypoint =
-  /* @__PURE__ */ getWorldHandlers().createQueueHandler(
-    '__wkf_step_',
-    async (message_, metadata) => {
-      const {
-        workflowName,
-        workflowRunId,
-        workflowStartedAt,
-        stepId,
-        traceCarrier: traceContext,
-      } = StepInvokePayloadSchema.parse(message_);
-      // Execute step within the propagated trace context
-      return await withTraceContext(traceContext, async () => {
-        // Extract the step name from the topic name
-        const stepName = metadata.queueName.slice('__wkf_step_'.length);
-        const world = getWorld();
+export function workflowEntrypoint(
+  workflowCode: string,
+  options?: {
+    namespace?: string;
+    routeModuleBodyStartedAt?: number;
+    basePath?: string;
+  }
+): (req: Request) => Promise<Response> {
+  setWorkflowBasePath(options?.basePath);
+  // The route this handler is mounted at, base path included (Next.js'
+  // `basePath`, `workflows.experimentalRoutePrefix`, NestJS' global prefix).
+  // It is fixed for the deployment, so it stays a bounded route template.
+  const flowRoute = `${options?.basePath ?? ''}${WORKFLOW_FLOW_ROUTE}`;
 
-        return trace(`STEP ${stepName}`, async (span) => {
-          span?.setAttributes({
-            ...Attribute.StepName(stepName),
-            ...Attribute.StepAttempt(metadata.attempt),
-            ...Attribute.QueueName(metadata.queueName),
-          });
+  const namespace = resolveQueueNamespace(options?.namespace);
+  const workflowPrefix = getQueueTopicPrefix('workflow', namespace);
 
-          const stepFn = getStepFunction(stepName);
-          if (!stepFn) {
-            throw new Error(`Step "${stepName}" not found`);
-          }
-          if (typeof stepFn !== 'function') {
-            throw new Error(
-              `Step "${stepName}" is not a function (got ${typeof stepFn})`
-            );
-          }
+  const handler = (worldHandlers: World) =>
+    worldHandlers.createQueueHandler(
+      workflowPrefix,
+      withRunInputs(worldHandlers)(async (message_, metadata, activity) => {
+        // T2 of the hook-resume TTR window (see runtime/resume-latency.ts):
+        // the instant this consumer began, before message parsing. Only used
+        // when the message turns out to carry resume timing; taking it
+        // unconditionally keeps it honest for the deliveries that do.
+        const handlerEnteredAtMs = Date.now();
+        // Check if this is a health check message. It is a queue delivery
+        // like any other, so it passed the route's queue auth check (the
+        // World's queue sends it with the key). It only writes a status
+        // response to a stream named by a correlationId the caller knows.
+        const healthCheck = parseHealthCheckPayload(message_);
+        if (healthCheck) {
+          await handleHealthCheckMessage(
+            healthCheck,
+            worldHandlers.specVersion
+          );
+          return;
+        }
 
-          span?.setAttributes({
-            ...Attribute.WorkflowName(workflowName),
-            ...Attribute.WorkflowRunId(workflowRunId),
-            ...Attribute.StepId(stepId),
-            ...Attribute.StepMaxRetries(stepFn.maxRetries ?? 3),
-            ...Attribute.StepTracePropagated(!!traceContext),
-          });
+        const message = WorkflowInvokePayloadSchema.parse(message_);
+        const {
+          runId,
+          traceCarrier: incomingTraceCarrier,
+          requestedAt,
+          stepId: incomingStepId,
+          runInput,
+          hookResumeTiming,
+        } = message;
 
-          let step = await world.steps.get(workflowRunId, stepId);
+        // --- Hook-resume TTR telemetry (runtime/resume-latency.ts) ---
+        // Threaded through this invocation and CONSUMED by the first durable
+        // step that follows the resumption, cleared at that point so a later
+        // step, a retry, or a redelivery never re-reports the same resume.
+        //
+        // Two delivery shapes carry timing:
+        //  - the resume's own invocation (no `stepId`): the producer's T0/T1
+        //    ride the message and this handler's entry is T2.
+        //  - a step this invocation handed to another invocation (`stepId`
+        //    present): the resuming invocation already stamped T2..T4 onto
+        //    the message, so they are read back verbatim.
+        let resumeTracking = resumeTrackingFromMessage(
+          hookResumeTiming,
+          incomingStepId !== undefined ? 'dispatched' : 'inline'
+        );
+        if (resumeTracking && incomingStepId === undefined) {
+          resumeTracking.consumerStartedAtMs = handlerEnteredAtMs;
+        }
+        if (
+          resumeTracking &&
+          !Number.isFinite(resumeTracking.consumerStartedAtMs)
+        ) {
+          // A step message from a producer that forwarded timing without the
+          // consumer boundaries. Nothing additive can be reported.
+          resumeTracking = undefined;
+        }
+        // `start()` always attaches a trace carrier, but
+        // serializeTraceCarrier() returns `{}` when no OTEL SDK is registered
+        // or no span is active, so treat an empty carrier the same as an
+        // absent one so linked mode falls back to a fresh origin instead of
+        // forwarding a useless `{}` forever.
+        const traceContext = isUsableTraceCarrier(incomingTraceCarrier)
+          ? incomingTraceCarrier
+          : undefined;
+        const { requestId } = metadata;
+        const workflowName = metadata.queueName.slice(workflowPrefix.length);
 
-          runtimeLogger.debug('Step execution details', {
-            stepName,
-            stepId: step.stepId,
-            status: step.status,
-            attempt: step.attempt,
-          });
+        // --- Max delivery check ---
+        // Enforce max delivery limit before any infrastructure calls.
+        // This prevents runaway workflows from consuming infinite queue deliveries.
+        // Scoped logger for this run: attaches runId/workflowName to every
+        // log line and child loggers below, so callers don't repeat it.
+        const runLogger = runtimeLogger.forRun(runId, workflowName);
 
-          span?.setAttributes({
-            ...Attribute.StepStatus(step.status),
-          });
+        // The orchestrator of the run's spec version: a run keeps the one it
+        // was created with (see `runtime/delivery.ts`).
+        const runSpec = await resolveRunSpec(message);
+        const maxQueueDeliveries = getMaxQueueDeliveries();
+        let orchestrator: Orchestrator;
+        try {
+          orchestrator = await orchestratorForSpecVersion(runSpec.specVersion);
+        } catch (err) {
+          // The spec 9 orchestrator is loaded on demand, so a bundle whose
+          // spec 9 chunk cannot load fails here on every delivery, before the
+          // max-deliveries check below (which needs the orchestrator to write
+          // the run's failure). Each failure is logged, and the delivery cap
+          // still bounds it: past the cap the message is acknowledged, leaving
+          // the run in its current state, instead of redelivering until the
+          // queue's retention expires.
+          const pastCap = metadata.attempt > maxQueueDeliveries;
+          runLogger.error(
+            pastCap
+              ? `Failed to load the orchestrator for spec version ${runSpec.specVersion} after ${metadata.attempt} delivery attempts. ` +
+                  'The message is being acknowledged, and the run will remain in its current state until manually resolved. ' +
+                  'This points to a broken deployment bundle.'
+              : `Failed to load the orchestrator for spec version ${runSpec.specVersion}; retrying via queue redelivery ` +
+                  `(${metadata.attempt}/${maxQueueDeliveries})`,
+            {
+              attempt: metadata.attempt,
+              specVersion: runSpec.specVersion,
+              errorName: err instanceof Error ? err.name : 'UnknownError',
+              errorMessage: err instanceof Error ? err.message : String(err),
+              errorStack: err instanceof Error ? err.stack : undefined,
+            }
+          );
+          if (pastCap) return;
+          throw err;
+        }
 
-          let result: unknown;
-          const attempt = step.attempt + 1;
+        if (
+          metadata.attempt > maxQueueDeliveries &&
+          orchestrator.countsTowardMaxDeliveries(message)
+        ) {
+          const maxDeliveriesDescription = describeError(
+            undefined,
+            RUN_ERROR_CODES.MAX_DELIVERIES_EXCEEDED
+          );
+          runLogger.error(
+            `Workflow handler exceeded max deliveries (${metadata.attempt}/${maxQueueDeliveries})`,
+            {
+              attempt: metadata.attempt,
+              errorCode: maxDeliveriesDescription.errorCode,
+              errorAttribution: maxDeliveriesDescription.attribution,
+            }
+          );
+          let encryptionKey: PayloadKey | undefined;
+          let dehydratedError: Uint8Array;
+          // No run is loaded past the ceiling; the terminal write returns it.
+          let failedRun: WorkflowRun | undefined;
+          const fenceRefused = new Error(
+            `Max-deliveries failure of run "${runId}" was refused by the in-band fence; redelivering to retry it`
+          );
           try {
-            if (step.status !== 'pending') {
-              // We should only be running the step if it's pending
-              // (initial state, or state set on re-try), so the step has been
-              // invoked erroneously.
-              console.error(
-                `[Workflows] "${workflowRunId}" - Step invoked erroneously, expected status "pending", got "${step.status}" instead, skipping execution`
+            const world = await getWorld();
+            const getEncryptionKey = memoizeEncryptionKey(world, runId);
+            const err = new FatalError(
+              `Workflow exceeded maximum queue deliveries (${metadata.attempt}/${maxQueueDeliveries})`
+            );
+            encryptionKey = await getEncryptionKey();
+            dehydratedError = await dehydrateRunError(
+              err,
+              runId,
+              encryptionKey
+            );
+            const written = await orchestrator.writeMaxDeliveriesFailure(
+              world,
+              runId,
+              {
+                error: dehydratedError,
+                errorCode: RUN_ERROR_CODES.MAX_DELIVERIES_EXCEEDED,
+              },
+              requestId
+            );
+            if (written === 'superseded') {
+              // A refusal does not prove that another orchestrator is
+              // running: the World also refuses a write whose own position it
+              // sealed, and then nothing else is queued for the run. Throw so
+              // the queue redelivers this message. The redelivery is still
+              // past the ceiling, so it only retries this terminal write from
+              // a fresh load, and finds the run terminal (and acknowledges) if
+              // a live orchestrator did finish it. A fresh wake would restart
+              // the delivery count instead.
+              runLogger.warn(
+                'Max-deliveries failure refused by the in-band fence; retrying via queue redelivery',
+                { attempt: metadata.attempt }
               );
-              span?.setAttributes({
-                ...Attribute.StepSkipped(true),
-                ...Attribute.StepSkipReason(step.status),
-              });
+              throw fenceRefused;
+            }
+            failedRun = written.run;
+          } catch (err) {
+            if (err === fenceRefused) throw err;
+            if (EntityConflictError.is(err) || RunExpiredError.is(err)) {
+              // Run already finished, consume the message silently
               return;
             }
-
-            await world.events.create(workflowRunId, {
-              eventType: 'step_started', // TODO: Replace with 'step_retrying'
-              correlationId: stepId,
-            });
-
-            step = await world.steps.update(workflowRunId, stepId, {
-              attempt,
-              status: 'running',
-            });
-
-            if (!step.startedAt) {
-              throw new WorkflowRuntimeError(
-                `Step "${stepId}" has no "startedAt" timestamp`
+            // A transient backend failure (429 / 5xx / transport) must not
+            // abandon the run: acking here leaves it `running` with no message
+            // left to drive it. Throw so the queue redelivers with its backoff
+            // (honoring a 429's Retry-After); the redelivery is still past the
+            // ceiling, so it only retries this terminal write, never the replay.
+            // This relies on the World redelivering past the ceiling: VQS and
+            // world-local do, while world-postgres currently caps its jobs at
+            // exactly this delivery (#4427, fixed by #4428).
+            if (isRetryableWorldError(err)) {
+              runLogger.warn(
+                'Transient error marking run as failed after max deliveries, retrying via queue redelivery',
+                {
+                  attempt: metadata.attempt,
+                  errorName: err instanceof Error ? err.name : 'UnknownError',
+                  errorMessage:
+                    err instanceof Error ? err.message : String(err),
+                }
               );
+              throw err;
             }
-            // Hydrate the step input arguments
-            const ops: Promise<void>[] = [];
-            const args = hydrateStepArguments(step.input, ops);
-
-            span?.setAttributes({
-              ...Attribute.StepArgumentsCount(args.length),
-            });
-
-            result = await contextStorage.run(
+            runLogger.error(
+              `Failed to mark run as failed after ${metadata.attempt} delivery attempts. ` +
+                `A persistent error is preventing the run from being terminated. ` +
+                `The run will remain in its current state until manually resolved. ` +
+                `This is most likely due to a persistent outage of the workflow backend ` +
+                `or a bug in the workflow runtime and should be reported to the Workflow team.`,
               {
-                stepMetadata: {
-                  stepId,
-                  stepStartedAt: new Date(+step.startedAt),
-                  attempt,
-                },
-                workflowMetadata: {
-                  workflowRunId,
-                  workflowStartedAt: new Date(+workflowStartedAt),
-                  // TODO: there should be a getUrl method on the world interface itself. This
-                  // solution only works for vercel + embedded worlds.
-                  url: process.env.VERCEL_URL
-                    ? `https://${process.env.VERCEL_URL}`
-                    : `http://localhost:${process.env.PORT || 3000}`,
-                },
-              },
-              () => stepFn(...args)
+                attempt: metadata.attempt,
+                errorName: err instanceof Error ? err.name : 'UnknownError',
+                errorMessage: err instanceof Error ? err.message : String(err),
+                errorStack: err instanceof Error ? err.stack : undefined,
+              }
             );
+            return;
+          }
+          await afterRunFailed(
+            await getWorld(),
+            failedRun ?? runId,
+            workflowName,
+            dehydratedError,
+            encryptionKey,
+            RUN_ERROR_CODES.MAX_DELIVERIES_EXCEEDED
+          );
+          return;
+        }
 
-            result = dehydrateStepReturnValue(result, ops);
+        // --- Trace correlation mode ---
+        // 'linked' (default): the workflow.execute span below stays a CHILD
+        // of the local delivery (flow-route) context, so one invocation
+        // (route handler, workflow replay, inline steps, event writes) is a
+        // single bounded trace. The run-origin context travels as a span
+        // LINK (not a parent), and re-enqueues forward the original carrier
+        // unchanged, so a (potentially hours-long) run is never stitched
+        // into one giant trace across invocations.
+        // 'continuous': legacy behavior, where the restored run-origin context
+        // becomes the parent of this invocation's spans.
+        const traceMode = getWorkflowTraceMode();
 
-            waitUntil(Promise.all(ops));
+        // Trace carrier to attach to messages this invocation enqueues.
+        // See getNextTraceCarrier for the linked/continuous semantics.
+        const nextTraceCarrier = (): Promise<Record<string, string>> =>
+          getNextTraceCarrier(traceMode, traceContext);
 
-            // Update the event log with the step result
-            await world.events.create(workflowRunId, {
-              eventType: 'step_completed',
-              correlationId: stepId,
-              eventData: {
-                result: result as Serializable,
-              },
-            });
+        // Span links to the incoming delivery context and (in linked mode)
+        // the run-origin context from the trace carrier.
+        const spanLinks = await buildInvocationSpanLinks(
+          traceMode,
+          traceContext
+        );
 
-            await world.steps.update(workflowRunId, stepId, {
-              status: 'completed',
-              output: result as Serializable,
-            });
+        // The replay budget covers orchestration work between steps, not inline
+        // step bodies. It is checked between loop iterations; step bodies use
+        // the platform timeout and NO_INLINE_REPLAY_AFTER_MS guard instead.
+        const replayBudget = new ReplayBudget();
 
-            span?.setAttributes({
-              ...Attribute.StepStatus('completed'),
-              ...Attribute.StepResultType(typeof result),
-            });
-          } catch (err: unknown) {
-            span?.setAttributes({
-              ...Attribute.StepErrorName(getErrorName(err)),
-              ...Attribute.StepErrorMessage(String(err)),
-            });
-
-            if (isInstanceOf(err, WorkflowAPIError)) {
-              if (err.status === 410) {
-                // Workflow has already completed, so no-op
-                console.warn(
-                  `Workflow run "${workflowRunId}" has already completed, skipping step "${stepId}": ${err.message}`
-                );
+        // In linked mode the run-origin context is NOT restored as the
+        // active (parent) context: passing `undefined` makes
+        // withTraceContext a passthrough, so the workflow.execute span below
+        // stays a child of the local delivery (flow-route) context and the
+        // run-origin travels as a span link instead.
+        const parentTraceCarrier =
+          traceMode === 'continuous' ? traceContext : undefined;
+        // Queue-delivered invocation: CONSUMER kind, matching the
+        // queue-delivered step.execute span.
+        const spanKind = await getSpanKind('CONSUMER');
+        return await withTraceContext(parentTraceCarrier, async () => {
+          return await withWorkflowBaggage(
+            { workflowRunId: runId, workflowName },
+            async () => {
+              const world = await trace('workflow.route.get_world', async () =>
+                getWorld()
+              );
+              // Both checks below look at `runInput`, so both are no-ops on a
+              // re-enqueued message (which carries none): they only ever run on
+              // a first delivery, the one that could create the run.
+              //
+              // Returning acks the message. That is deliberate: the mismatch is
+              // baked into this message, so every redelivery would reach the
+              // same verdict, and throwing would hot-loop the handler until
+              // MAX_QUEUE_DELIVERIES with the same error each time. It matches
+              // how the run_started path already discards deliveries whose
+              // verdict cannot change (EntityConflictError, RunExpiredError).
+              if (
+                refuseCrossEnvironmentDelivery({
+                  world,
+                  runInput,
+                  runId,
+                  runLogger,
+                })
+              ) {
                 return;
               }
-            }
-
-            if (isInstanceOf(err, FatalError)) {
-              const stackLines = getErrorStack(err).split('\n').slice(0, 4);
-              console.error(
-                `[Workflows] "${workflowRunId}" - Encountered \`FatalError\` while executing step "${stepName}":\n  > ${stackLines.join('\n    > ')}\n\nBubbling up error to parent workflow`
-              );
-              // Fatal error - store the error in the event log and re-invoke the workflow
-              await world.events.create(workflowRunId, {
-                eventType: 'step_failed',
-                correlationId: stepId,
-                eventData: {
-                  error: String(err),
-                  stack: err.stack,
-                  fatal: true,
-                },
+              // Diagnostic only. See the helper for why this warns instead of
+              // refusing the invocation.
+              await warnOnDeploymentPinningMismatch({
+                world,
+                runInput,
+                runId,
+                runLogger,
               });
-              await world.steps.update(workflowRunId, stepId, {
-                status: 'failed',
-                error: String(err),
-                // TODO: include error codes when we define them
-                // TODO: serialize/include the error name and stack?
-              });
-
-              span?.setAttributes({
-                ...Attribute.StepStatus('failed'),
-                ...Attribute.StepFatalError(true),
-              });
-            } else {
-              const maxRetries = stepFn.maxRetries ?? 3;
-
-              span?.setAttributes({
-                ...Attribute.StepAttempt(attempt),
-                ...Attribute.StepMaxRetries(maxRetries),
-              });
-
-              if (attempt >= maxRetries) {
-                // Max retries reached
-                const stackLines = getErrorStack(err).split('\n').slice(0, 4);
-                console.error(
-                  `[Workflows] "${workflowRunId}" - Encountered \`Error\` while executing step "${stepName}" (attempt ${attempt}):\n  > ${stackLines.join('\n    > ')}\n\n  Max retries reached\n  Bubbling error to parent workflow`
-                );
-                const errorMessage = `Step "${stepName}" failed after max retries: ${String(err)}`;
-                await world.events.create(workflowRunId, {
-                  eventType: 'step_failed',
-                  correlationId: stepId,
-                  eventData: {
-                    error: errorMessage,
-                    stack: getErrorStack(err),
-                    fatal: true,
-                  },
-                });
-                await world.steps.update(workflowRunId, stepId, {
-                  status: 'failed',
-                  error: errorMessage,
-                });
-
-                span?.setAttributes({
-                  ...Attribute.StepStatus('failed'),
-                  ...Attribute.StepRetryExhausted(true),
-                });
-              } else {
-                // Not at max retries yet - log as a retryable error
-                if (isInstanceOf(err, RetryableError)) {
-                  console.warn(
-                    `[Workflows] "${workflowRunId}" - Encountered \`RetryableError\` while executing step "${stepName}" (attempt ${attempt}):\n  > ${String(err.message)}\n\n  This step has failed but will be retried`
-                  );
-                } else {
-                  const stackLines = getErrorStack(err).split('\n').slice(0, 4);
-                  console.error(
-                    `[Workflows] "${workflowRunId}" - Encountered \`Error\` while executing step "${stepName}" (attempt ${attempt}):\n  > ${stackLines.join('\n    > ')}\n\n  This step has failed but will be retried`
-                  );
+              return trace(
+                `workflow.execute ${workflowDisplayName(workflowName)}`,
+                { kind: spanKind, links: spanLinks },
+                async (span) => {
+                  span?.setAttributes({
+                    ...Attribute.WorkflowName(workflowName),
+                    ...Attribute.WorkflowOperation('execute_v2'),
+                    ...Attribute.MessagingSystem('vercel-queue'),
+                    ...Attribute.MessagingDestinationName(metadata.queueName),
+                    ...Attribute.MessagingMessageId(metadata.messageId),
+                    ...Attribute.MessagingOperationType('process'),
+                    ...getQueueOverhead({ requestedAt }),
+                    ...Attribute.WorkflowRunId(runId),
+                    ...Attribute.WorkflowTracePropagated(!!traceContext),
+                    ...Attribute.WorkflowTraceMode(traceMode),
+                    // Which orchestrator handles the delivery, and how the
+                    // queue counts it: a coalesced re-run or a handoff
+                    // keeps `attempt` and advances `deliveryCount`.
+                    ...Attribute.WorkflowRunSpecVersion(runSpec.specVersion),
+                    ...Attribute.WorkflowDeliveryAttempt(metadata.attempt),
+                    ...(metadata.deliveryCount !== undefined
+                      ? Attribute.WorkflowDeliveryCount(metadata.deliveryCount)
+                      : {}),
+                  });
+                  return orchestrator.runDelivery({
+                    message,
+                    metadata,
+                    activity,
+                    workflowCode,
+                    namespace,
+                    world,
+                    span,
+                    runLogger,
+                    workflowName,
+                    requestId,
+                    resumeTracking,
+                    nextTraceCarrier,
+                    replayBudget,
+                    prefetchedRun: runSpec.run,
+                    runSpecVersion: runSpec.specVersion,
+                  });
                 }
-                await world.events.create(workflowRunId, {
-                  eventType: 'step_failed',
-                  correlationId: stepId,
-                  eventData: {
-                    error: String(err),
-                    stack: getErrorStack(err),
-                  },
-                });
-                await world.steps.update(workflowRunId, stepId, {
-                  status: 'pending', // TODO: Should be "retrying" once we have that status
-                });
-                const timeoutSeconds = Math.max(
-                  1,
-                  isInstanceOf(err, RetryableError)
-                    ? Math.floor(
-                        (+err.retryAfter.getTime() - Date.now()) / 1000
-                      )
-                    : 1
-                );
-
-                span?.setAttributes({
-                  ...Attribute.StepRetryTimeoutSeconds(timeoutSeconds),
-                  ...Attribute.StepRetryWillRetry(true),
-                });
-
-                // It's a retryable error - so have the queue keep the message visible
-                // so that it gets retried.
-                return { timeoutSeconds };
-              }
+              );
             }
-          }
-
-          await world.queue(`__wkf_workflow_${workflowName}`, {
-            runId: workflowRunId,
-            traceCarrier: await serializeTraceCarrier(),
-          } satisfies WorkflowInvokePayload);
+          );
         });
-      });
-    }
-  );
+      })
+    );
 
-// this is a no-op placeholder as the client is
-// expecting this to be present but we aren't actually using it
-export function runStep() {}
+  // The handler, with the World it was built for (which declares how its
+  // deliveries are authenticated) and the refusal log (process-wide; see
+  // `createQueueAuthRefusalLogger`).
+  let cachedRoute:
+    | {
+        handler: (req: Request) => Promise<Response>;
+        world: World;
+        logQueueAuthRefusal: () => void;
+      }
+    | undefined;
+  let invocationCount = 0;
+  const entrypointCreatedAt = Date.now();
+  const routeModuleBodyInitMs =
+    typeof options?.routeModuleBodyStartedAt === 'number'
+      ? entrypointCreatedAt - options.routeModuleBodyStartedAt
+      : undefined;
+
+  return withHealthCheck(async (req) => {
+    invocationCount += 1;
+    const handlerCached = cachedRoute !== undefined;
+    const spanKind = await getSpanKind('SERVER');
+
+    return trace(
+      'workflow.route.flow',
+      {
+        kind: spanKind,
+        attributes: {
+          ...Attribute.WorkflowRouteType('flow'),
+          ...Attribute.FaasInstance(getComputeInstanceId()),
+          ...Attribute.WorkflowRouteHandlerCached(handlerCached),
+          ...Attribute.WorkflowRouteInvocationCount(invocationCount),
+          ...Attribute.WorkflowRouteEntrypointAgeMs(
+            Date.now() - entrypointCreatedAt
+          ),
+          ...(routeModuleBodyInitMs === undefined
+            ? {}
+            : Attribute.WorkflowRouteModuleBodyInitMs(routeModuleBodyInitMs)),
+          ...Attribute.HttpRequestMethod(req.method),
+          ...Attribute.HttpRoute(flowRoute),
+        },
+      },
+      async (span) => {
+        if (!cachedRoute) {
+          cachedRoute = await trace('workflow.route.init', async () => {
+            // The full runtime World, not `getWorldHandlers()`. That accessor
+            // owns a second, build-time-safe cache, so calling it here built a
+            // second World in the same process: duplicate connection pools and
+            // queue workers for a stateful World, plus a second copy of that
+            // world package's modules once it is bundled, which is what
+            // silently demoted the events WebSocket transport to HTTP. #3665.
+            //
+            // The span keeps its original name. It is a distinct span from the
+            // per-request `workflow.route.get_world` at the top of the flow
+            // route, and renaming it would collide with that one.
+            const worldHandlers = await trace(
+              'workflow.route.get_world_handlers',
+              async () => getWorld()
+            );
+            logQueueAuthSetting(worldHandlers);
+            return {
+              handler: handler(worldHandlers),
+              world: worldHandlers,
+              logQueueAuthRefusal: createQueueAuthRefusalLogger(),
+            };
+          });
+        }
+
+        // Before the handler reads the body or touches any run: a request
+        // that does not carry the app's queue key is refused and dropped
+        // (see `authorizeQueueDelivery`). Covers every delivery
+        // to this route, health checks and invocations included.
+        const refusal = await authorizeQueueDelivery(cachedRoute.world, req);
+        if (refusal) {
+          cachedRoute.logQueueAuthRefusal();
+          // Counted, not awaited: the 401 does not wait on a meter. The route
+          // label is the route template, never the request's path: routers
+          // send `/flow/`, `/flow//` and the like to this same handler, so the
+          // path would let a forgery flood mint unbounded series.
+          void recordQueueDeliveryRefused({
+            world: resolveWorkflowTargetWorld(),
+            route: WORKFLOW_FLOW_ROUTE,
+            reason: refusal.reason,
+          });
+          span?.setAttributes(
+            Attribute.HttpResponseStatusCode(refusal.response.status)
+          );
+          return refusal.response;
+        }
+
+        const response = await cachedRoute.handler(req);
+        if (response instanceof Response) {
+          span?.setAttributes(
+            Attribute.HttpResponseStatusCode(response.status)
+          );
+        }
+        return response;
+      }
+    );
+  });
+}

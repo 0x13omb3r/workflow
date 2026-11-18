@@ -1,0 +1,829 @@
+#!/usr/bin/env node
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { dimensionFor } = require('./generate-e2e-flake-history.js');
+
+// Parse command line arguments
+const args = process.argv.slice(2);
+let resultsDir = '.';
+let jobName = 'E2E Tests';
+let mode = 'single'; // 'single' for step summary, 'aggregate' for PR comment
+let runUrl = '';
+
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--job-name' && args[i + 1]) {
+    jobName = args[i + 1];
+    i++;
+  } else if (args[i] === '--mode' && args[i + 1]) {
+    mode = args[i + 1];
+    i++;
+  } else if (args[i] === '--run-url' && args[i + 1]) {
+    runUrl = args[i + 1];
+    i++;
+  } else if (!args[i].startsWith('--')) {
+    resultsDir = args[i];
+  }
+}
+
+// Find JSON files by prefix pattern
+function findJsonFiles(dir, prefix, excludePrefixes = []) {
+  const files = [];
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...findJsonFiles(fullPath, prefix, excludePrefixes));
+      } else if (
+        entry.name.startsWith(prefix) &&
+        entry.name.endsWith('.json') &&
+        !excludePrefixes.some((ep) => entry.name.startsWith(ep))
+      ) {
+        files.push(fullPath);
+      }
+    }
+  } catch (_e) {
+    // Directory doesn't exist or can't be read
+  }
+  return files;
+}
+
+// Find all e2e result JSON files
+function findResultFiles(dir) {
+  return findJsonFiles(dir, 'e2e-', [
+    'e2e-metadata-',
+    'e2e-failures-',
+    'e2e-flaky-',
+    'e2e-infra-',
+    'e2e-diagnostics-',
+    'e2e-runtime-logs-',
+    // Not a report: the per-app cross-language conformance declaration
+    // (`workbench/*/e2e-conformance.json` and its `.example` sibling). The
+    // trailing dot matters — the Python lane's report is
+    // `e2e-conformance-python.json` and must keep matching.
+    'e2e-conformance.',
+  ]).filter((file) => !file.endsWith('.flaky.json'));
+}
+
+// Find all e2e metadata JSON files
+function findMetadataFiles(dir) {
+  const files = [];
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...findMetadataFiles(fullPath));
+      } else if (
+        entry.name.startsWith('e2e-metadata-') &&
+        entry.name.endsWith('.json')
+      ) {
+        files.push(fullPath);
+      }
+    }
+  } catch (_e) {
+    // Directory doesn't exist or can't be read
+  }
+  return files;
+}
+
+// Load metadata indexed by app name
+function loadMetadata(dir) {
+  const metadata = new Map(); // app -> { runIds, vercel }
+  const metadataFiles = findMetadataFiles(dir);
+
+  for (const file of metadataFiles) {
+    try {
+      const content = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      // Extract app name from filename: e2e-metadata-{app}-vercel.json
+      const basename = path.basename(file, '.json');
+      const match = basename.match(/^e2e-metadata-(.+)-vercel$/);
+      if (match && content.vercel) {
+        const appName = match[1];
+        metadata.set(appName, content);
+      }
+    } catch (_e) {
+      // Skip invalid metadata files
+    }
+  }
+
+  return metadata;
+}
+
+// Load diagnostics sidecar files (per-test run ID + dashboard URL mapping)
+function loadDiagnostics(dir) {
+  // Map of testName -> { runId, dashboardUrl, timestamp }
+  const diagnostics = new Map();
+  const files = findJsonFiles(dir, 'e2e-diagnostics-');
+
+  for (const file of files) {
+    try {
+      const entries = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      for (const entry of entries) {
+        if (entry.testName && entry.runId) {
+          diagnostics.set(entry.testName, entry);
+        }
+      }
+    } catch (_e) {
+      // Skip invalid files
+    }
+  }
+
+  return diagnostics;
+}
+
+// Load failure sidecar files (enriched per-test failure info from github-reporter)
+function loadFailures(dir) {
+  // Map of testName -> { runId, dashboardUrl, status, errorMessage }
+  const failures = new Map();
+  const files = findJsonFiles(dir, 'e2e-failures-');
+
+  for (const file of files) {
+    try {
+      const entries = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      for (const entry of entries) {
+        if (entry.testName) {
+          failures.set(entry.testName, entry);
+        }
+      }
+    } catch (_e) {
+      // Skip invalid files
+    }
+  }
+
+  return failures;
+}
+
+// Load flaky-test sidecar files (tests that passed only after a retry,
+// written by github-reporter). Grouped per app; the same test flaking in
+// several jobs for one app is collapsed into a single entry with an
+// occurrence count so the section stays scannable.
+function loadFlaky(dir) {
+  // New sidecars pair 1:1 with exact result files; keep reading legacy names
+  // while artifacts from older branches can still reach the aggregator.
+  const flaky = new Map();
+  const paired = findJsonFiles(dir, 'e2e-').filter((file) =>
+    file.endsWith('.flaky.json')
+  );
+  const legacy = findJsonFiles(dir, 'e2e-flaky-');
+
+  for (const file of [...paired, ...legacy]) {
+    const basename = path.basename(file);
+    const pairedReport = basename.replace(/\.flaky\.json$/, '.json');
+    const dimension = basename.endsWith('.flaky.json')
+      ? dimensionFor(pairedReport)
+      : null;
+    const legacyMatch = path
+      .basename(file, '.json')
+      .match(/^e2e-flaky-(.+)-(?:vercel|local)$/);
+    const app = dimension?.app || legacyMatch?.[1] || 'unknown';
+    const lane = dimension
+      ? [dimension.lane, dimension.world, dimension.vm, dimension.variant]
+          .filter(Boolean)
+          .join(' / ')
+      : null;
+    try {
+      const entries = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      for (const entry of entries) {
+        if (!entry.testName) continue;
+        const key = `${lane || app}\u0000${entry.fullName || entry.testName}`;
+        const existing = flaky.get(key);
+        if (existing) {
+          existing.occurrences++;
+          existing.retryCount = Math.max(
+            existing.retryCount,
+            entry.retryCount || 1
+          );
+        } else {
+          flaky.set(key, {
+            app,
+            lane,
+            testName: entry.testName,
+            retryCount: entry.retryCount || 1,
+            occurrences: 1,
+          });
+        }
+      }
+    } catch (_e) {
+      // Skip invalid files
+    }
+  }
+
+  return [...flaky.values()];
+}
+
+// Load infra-event sidecar files (platform anomalies the harness observed
+// and absorbed, e.g. runs the queue never picked up — written by the e2e
+// suites' pickup watchdog). Kept separate from flaky tests: a cluster of
+// infra events in one time window is backend signal, not test signal.
+function loadInfra(dir) {
+  const events = [];
+  const files = findJsonFiles(dir, 'e2e-infra-');
+
+  for (const file of files) {
+    const basename = path.basename(file, '.json');
+    const match = basename.match(/^e2e-infra-(.+)-(?:vercel|local)$/);
+    const app = match ? match[1] : 'unknown';
+    try {
+      const entries = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      for (const entry of entries) {
+        if (!entry.kind) continue;
+        events.push({ ...entry, app });
+      }
+    } catch (_e) {
+      // Skip invalid files
+    }
+  }
+
+  return events.sort((a, b) =>
+    (a.timestamp || '').localeCompare(b.timestamp || '')
+  );
+}
+
+// Render the infra-events section shared by the PR comment and the per-job
+// step summary. Several events inside one narrow time window across
+// different apps read as the platform blip they are, rather than as
+// unrelated flaky tests.
+function renderInfraSection(infraEvents) {
+  if (infraEvents.length === 0) return;
+
+  console.log('### \ud83d\udee0 Infra Events (absorbed by the harness)\n');
+  console.log(
+    '_Platform anomalies the e2e harness detected and worked around (e.g. a run the queue never picked up, replaced by a fresh run). Clustered timestamps indicate a backend blip; a steady drip indicates a platform issue worth escalating._\n'
+  );
+
+  const collapse = infraEvents.length >= 10;
+  if (collapse) {
+    console.log('<details>');
+    console.log(`<summary>${infraEvents.length} infra events</summary>\n`);
+  }
+  for (const event of infraEvents) {
+    const time = (event.timestamp || '').slice(11, 19);
+    const parts = [
+      `\`${event.kind}\``,
+      `${event.testName} (${event.app})`,
+      time ? `at ${time}Z` : null,
+      event.runId ? `abandoned \`${event.runId}\`` : null,
+      // cold-start-warmup events carry every stalled probe; the first is
+      // rendered as the abandoned run, the rest as a count.
+      Array.isArray(event.stalledProbeRunIds) &&
+      event.stalledProbeRunIds.length > 1
+        ? `(+${event.stalledProbeRunIds.length - 1} more)`
+        : null,
+    ].filter(Boolean);
+    console.log(`- ${parts.join(' · ')}`);
+  }
+  console.log('');
+  if (collapse) {
+    console.log('</details>\n');
+  }
+}
+
+// Render the flaky-tests section shared by the PR comment and the per-job
+// step summary. Retried-to-green tests would otherwise be invisible — the
+// job is green — so this is the only place a recurring race stays visible.
+function renderFlakySection(flakyTests) {
+  if (flakyTests.length === 0) return;
+
+  console.log('### ⚠️ Flaky E2E Tests (passed on retry)\n');
+  console.log(
+    '_These tests failed at least once and passed on a retry. A recurring entry here is a real race worth investigating._\n'
+  );
+
+  const sorted = [...flakyTests].sort(
+    (a, b) =>
+      b.occurrences - a.occurrences || a.testName.localeCompare(b.testName)
+  );
+  const collapse = sorted.length >= 10;
+  if (collapse) {
+    console.log('<details>');
+    console.log(`<summary>${sorted.length} flaky tests</summary>\n`);
+  }
+  for (const test of sorted) {
+    const jobs =
+      test.occurrences > 1 ? ` — flaked in ${test.occurrences} jobs` : '';
+    const location = test.lane ? `${test.app} · ${test.lane}` : test.app;
+    console.log(`- \`${test.testName}\` (${location})${jobs}`);
+  }
+  console.log('');
+  if (collapse) {
+    console.log('</details>\n');
+  }
+}
+
+// vitest's JSON reporter serializes only error stacks. For test timeouts the
+// stack is the task-collection stack ("Error: STACK_TRACE_ERROR ..."), which
+// carries no information about the failure. The github-reporter failures
+// sidecar carries the real error message (e.g. "Test timed out in 60000ms"),
+// so prefer it whenever the vitest message is useless.
+function enrichFailedTestMessages(failedTests, failures) {
+  for (const test of failedTests) {
+    const useless =
+      !test.message || test.message.startsWith('Error: STACK_TRACE_ERROR');
+    if (!useless) continue;
+
+    const sidecar =
+      failures.get(test.title) ||
+      failures.get(test.name) ||
+      failures.get((test.name || '').replace(/^e2e\s+/, ''));
+    if (sidecar?.errorMessage) {
+      test.message = sidecar.errorMessage.slice(0, 200);
+    } else if (!test.message) {
+      test.message = '(no error message serialized)';
+    } else {
+      test.message =
+        '(no error message serialized — likely a test timeout; see job log annotations)';
+    }
+  }
+}
+
+// Generate observability URL for a test
+function getObservabilityUrl(metadata, appName, testName) {
+  const appMetadata = metadata.get(appName);
+  if (!appMetadata || !appMetadata.vercel) return null;
+
+  const { vercel, runIds } = appMetadata;
+  if (!vercel.teamSlug || !vercel.projectSlug) return null;
+
+  // Find the runId for this test
+  const runInfo = runIds?.find((r) => r.testName === testName);
+  if (!runInfo) return null;
+
+  const env = vercel.environment === 'production' ? 'production' : 'preview';
+  return `https://vercel.com/${vercel.teamSlug}/${vercel.projectSlug}/workflows/runs/${runInfo.runId}?environment=${env}`;
+}
+
+// Parse vitest JSON output
+function parseVitestResults(file) {
+  try {
+    const content = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    const results = {
+      file: path.basename(file),
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+      duration: 0,
+      failedTests: [],
+    };
+
+    // Handle vitest JSON reporter format
+    if (content.testResults) {
+      for (const testFile of content.testResults) {
+        results.duration += testFile.duration || 0;
+        for (const assertionResult of testFile.assertionResults || []) {
+          if (assertionResult.status === 'passed') {
+            results.passed++;
+          } else if (assertionResult.status === 'failed') {
+            results.failed++;
+            results.failedTests.push({
+              name: assertionResult.fullName || assertionResult.title,
+              title: assertionResult.title,
+              file: testFile.name,
+              message:
+                assertionResult.failureMessages?.join('\n').slice(0, 200) || '',
+            });
+          } else if (assertionResult.status === 'skipped') {
+            results.skipped++;
+          }
+        }
+      }
+    }
+
+    return results;
+  } catch (e) {
+    console.error(`Warning: Could not parse ${file}: ${e.message}`);
+    return null;
+  }
+}
+
+// Parse job info from filename (e.g., e2e-local-dev-nextjs-turbopack.json)
+function parseJobInfo(filename) {
+  // Pattern: e2e-{category}-{app}.json or e2e-{category}-{subcategory}-{app}.json
+  const base = path.basename(filename, '.json');
+  const parts = base.split('-');
+
+  if (parts.length >= 3) {
+    // e2e-vercel-prod-nextjs-turbopack -> category: vercel-prod, app: nextjs-turbopack
+    // e2e-local-dev-nextjs-turbopack -> category: local-dev, app: nextjs-turbopack
+    // e2e-community-turso -> category: community, app: turso
+    const categoryEndIndex = parts.findIndex(
+      (p, i) =>
+        i > 1 &&
+        [
+          'nextjs',
+          'nitro',
+          'vite',
+          'nuxt',
+          'sveltekit',
+          'hono',
+          'express',
+          'fastify',
+          'astro',
+          'example',
+          'turso',
+          'mongodb',
+          'redis',
+          'starter',
+          'python',
+          'nest',
+          'tanstack',
+        ].some((app) => p.startsWith(app))
+    );
+
+    if (categoryEndIndex > 1) {
+      return {
+        category: parts.slice(1, categoryEndIndex).join('-'),
+        app: parts.slice(categoryEndIndex).join('-'),
+      };
+    }
+  }
+
+  return {
+    category: 'other',
+    app: base,
+  };
+}
+
+// Aggregate all results
+function aggregateResults(files) {
+  const summary = {
+    totalPassed: 0,
+    totalFailed: 0,
+    totalSkipped: 0,
+    totalDuration: 0,
+    fileResults: [],
+    allFailedTests: [],
+  };
+
+  for (const file of files) {
+    const results = parseVitestResults(file);
+    if (results) {
+      summary.totalPassed += results.passed;
+      summary.totalFailed += results.failed;
+      summary.totalSkipped += results.skipped;
+      summary.totalDuration += results.duration;
+      summary.fileResults.push(results);
+      summary.allFailedTests.push(...results.failedTests);
+    }
+  }
+
+  return summary;
+}
+
+// Aggregate results grouped by job category
+function aggregateByCategory(files) {
+  const categories = new Map();
+  const overallSummary = {
+    totalPassed: 0,
+    totalFailed: 0,
+    totalSkipped: 0,
+    allFailedTests: [],
+  };
+
+  for (const file of files) {
+    const { category, app } = parseJobInfo(file);
+    const results = parseVitestResults(file);
+
+    if (!results) continue;
+
+    if (!categories.has(category)) {
+      categories.set(category, {
+        name: category,
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        apps: [],
+        failedTests: [],
+      });
+    }
+
+    const cat = categories.get(category);
+    cat.passed += results.passed;
+    cat.failed += results.failed;
+    cat.skipped += results.skipped;
+    cat.apps.push({
+      name: app,
+      passed: results.passed,
+      failed: results.failed,
+      skipped: results.skipped,
+    });
+    cat.failedTests.push(
+      ...results.failedTests.map((t) => ({ ...t, app, category }))
+    );
+
+    overallSummary.totalPassed += results.passed;
+    overallSummary.totalFailed += results.failed;
+    overallSummary.totalSkipped += results.skipped;
+    overallSummary.allFailedTests.push(
+      ...results.failedTests.map((t) => ({ ...t, app, category }))
+    );
+  }
+
+  return { categories, overallSummary };
+}
+
+// Render markdown summary for single job (step summary)
+function renderSingleJobSummary(summary, flakyTests = [], infraEvents = []) {
+  const total =
+    summary.totalPassed + summary.totalFailed + summary.totalSkipped;
+  const statusEmoji = summary.totalFailed > 0 ? '❌' : '✅';
+  const statusText =
+    summary.totalFailed > 0 ? 'Some tests failed' : 'All tests passed';
+
+  console.log(`## ${statusEmoji} ${jobName}\n`);
+  console.log(`**Status:** ${statusText}\n`);
+
+  // Summary table
+  console.log('| Metric | Count |');
+  console.log('|:-------|------:|');
+  console.log(`| ✅ Passed | ${summary.totalPassed} |`);
+  console.log(`| ❌ Failed | ${summary.totalFailed} |`);
+  console.log(`| ⏭️ Skipped | ${summary.totalSkipped} |`);
+  console.log(`| **Total** | **${total}** |`);
+  console.log('');
+
+  // Duration
+  const durationSec = (summary.totalDuration / 1000).toFixed(2);
+  console.log(`_Duration: ${durationSec}s_\n`);
+
+  // Failed tests details
+  if (summary.allFailedTests.length > 0) {
+    console.log('### Failed Tests\n');
+    for (const test of summary.allFailedTests) {
+      console.log(`<details>`);
+      console.log(`<summary>❌ ${test.name}</summary>\n`);
+      console.log(`**File:** \`${test.file}\`\n`);
+      if (test.message) {
+        console.log('```');
+        console.log(test.message);
+        console.log('```');
+      }
+      console.log('</details>\n');
+    }
+  }
+
+  renderFlakySection(flakyTests);
+  renderInfraSection(infraEvents);
+
+  // Results by file
+  if (summary.fileResults.length > 1) {
+    console.log('<details>');
+    console.log('<summary>Results by File</summary>\n');
+    console.log('| File | Passed | Failed | Skipped |');
+    console.log('|:-----|-------:|-------:|--------:|');
+    for (const result of summary.fileResults) {
+      const fileStatus = result.failed > 0 ? '❌' : '✅';
+      console.log(
+        `| ${fileStatus} ${result.file} | ${result.passed} | ${result.failed} | ${result.skipped} |`
+      );
+    }
+    console.log('</details>');
+  }
+}
+
+// Category display names
+const categoryNames = {
+  'vercel-prod': '▲ Vercel Production',
+  'local-dev': '💻 Local Development',
+  'local-prod': '📦 Local Production',
+  'local-postgres': '🐘 Local Postgres',
+  windows: '🪟 Windows',
+  conformance: '🌐 Cross-language Conformance',
+  community: '🌍 Community Worlds',
+  other: '📋 Other',
+};
+
+// Category order for display
+const categoryOrder = [
+  'vercel-prod',
+  'local-dev',
+  'local-prod',
+  'local-postgres',
+  'windows',
+  'conformance',
+  'community',
+  'other',
+];
+
+// In the "Failed E2E Tests" section, a category with fewer than this many
+// failed tests is listed inline under a heading; at or above it, the list is
+// tucked into a <details> to keep the top of the comment scannable.
+const FAILED_INLINE_THRESHOLD = 10;
+
+// Render aggregated PR comment summary
+function renderAggregatedSummary(
+  categories,
+  overallSummary,
+  metadata,
+  diagnostics,
+  failures,
+  flakyTests,
+  infraEvents
+) {
+  const total =
+    overallSummary.totalPassed +
+    overallSummary.totalFailed +
+    overallSummary.totalSkipped;
+  const statusEmoji = overallSummary.totalFailed > 0 ? '❌' : '✅';
+  const statusText =
+    overallSummary.totalFailed > 0 ? 'Some tests failed' : 'All tests passed';
+
+  console.log('<!-- e2e-test-results -->');
+  console.log(`## 🧪 E2E Test Results\n`);
+  console.log(`${statusEmoji} **${statusText}**\n`);
+
+  // Sort categories by defined order (shared by every section below)
+  const sortedCategories = Array.from(categories.entries()).sort(
+    ([a], [b]) =>
+      (categoryOrder.indexOf(a) === -1 ? 999 : categoryOrder.indexOf(a)) -
+      (categoryOrder.indexOf(b) === -1 ? 999 : categoryOrder.indexOf(b))
+  );
+
+  // Renders the failed tests of one category, grouped by app. Callers wrap this
+  // in either a heading (few failures) or a <details> (many).
+  const renderFailedCategoryTests = (catName, appsMap) => {
+    for (const [appName, tests] of appsMap.entries()) {
+      console.log(`**${appName}** (${tests.length} failed):\n`);
+      for (const test of tests) {
+        // Extract just the test name without "e2e " prefix if present
+        const testName = test.name.replace(/^e2e\s+/, '');
+
+        // Look up enriched diagnostics for this test.
+        // Only show observability links for vercel-prod tests — other
+        // categories (local, community) don't run on Vercel's world
+        // backend so there's no dashboard to link to.
+        const isVercelProd = catName === 'vercel-prod';
+        const diag = diagnostics.get(test.name) || diagnostics.get(testName);
+        const failureInfo = failures.get(testName) || failures.get(test.name);
+        const obsUrl = isVercelProd
+          ? getObservabilityUrl(metadata, appName, test.name)
+          : null;
+        const dashboardUrl = isVercelProd
+          ? diag?.dashboardUrl || failureInfo?.dashboardUrl || obsUrl
+          : null;
+        const runId = diag?.runId || failureInfo?.runId;
+        const runStatus = failureInfo?.status;
+
+        // Build the line with available info
+        const links = [];
+        if (dashboardUrl) links.push(`[🔍 observability](${dashboardUrl})`);
+
+        if (links.length > 0 || runId) {
+          const parts = [`\`${testName}\``];
+          if (runId) parts.push(`\`${runId}\``);
+          if (runStatus) parts.push(`status: \`${runStatus}\``);
+          if (links.length > 0) parts.push(links.join(' '));
+          console.log(`- ${parts.join(' | ')}`);
+        } else {
+          console.log(`- \`${testName}\``);
+        }
+      }
+      console.log('');
+    }
+  };
+
+  // Failed tests first (hidden entirely when everything passed), grouped by
+  // category and app. A category with fewer than FAILED_INLINE_THRESHOLD
+  // failures is listed inline under a heading; larger ones collapse into a
+  // <details> so the top of the comment stays scannable.
+  if (overallSummary.allFailedTests.length > 0) {
+    console.log('### ❌ Failed E2E Tests\n');
+
+    const failedByCategory = new Map();
+    for (const test of overallSummary.allFailedTests) {
+      if (!failedByCategory.has(test.category)) {
+        failedByCategory.set(test.category, new Map());
+      }
+      const catMap = failedByCategory.get(test.category);
+      if (!catMap.has(test.app)) {
+        catMap.set(test.app, []);
+      }
+      catMap.get(test.app).push(test);
+    }
+
+    const sortedFailedCategories = Array.from(failedByCategory.entries()).sort(
+      ([a], [b]) =>
+        (categoryOrder.indexOf(a) === -1 ? 999 : categoryOrder.indexOf(a)) -
+        (categoryOrder.indexOf(b) === -1 ? 999 : categoryOrder.indexOf(b))
+    );
+
+    for (const [catName, appsMap] of sortedFailedCategories) {
+      const catDisplay = categoryNames[catName] || catName;
+      const catFailedCount = Array.from(appsMap.values()).reduce(
+        (sum, tests) => sum + tests.length,
+        0
+      );
+
+      if (catFailedCount >= FAILED_INLINE_THRESHOLD) {
+        console.log('<details>');
+        console.log(
+          `<summary>${catDisplay} (${catFailedCount} failed)</summary>\n`
+        );
+        renderFailedCategoryTests(catName, appsMap);
+        console.log('</details>\n');
+      } else {
+        console.log(`#### ${catDisplay} (${catFailedCount} failed)\n`);
+        renderFailedCategoryTests(catName, appsMap);
+      }
+    }
+  }
+
+  renderFlakySection(flakyTests);
+  renderInfraSection(infraEvents);
+
+  // Everything else lives under one collapsible summary section.
+  console.log('### E2E Test Summary\n');
+
+  // Overall summary table (expandable)
+  console.log('<details>');
+  console.log('<summary>Summary</summary>\n');
+  console.log('| | Passed | Failed | Skipped | Total |');
+  console.log('|:--|------:|-------:|--------:|------:|');
+  for (const [catName, cat] of sortedCategories) {
+    const catTotal = cat.passed + cat.failed + cat.skipped;
+    const catStatus = cat.failed > 0 ? '❌' : '✅';
+    const displayName = categoryNames[catName] || catName;
+    console.log(
+      `| ${catStatus} ${displayName} | ${cat.passed} | ${cat.failed} | ${cat.skipped} | ${catTotal} |`
+    );
+  }
+  console.log(
+    `| **Total** | **${overallSummary.totalPassed}** | **${overallSummary.totalFailed}** | **${overallSummary.totalSkipped}** | **${total}** |`
+  );
+  console.log('</details>\n');
+
+  // Per-app breakdown (expandable) — one flat list, no nested collapsibles.
+  console.log('<details>');
+  console.log('<summary>Details by Category</summary>\n');
+  for (const [catName, cat] of sortedCategories) {
+    const catStatus = cat.failed > 0 ? '❌' : '✅';
+    const displayName = categoryNames[catName] || catName;
+    console.log(`**${catStatus} ${displayName}**\n`);
+    console.log('| App | Passed | Failed | Skipped |');
+    console.log('|:----|-------:|-------:|--------:|');
+    for (const app of cat.apps) {
+      const appStatus = app.failed > 0 ? '❌' : '✅';
+      console.log(
+        `| ${appStatus} ${app.name} | ${app.passed} | ${app.failed} | ${app.skipped} |`
+      );
+    }
+    console.log('');
+  }
+  console.log('</details>\n');
+
+  // Add link to workflow run
+  if (runUrl) {
+    console.log('---');
+    console.log(`📋 [View full workflow run](${runUrl})`);
+  }
+}
+
+// Main
+const resultFiles = findResultFiles(resultsDir);
+
+if (resultFiles.length === 0) {
+  // No results found, output a simple message
+  if (mode === 'aggregate') {
+    console.log('<!-- e2e-test-results -->');
+    console.log('## 🧪 E2E Test Results\n');
+    console.log('_No test result files found._\n');
+  } else {
+    console.log(`## ${jobName}\n`);
+    console.log('_No test result files found._\n');
+  }
+  process.exit(0);
+}
+
+if (mode === 'aggregate') {
+  const { categories, overallSummary } = aggregateByCategory(resultFiles);
+  const metadata = loadMetadata(resultsDir);
+  const diagnostics = loadDiagnostics(resultsDir);
+  const failures = loadFailures(resultsDir);
+  const flakyTests = loadFlaky(resultsDir);
+  const infraEvents = loadInfra(resultsDir);
+  enrichFailedTestMessages(overallSummary.allFailedTests, failures);
+  renderAggregatedSummary(
+    categories,
+    overallSummary,
+    metadata,
+    diagnostics,
+    failures,
+    flakyTests,
+    infraEvents
+  );
+
+  // Exit with non-zero if any tests failed
+  if (overallSummary.totalFailed > 0) {
+    process.exit(1);
+  }
+} else {
+  const summary = aggregateResults(resultFiles);
+  enrichFailedTestMessages(summary.allFailedTests, loadFailures(resultsDir));
+  renderSingleJobSummary(summary, loadFlaky(resultsDir), loadInfra(resultsDir));
+
+  // Exit with non-zero if any tests failed
+  if (summary.totalFailed > 0) {
+    process.exit(1);
+  }
+}

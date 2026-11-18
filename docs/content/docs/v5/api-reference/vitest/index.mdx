@@ -1,0 +1,230 @@
+---
+title: "@workflow/vitest"
+description: Vitest plugin and test helpers for integration testing workflows in-process.
+---
+
+The `@workflow/vitest` package provides a Vitest plugin and test helpers for running full workflow integration tests in-process, no server required.
+
+## Installation
+
+```package-install
+npm i -D @workflow/vitest
+```
+
+<Callout type="warn">
+The package carries its own copy of `@workflow/core` and runs your workflows against it, so it has to move with `workflow` and stay on the same major.
+
+`globalSetup` compares the two copies once per run: a different major fails the run with the install command that fixes it, and any other difference logs a warning. Set [`WORKFLOW_VITEST_VERSION_CHECK=off`](/docs/configuration/build-and-diagnostics#workflow_vitest_version_check) to skip the check.
+</Callout>
+
+## Plugin
+
+### `workflow()`
+
+Returns a Vite plugin array that handles SWC transforms, bundle building, and in-process handler registration automatically.
+
+
+```typescript
+import { defineConfig } from "vitest/config";
+import { workflow } from "@workflow/vitest"; // [!code highlight]
+
+export default defineConfig({
+  plugins: [workflow()], // [!code highlight]
+});
+```
+
+Pass a [`WorkflowTestOptions`](#workflowtestoptions) object when your project uses a non-standard layout, for example, a monorepo where `workflows/` does not live at the Vitest config's directory, or when the default `.workflow-data` / `.workflow-vitest` output locations need to move. The plugin forwards these paths to `buildWorkflowTests()` and `setupWorkflowTests()` through Vitest's per-project provided context, so each Vitest workspace project stays isolated.
+
+
+```typescript
+import { defineConfig } from "vitest/config";
+import { workflow } from "@workflow/vitest";
+
+export default defineConfig({
+  plugins: [
+    workflow({
+      cwd: "./apps/api",
+      rootDir: "./apps/api/test-artifacts",
+    }),
+  ],
+});
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `options?` | `WorkflowTestOptions` | Optional configuration |
+
+**Returns:** `Plugin[]`
+
+## Setup functions
+
+### `buildWorkflowTests()`
+
+Builds workflow and step bundles to disk. Called automatically by the `workflow()` plugin in `globalSetup`. Use directly only for [manual setup](/docs/testing#manual-setup).
+
+
+```typescript
+import { buildWorkflowTests } from "@workflow/vitest";
+
+export async function setup() {
+  await buildWorkflowTests();
+}
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `options?` | `WorkflowTestOptions` | Optional configuration |
+
+### `setupWorkflowTests()`
+
+Sets up an in-process workflow runtime in each test worker. Imports pre-built bundles, creates a [Local World](/worlds/local) instance with direct handlers, and sets it as the global world. Clears all workflow data on each invocation for full test isolation.
+
+Called automatically by the `workflow()` plugin in `setupFiles`. Use directly only for [manual setup](/docs/testing#manual-setup).
+
+
+```typescript
+import { beforeAll, afterAll } from "vitest";
+import { setupWorkflowTests, teardownWorkflowTests } from "@workflow/vitest";
+
+beforeAll(async () => {
+  await setupWorkflowTests();
+});
+
+afterAll(async () => {
+  await teardownWorkflowTests();
+});
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `options?` | `WorkflowTestOptions` | Optional configuration |
+
+### `teardownWorkflowTests()`
+
+Tears down the workflow test world. Clears the global world and closes the Local World instance. Called automatically by the `workflow()` plugin.
+
+**Returns:** `Promise<void>`
+
+### `WorkflowTestOptions`
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cwd` | `string` | `process.cwd()` | The working directory of the project (where `workflows/` lives). Relative paths resolve against `process.cwd()`. |
+| `rootDir` | `string` | same as `cwd` | Root directory used for default test artifacts. When set, `dataDir` and `outDir` default to `<rootDir>/.workflow-data` and `<rootDir>/.workflow-vitest`. Relative paths resolve against `cwd`. |
+| `dataDir` | `string` | `<rootDir>/.workflow-data` | Directory for workflow runtime data written by the test world. Relative paths resolve against `cwd`. |
+| `outDir` | `string` | `<rootDir>/.workflow-vitest` | Directory for generated workflow and step bundles. Relative paths resolve against `cwd`. |
+
+## Workflow references
+
+The test build writes the same `manifest.json` the other Workflow builders write into `outDir`. These helpers read it, so a test can name a workflow instead of hand-writing the generated `workflow//...` id. Importing the workflow function is still preferable when a test can do it, because it keeps the argument and return types.
+
+### `getWorkflowRef()`
+
+Looks up one workflow in the test build and returns it in the shape [`start()`](/docs/api-reference/workflow-api/start) accepts.
+
+```typescript
+import { getWorkflowRef } from "@workflow/vitest"; // [!code highlight]
+import { start } from "workflow/api";
+
+const run = await start(getWorkflowRef("approvalWorkflow"), ["doc-1"]); // [!code highlight]
+```
+
+`query` is an exported workflow name, or a file-qualified name when the same name appears in more than one file: `getWorkflowRef("workflows/approval.ts#approvalWorkflow")`. The file part also matches by path suffix, so `"approval.ts#approvalWorkflow"` resolves the same entry.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `query` | `string` | Workflow name, or `<file>#<name>` |
+
+**Returns:** [`WorkflowRef`](#workflowref).
+
+**Throws** when the manifest is missing (the plugin or `buildWorkflowTests()` has not run), when nothing matches, or when the name is ambiguous. The message lists the workflows the build contains.
+
+### `listWorkflowRefs()`
+
+Returns every workflow in the test build, sorted by file and then name.
+
+```typescript
+import { listWorkflowRefs } from "@workflow/vitest"; // [!code highlight]
+
+const names = listWorkflowRefs().map((ref) => ref.name); // [!code highlight]
+```
+
+**Returns:** [`WorkflowRef`](#workflowref)`[]`.
+
+### `WorkflowRef`
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `name` | `string` | Exported name of the workflow function |
+| `file` | `string` | Project-relative path of the file it was compiled from |
+| `workflowId` | `string` | Generated workflow id, the field `start()` reads |
+
+## Test helpers
+
+### `waitForSleep()`
+
+Polls the event log until the workflow has a pending `sleep()` call, one with a `wait_created` event but no corresponding `wait_completed` event. Returns the correlation ID of the pending sleep, which can be passed to [`wakeUp()`](/docs/api-reference/workflow-api/get-run) to target a specific sleep.
+
+
+```typescript
+import { waitForSleep } from "@workflow/vitest"; // [!code highlight]
+import { start, getRun } from "workflow/api";
+
+const run = await start(myWorkflow, []);
+const sleepId = await waitForSleep(run); // [!code highlight]
+await getRun(run.runId).wakeUp({ correlationIds: [sleepId] }); // [!code highlight]
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `run` | `Run<any>` | The workflow run to monitor |
+| `options?` | `WaitOptions` | Polling and timeout configuration |
+
+**Returns:** `Promise<string>`, the correlation ID of the first pending sleep. Pass this to `wakeUp({ correlationIds: [id] })` to target a specific sleep.
+
+#### Behavior with multiple sleeps
+
+- **Sequential sleeps**: `waitForSleep()` returns each sleep as the workflow reaches it. After waking one, call `waitForSleep()` again for the next.
+- **Parallel sleeps**: `waitForSleep()` returns whichever pending sleep is found first. After waking it, call `waitForSleep()` again to get the next one.
+
+### `waitForHook()`
+
+Polls the hook list and event log until a hook matching the optional `token` filter exists that hasn't been received yet. Returns the matching hook object.
+
+
+```typescript
+import { waitForHook } from "@workflow/vitest"; // [!code highlight]
+import { start, resumeHook } from "workflow/api";
+
+const run = await start(myWorkflow, ["doc-1"]);
+const hook = await waitForHook(run, { token: "approval:doc-1" }); // [!code highlight]
+await resumeHook(hook.token, { approved: true }); // [!code highlight]
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `run` | `Run<any>` | The workflow run to monitor |
+| `options?` | `WaitOptions & { token?: string }` | Polling, timeout, and optional token filter |
+
+**Returns:** `Promise<Hook>`, the first pending hook matching the filter. The hook object includes `token`, `hookId`, and `runId`.
+
+### `WaitOptions`
+
+Both `waitForSleep()` and `waitForHook()` accept options for controlling polling behavior:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `timeout` | `number` | `30000` | Maximum time to wait in milliseconds |
+| `pollInterval` | `number` | `100` | Polling interval in milliseconds |

@@ -1,0 +1,19 @@
+{
+  "pages": [
+    "---",
+    "whats-new",
+    "getting-started",
+    "foundations",
+    "how-it-works",
+    "advanced",
+    "observability",
+    "performance",
+    "ai",
+    "testing",
+    "deploying",
+    "errors",
+    "comparisons",
+    "configuration",
+    "api-reference"
+  ]
+}

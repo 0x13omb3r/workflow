@@ -1,0 +1,282 @@
+import { execSync } from 'node:child_process';
+import { PostgreSqlContainer } from '@testcontainers/postgresql';
+import { RunExpiredError, WorkflowRunNotFoundError } from '@workflow/errors';
+import type { WorkflowRun } from '@workflow/world';
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  test,
+  vi,
+} from 'vitest';
+import { createClient } from '../src/drizzle/index.js';
+import {
+  createRunStatusListener,
+  type RunStatusListener,
+} from '../src/run-status.js';
+import { createEventsStorage, createRunsStorage } from '../src/storage.js';
+import { TestPool } from './pool.js';
+
+// The backstop re-read interval, overridden per test so a wait that resolves
+// quickly can only have been woken by the notification.
+const backstop = vi.hoisted(() => ({ ms: 10_000 }));
+vi.mock('../src/run-status.js', async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import('../src/run-status.js')>();
+  return {
+    ...original,
+    get RUN_STATUS_POLL_INTERVAL_MS() {
+      return backstop.ms;
+    },
+  };
+});
+
+/**
+ * `runs.waitForTerminalStatus` on world-postgres.
+ *
+ * The point of these tests is to pin down that the wait is driven by the
+ * run-terminal `NOTIFY` and not by its backstop re-read: the backstop is
+ * dialed up to 10s here, so a wait that resolves in milliseconds can only have
+ * been woken by the notification.
+ */
+describe('runs.waitForTerminalStatus (Postgres integration)', () => {
+  if (process.platform === 'win32') {
+    test.skip('skipped on Windows since it relies on a docker container', () => {});
+    return;
+  }
+
+  let container: Awaited<ReturnType<PostgreSqlContainer['start']>>;
+  let pool: TestPool;
+  let drizzle: ReturnType<typeof createClient>;
+  let listener: RunStatusListener;
+  let runs: ReturnType<typeof createRunsStorage>;
+  let events: ReturnType<typeof createEventsStorage>;
+
+  beforeAll(async () => {
+    container = await new PostgreSqlContainer('postgres:15-alpine').start();
+    const dbUrl = container.getConnectionUri();
+    process.env.DATABASE_URL = dbUrl;
+    process.env.WORKFLOW_POSTGRES_URL = dbUrl;
+
+    execSync('pnpm db:push', {
+      stdio: 'inherit',
+      cwd: process.cwd(),
+      env: process.env,
+    });
+
+    // >1 connection: the wait holds a read while the completing writer needs
+    // its own, and the LISTEN client is separate from the pool entirely.
+    pool = new TestPool({ connectionString: dbUrl, max: 4 });
+    drizzle = createClient(pool);
+    listener = createRunStatusListener(pool);
+    runs = createRunsStorage(drizzle, listener);
+    events = createEventsStorage(drizzle);
+  }, 120_000);
+
+  beforeEach(async () => {
+    // Only the NOTIFY can wake a wait this quickly.
+    backstop.ms = 10_000;
+    await pool.query(
+      'TRUNCATE TABLE workflow.workflow_events, workflow.workflow_event_slots, workflow.workflow_steps, workflow.workflow_hooks, workflow.workflow_runs RESTART IDENTITY CASCADE'
+    );
+  });
+
+  afterAll(async () => {
+    await listener?.close();
+    await pool?.end();
+    await container?.stop();
+  });
+
+  async function startRun(): Promise<WorkflowRun> {
+    const created = await events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'dpl_test',
+        workflowName: 'test-workflow',
+        input: new Uint8Array([1]),
+      },
+    } as never);
+    if (!created.run) throw new Error('Expected run to be created');
+    await events.create(created.run.runId, {
+      eventType: 'run_started',
+    } as never);
+    return created.run;
+  }
+
+  const finish = (
+    runId: string,
+    eventType: 'run_completed' | 'run_failed' | 'run_cancelled',
+    eventData?: Record<string, unknown>
+  ) => events.create(runId, { eventType, eventData } as never);
+
+  const waitForTerminalStatus = () => {
+    const wait = runs.waitForTerminalStatus;
+    if (!wait) throw new Error('world-postgres should implement the long poll');
+    return wait;
+  };
+
+  it('a run_started racing the run ending does not move it back to running', async () => {
+    const created = await events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'dpl_test',
+        workflowName: 'test-workflow',
+        input: new Uint8Array([1]),
+      },
+    } as never);
+    const runId = created.run!.runId;
+
+    // Another writer ends the run and holds its row lock, so the run_started
+    // passes validation against `pending` and then waits on the row.
+    const ender = await pool.connect();
+    try {
+      await ender.query('BEGIN');
+      await ender.query(
+        `UPDATE workflow.workflow_runs
+           SET status = 'cancelled', completed_at = now()
+         WHERE id = $1`,
+        [runId]
+      );
+      const started = events
+        .create(runId, { eventType: 'run_started' } as never)
+        .then(
+          () => 'started',
+          (error: unknown) => error
+        );
+      // Commit only once the run_started UPDATE is parked on the row lock.
+      // Committing earlier would let the validation read see the ended run,
+      // and that refusal passes without the guard under test.
+      const {
+        rows: [{ pid: enderPid }],
+      } = await ender.query('SELECT pg_backend_pid() AS pid');
+      await expect
+        .poll(async () => {
+          const { rows } = await pool.query(
+            `SELECT count(*)::int AS count FROM pg_stat_activity
+               WHERE pid <> $1 AND wait_event_type = 'Lock'
+               AND query ILIKE '%update%workflow_runs%'`,
+            [enderPid]
+          );
+          return rows[0].count;
+        })
+        .toBe(1);
+      await ender.query('COMMIT');
+
+      const outcome = await started;
+      expect(RunExpiredError.is(outcome)).toBe(true);
+    } finally {
+      ender.release();
+    }
+
+    const run = await runs.get(runId);
+    expect(run.status).toBe('cancelled');
+    const { data } = await events.list({ runId, resolveData: 'none' } as never);
+    expect(data.map((event) => event.eventType)).not.toContain('run_started');
+  });
+
+  it('returns an already-terminal run immediately', async () => {
+    const run = await startRun();
+    await finish(run.runId, 'run_completed', { output: new Uint8Array([2]) });
+
+    const startedAt = Date.now();
+    const waited = await waitForTerminalStatus()(run.runId, {
+      timeoutMs: 30_000,
+    });
+
+    expect(waited.status).toBe('completed');
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it('is woken by the run-terminal NOTIFY, not by its backstop', async () => {
+    const run = await startRun();
+
+    const pending = waitForTerminalStatus()(run.runId, { timeoutMs: 30_000 });
+    // Give the waiter time to park on the LISTEN, then finish the run.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const startedAt = Date.now();
+    await finish(run.runId, 'run_completed', { output: new Uint8Array([2]) });
+
+    const waited = await pending;
+
+    expect(waited.status).toBe('completed');
+    // The backstop re-read is 10s away, so anything close to instant proves
+    // the notification did the waking.
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+
+  it('wakes on a failed run too', async () => {
+    const run = await startRun();
+
+    const pending = waitForTerminalStatus()(run.runId, { timeoutMs: 30_000 });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await finish(run.runId, 'run_failed', {
+      error: new Uint8Array([3]),
+      errorCode: 'USER_ERROR',
+    });
+
+    const waited = await pending;
+    expect(waited.status).toBe('failed');
+  });
+
+  it('wakes on a cancelled run', async () => {
+    const run = await startRun();
+
+    const pending = waitForTerminalStatus()(run.runId, { timeoutMs: 30_000 });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await finish(run.runId, 'run_cancelled');
+
+    const waited = await pending;
+    expect(waited.status).toBe('cancelled');
+  });
+
+  it('returns the latest non-terminal snapshot when the budget expires', async () => {
+    const run = await startRun();
+
+    const startedAt = Date.now();
+    const waited = await waitForTerminalStatus()(run.runId, { timeoutMs: 200 });
+
+    expect(waited.status).toBe('running');
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(190);
+  });
+
+  it('falls back to the backstop re-read without a listener', async () => {
+    // A runs storage built without the shared LISTEN subscription (a direct
+    // caller, or a pool that cannot host one) must still resolve — just on its
+    // re-read interval instead of on the notification.
+    backstop.ms = 50;
+    const pollingRuns = createRunsStorage(drizzle);
+    const run = await startRun();
+
+    const wait = pollingRuns.waitForTerminalStatus;
+    if (!wait) throw new Error('expected a long-poll implementation');
+    const pending = wait(run.runId, { timeoutMs: 30_000 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await finish(run.runId, 'run_completed', { output: new Uint8Array([2]) });
+
+    expect((await pending).status).toBe('completed');
+  });
+
+  it('stops early when the caller aborts', async () => {
+    const run = await startRun();
+    const controller = new AbortController();
+
+    const pending = waitForTerminalStatus()(run.runId, {
+      timeoutMs: 30_000,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 100);
+
+    expect((await pending).status).toBe('running');
+  });
+
+  it('fails like get for an unknown run', async () => {
+    await expect(
+      waitForTerminalStatus()('wrun_01JB0000000000000000000000', {
+        timeoutMs: 30_000,
+      })
+    ).rejects.toBeInstanceOf(WorkflowRunNotFoundError);
+  });
+});

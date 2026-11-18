@@ -1,0 +1,95 @@
+import { Button } from '@vercel/geistdocs/components/button';
+import Image from 'next/image';
+import Link from 'next/link';
+import { examplesRepositoryUrl } from '@/geistdocs';
+import { cn } from '@/lib/utils';
+import Flight from './flight-v2.png';
+import FlightDark from './flight-v2-dark.png';
+import Storytime from './storytime-v2.png';
+import StorytimeDark from './storytime-v2-dark.png';
+import Vectr from './vectr-v2.png';
+import VectrDark from './vectr-v2-dark.png';
+
+const data = [
+  {
+    title: 'Story Generator Slack Bot',
+    description:
+      "A Slack bot that generates children's stories from collaborative input.",
+    image: Storytime,
+    imageDark: StorytimeDark,
+    link: 'https://vercel.com/guides/stateful-slack-bots-with-vercel-workflow',
+  },
+  {
+    title: 'Flight Booking App',
+    description:
+      'Use Workflow to make AI agents more reliable and production-ready.',
+    image: Flight,
+    imageDark: FlightDark,
+    link: 'https://github.com/vercel/workflow-examples/tree/main/flight-booking-app',
+  },
+  {
+    title: 'Natural Language Image Search',
+    description:
+      'A free, open-source template for building natural language image search.',
+    image: Vectr,
+    imageDark: VectrDark,
+    link: 'https://www.vectr.store',
+  },
+];
+
+export const Templates = () => (
+  <div className="grid grid-cols-12 gap-y-12 md:gap-x-8 py-8 sm:py-12">
+    <div className="col-span-12 md:col-span-5 grid gap-4 content-start">
+      <h2 className="text-heading-20 sm:text-heading-24 md:text-heading-32 lg:text-heading-40 lg:text-heading-40">
+        Get started
+      </h2>
+      <p className="text-lg text-gray-900 text-balance sm:max-w-md">
+        See Workflow SDK in action with one of the example templates.
+      </p>
+      <Button
+        Component={Link}
+        href={examplesRepositoryUrl}
+        size="large"
+        className="rounded-full h-10 px-6 w-fit mt-2"
+      >
+        All examples
+      </Button>
+    </div>
+    <div className="col-span-12 md:col-span-7 grid sm:grid-cols-2 gap-8">
+      {data.map((item) => (
+        <a
+          key={item.title}
+          href={item.link}
+          className="flex-col bg-background-100 group rounded-lg border p-4 overflow-hidden"
+        >
+          <h3 className="font-medium tracking-tight">{item.title}</h3>
+          <p className="text-gray-900 text-sm line-clamp-2">
+            {item.description}
+          </p>
+          <Image
+            src={item.image}
+            alt={item.title}
+            width={640}
+            height={336}
+            className={cn(
+              'border rounded-md overflow-hidden -rotate-3 ml-7 aspect-video object-cover object-top -mb-12 mt-8',
+              'group-hover:scale-105 transition-transform duration-300 group-hover:-rotate-1',
+              'dark:hidden'
+            )}
+          />
+          <Image
+            src={item.imageDark}
+            alt={item.title}
+            width={640}
+            height={336}
+            className={cn(
+              'border rounded-md overflow-hidden -rotate-3 ml-7 aspect-video object-cover object-top -mb-12 mt-8',
+              'group-hover:scale-105 transition-transform duration-300 group-hover:-rotate-1',
+              'hidden dark:block'
+            )}
+          />
+        </a>
+      ))}
+    </div>
+  </div>
+);

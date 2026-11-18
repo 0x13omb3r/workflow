@@ -1,0 +1,1324 @@
+import { createServer as createHttpServer } from 'node:http';
+import {
+  createSecureServer,
+  type Http2SecureServer,
+  constants as http2Constants,
+  type ServerHttp2Session,
+} from 'node:http2';
+import { type AddressInfo, connect, createServer, type Server } from 'node:net';
+import type { TLSSocket } from 'node:tls';
+import { NODE_HTTP_ENV_VAR } from '@workflow/world';
+import { Agent, type RetryAgent } from 'undici';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
+import {
+  _resetNodeHttpAgentsForTests,
+  createDispatcherRecycler,
+  createEventsDispatcher,
+  createQueueDispatcher,
+  createStreamDispatcher,
+  DEFAULT_AGENT_OPTIONS,
+  type DispatcherRecycler,
+  EVENTS_AGENT_OPTIONS,
+  EVENTS_AGENT_OPTIONS_NO_H2,
+  EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES,
+  EVENTS_REQUEST_TIMEOUT_MS,
+  getDispatcher,
+  getEventsDispatcher,
+  getNodeHttpAgents,
+  getQueueAgentOptions,
+  getQueueDispatcher,
+  getQueueRequestTimeoutMs,
+  getStreamCloseDispatcher,
+  getStreamDispatcher,
+  h2MultiplexInterceptor,
+  isRecyclableTransportError,
+  NODE_HTTP_BODY_TIMEOUT_MS,
+  NODE_HTTP_HEADERS_TIMEOUT_MS,
+  noteEventsTransportOutcome,
+  QUEUE_AGENT_CONNECTIONS,
+  QUEUE_AGENT_KEEP_ALIVE_TIMEOUT_MS,
+  QUEUE_REQUEST_TIMEOUT_MS,
+  STREAM_AGENT_OPTIONS,
+  STREAM_CLOSE_RETRY_OPTIONS,
+  STREAM_RETRY_OPTIONS,
+} from './http-client.js';
+import { WORKFLOW_SERVER_URL_OVERRIDE } from './utils.js';
+
+// Everything below this line asserts the undici wiring. `WORKFLOW_NODE_HTTP`
+// takes requests off undici entirely and makes every dispatcher getter return
+// `undefined`, so pin it off here rather than depending on whichever way its
+// default currently points. That mode has its own describe at the bottom of
+// the file.
+beforeEach(() => {
+  vi.stubEnv(NODE_HTTP_ENV_VAR, '0');
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+describe('getDispatcher', () => {
+  it('returns the shared default dispatcher when none is provided', () => {
+    expect(getDispatcher()).toBe(getDispatcher());
+    expect(getDispatcher({})).toBe(getDispatcher());
+  });
+
+  it('returns the caller-supplied dispatcher when provided', () => {
+    const custom = {};
+    expect(getDispatcher({ dispatcher: custom })).toBe(custom);
+  });
+});
+
+describe('getEventsDispatcher', () => {
+  it('returns its own shared dispatcher, distinct from the default', () => {
+    expect(getEventsDispatcher()).toBe(getEventsDispatcher());
+    expect(getEventsDispatcher()).not.toBe(getDispatcher());
+  });
+
+  it('returns the caller-supplied dispatcher when provided', () => {
+    const custom = {};
+    expect(getEventsDispatcher({ dispatcher: custom })).toBe(custom);
+  });
+});
+
+describe('getStreamDispatcher', () => {
+  it('returns its own shared dispatcher, distinct from default and events', () => {
+    expect(getStreamDispatcher()).toBe(getStreamDispatcher());
+    expect(getStreamDispatcher()).not.toBe(getDispatcher());
+    expect(getStreamDispatcher()).not.toBe(getEventsDispatcher());
+  });
+
+  it('returns the caller-supplied dispatcher when provided', () => {
+    const custom = {};
+    expect(getStreamDispatcher({ dispatcher: custom })).toBe(custom);
+  });
+
+  // Fresh fetch requests own append retries. This dispatcher must neither
+  // consume the 429 response nor resend a potentially persisted append.
+  it('disables dispatcher-level stream append retries', () => {
+    expect(STREAM_RETRY_OPTIONS.methods).toEqual(['PUT']);
+    expect(STREAM_RETRY_OPTIONS.maxRetries).toBe(0);
+    expect(STREAM_RETRY_OPTIONS.statusCodes).toEqual([]);
+    expect(STREAM_RETRY_OPTIONS.errorCodes).toEqual([]);
+  });
+
+  // Stream CLOSE is the one idempotent stream PUT: a duplicate close of a
+  // completed stream early-returns, and the server's close-barrier fence is
+  // an if_not_exists stamp a re-entered close resumes. The barrier protocol
+  // RELIES on close retrying 5xx: transient reconciliation failures (and
+  // unsafe close shapes awaiting in-flight backups) surface as retriable
+  // 503s with the stream left durably closing. Without 5xx here, that 503
+  // rejects writer.close() and the stream stays fenced until run expiry.
+  it('retries stream close on 5xx (idempotent, and the close barrier depends on it)', () => {
+    expect(STREAM_CLOSE_RETRY_OPTIONS.methods).toEqual(['PUT']);
+    for (const code of [429, 500, 502, 503, 504]) {
+      expect(STREAM_CLOSE_RETRY_OPTIONS.statusCodes).toContain(code);
+    }
+    expect(STREAM_CLOSE_RETRY_OPTIONS.retryAfter).toBe(true);
+  });
+
+  it('close uses its own shared dispatcher, distinct from the write dispatcher', () => {
+    expect(getStreamCloseDispatcher()).toBe(getStreamCloseDispatcher());
+    expect(getStreamCloseDispatcher()).not.toBe(getStreamDispatcher());
+    const custom = {};
+    expect(getStreamCloseDispatcher({ dispatcher: custom })).toBe(custom);
+  });
+});
+
+describe('agent transport', () => {
+  // Regression guards for the deliberate HTTP/2 scoping:
+  //   - the events API opts into H2 (the hot read/write path), while
+  //   - the default agent (queue webhook respondWith, v3, streaming) stays on
+  //     H1 because H2 deadlocks the webhook mechanism.
+  // Flipping either silently would regress one side or the other.
+  it('enables HTTP/2 for the events API only', () => {
+    expect(EVENTS_AGENT_OPTIONS.allowH2).toBe(true);
+    expect(STREAM_AGENT_OPTIONS.allowH2).toBe(true);
+    expect(DEFAULT_AGENT_OPTIONS.allowH2).toBe(false);
+  });
+
+  // WORKFLOW_H2_MULTIPLEX=0 is the operational escape hatch for an H2 transport
+  // fault, so it has to leave nothing of H2 behind: `allowH2: true` with the
+  // interceptor skipped still keeps a wedged session (see
+  // EVENTS_AGENT_OPTIONS_NO_H2).
+  // undici's 300s defaults outlast the runtime's 240s replay budget, so a
+  // silent stream would cost the whole delivery before it even failed.
+  it('arms events deadlines well inside the replay budget', () => {
+    const REPLAY_BUDGET_MS = 240_000;
+    for (const options of [EVENTS_AGENT_OPTIONS, EVENTS_AGENT_OPTIONS_NO_H2]) {
+      expect(options.headersTimeout).toBe(EVENTS_REQUEST_TIMEOUT_MS);
+      expect(options.bodyTimeout).toBe(EVENTS_REQUEST_TIMEOUT_MS);
+    }
+    expect(EVENTS_REQUEST_TIMEOUT_MS).toBeLessThan(REPLAY_BUDGET_MS / 2);
+  });
+
+  it('gives the kill switch an events agent with no HTTP/2 at all', () => {
+    expect(EVENTS_AGENT_OPTIONS_NO_H2.allowH2).toBe(false);
+    expect(EVENTS_AGENT_OPTIONS_NO_H2.pipelining).toBe(1);
+  });
+
+  // `allowH2` alone buys nothing: undici gates in-flight requests per
+  // connection on `pipelining`, so `pipelining: 1` reduces an H2 agent to H1
+  // behavior (one stream per connection). These two constants are the
+  // difference between multiplexing and not — see EVENTS_AGENT_OPTIONS.
+  it('gives the events agent a pipelining depth that permits multiplexing', () => {
+    expect(EVENTS_AGENT_OPTIONS.pipelining).toBeGreaterThan(1);
+  });
+
+  // Inverse guard: stream appends are not idempotent, so they must NOT
+  // multiplex — one connection-level failure would fail (and retry) several
+  // appends at once. See STREAM_AGENT_OPTIONS.
+  it('keeps stream writes and the H1 default at one request per connection', () => {
+    expect(STREAM_AGENT_OPTIONS.pipelining).toBe(1);
+    expect(DEFAULT_AGENT_OPTIONS.pipelining).toBe(1);
+  });
+
+  // Both receive windows have to clear undici's defaults (256 KiB stream,
+  // 512 KiB connection), and the connection window has to leave room for more
+  // than one stream's worth. Whichever is left at its default becomes the
+  // binding constraint by itself: a single read stalls on the stream window,
+  // concurrent reads stall on the shared connection window. See
+  // EVENTS_AGENT_OPTIONS.
+  it('raises both H2 receive windows on the events agent', () => {
+    // undici's own defaults, not HTTP/2's 65535 — see undici
+    // lib/dispatcher/client.js, kHTTP2InitialWindowSize / kHTTP2ConnectionWindowSize.
+    const UNDICI_DEFAULT_STREAM_WINDOW = 262_144;
+    const UNDICI_DEFAULT_CONNECTION_WINDOW = 524_288;
+
+    expect(EVENTS_AGENT_OPTIONS.initialWindowSize).toBeGreaterThan(
+      UNDICI_DEFAULT_STREAM_WINDOW
+    );
+    expect(EVENTS_AGENT_OPTIONS.connectionWindowSize).toBeGreaterThan(
+      UNDICI_DEFAULT_CONNECTION_WINDOW
+    );
+    expect(EVENTS_AGENT_OPTIONS.connectionWindowSize).toBeGreaterThan(
+      EVENTS_AGENT_OPTIONS.initialWindowSize
+    );
+  });
+});
+
+// Self-signed cert for localhost, valid 100 years. Generated with:
+//   openssl req -x509 -newkey rsa:2048 -nodes -days 36500 -subj /CN=localhost
+//     -addext subjectAltName=DNS:localhost,IP:127.0.0.1
+// It only ever terminates a loopback test server, so the private key is inert.
+const TEST_KEY = `-----BEGIN PRIVATE KEY-----
+MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQDH6QbH1JTD0vbo
+w4ND1gDSaHfx32D6mrXwK0RgaNP0PqyjBJWb2nTA+EN0hLq16DRahjLBIIGuOfhq
+YSoRdYbtUUpsV9Ywi7/oSxVIh+uNk0ASXqL9bGeUZZcdh5KkOMs5vZOj/MPIgYdn
+2kn2knvtR0qqpJiqkVueb3hoSdK8bUGKR+svdGyuFmquXd/iggYaPMiYZ/EhqSoE
+vTqpfCBlsDASGbsMED5LEqeyD332PkhNHnaoVofvZ96tTdk3YWe05rCfnlYSpwoi
+PNvsBbeFeU1CQw8fq0ktzkEKF+SzBS39OpjZC3NyRhVFXmBVRHyc3nd+PSDwmTkm
+g8OjmOIRAgMBAAECgf9LCgfaeXLMkDY0BiI/vYYFVMBdxvJSEfa1SzeassbMuggY
+2DlLAVR2eTuwbkJ/OQNVpAdpM7TzLUCmYmmAX4JpTH4EMpNvNGRQ21IcgVR+SWat
+/+WPlrhtxdTbTkEeO1EAHZT/wLviuuILan6ZppiYD4ZQd2g1VbO4KMwEVChCbCtX
+gu+5WAXKtn1kVd7mg9k58IP/SQBPZBzhI8uYCmjvRIVKPACq2ntRabBCu40w2Pt8
+5dIdFiU7FFGD7il4OHRmpopY67ZKsLjYvMbKKL6TXbev1zMgnglSt+4A5/JupGUs
+Z5wxeqR5HzoV/IXdDRRqXRyNpshdnRqvrqotZr0CgYEA+o0Gosh7nwIuRGiz9j9X
+m0/7Win5ozw6DgArr2joXWm/5SoVtwdSbuflaknfmolDrrlUj+lV/PPzIzkdUOC4
+o9Vd+ovTSdY87xWjZUphuALbCDQ6gy9P5B+04siP27udqXg+ZF7vOCXSsEaLp7ma
+B+YqE72xSQ79vD/UoGVQOm8CgYEAzEINa4d0pB2YQ2GqwVtb2gz49Lor7pB1MI2r
+Fn3WogQPhltrDLFj2FpYA+uYD9Mcr9jBkFEgU3RAyutaQARfftTSZRFxYLkHalM4
+ZxgC2FccPaaVe13m1ZR8nC9u0P1oAWg95W40+2epnVcCZePVF29qv4gqyljakMT0
+9CtY638CgYA8Mpn/jm+1Oo7nPMjQR1PDKypW9XLXN2czafMVB/2cRAYpBz2EZiv2
+HZ1PNkSVGpm6ZyjcEtHoHqyyL8zNW9DA/EjCI8o2GVU2lFpXwdFMptL9W58bWci2
+JLAPNOTrhF5TE2LaNrz/HodKdwii2cMaVsCRUahAx2tLSYLKrszh3QKBgQCgwvgH
+AtS1+qkFl5AqoPoZE466JvE+0am6rjXS/PX6DFIfwEHv+ooIFYsigsHq6pCwglxO
+dtuHc38vdq9QpWB31Y9GhsUCiH6im59P3OEYXu9WQo9ySoTM4xJ0ZwzEJj4+pUna
+ErRWjs87i+jSQtBLoqCU4No06lwUB0B4EMnqhwKBgAEcbz/0bEBLlsjtJi22kfib
+V20TfIk0ReiruJgNzcAUQ9zXzWUpzCyq0eNIPGbbnzu7M1PmvuRT4UwvqOIxPKDh
+sIQN52a6U6gA5KDP9rNDOkN5Bh7RSsOxY5uKqAqhPyBC+I5vTdtR5mWILf9Emc3M
+jMdHLypx4TIJ2ugeZzFv
+-----END PRIVATE KEY-----`;
+
+const TEST_CERT = `-----BEGIN CERTIFICATE-----
+MIIDJzCCAg+gAwIBAgIUPQi4xIRXRrIhXhrLbj/Dn3RY1SUwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDYyMjIxNDgwOFoYDzIxMjYw
+NTI5MjE0ODA4WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQDH6QbH1JTD0vbow4ND1gDSaHfx32D6mrXwK0RgaNP0
+PqyjBJWb2nTA+EN0hLq16DRahjLBIIGuOfhqYSoRdYbtUUpsV9Ywi7/oSxVIh+uN
+k0ASXqL9bGeUZZcdh5KkOMs5vZOj/MPIgYdn2kn2knvtR0qqpJiqkVueb3hoSdK8
+bUGKR+svdGyuFmquXd/iggYaPMiYZ/EhqSoEvTqpfCBlsDASGbsMED5LEqeyD332
+PkhNHnaoVofvZ96tTdk3YWe05rCfnlYSpwoiPNvsBbeFeU1CQw8fq0ktzkEKF+Sz
+BS39OpjZC3NyRhVFXmBVRHyc3nd+PSDwmTkmg8OjmOIRAgMBAAGjbzBtMB0GA1Ud
+DgQWBBTT1aH/RgcYEpdjuvedACycPwYPtDAfBgNVHSMEGDAWgBTT1aH/RgcYEpdj
+uvedACycPwYPtDAPBgNVHRMBAf8EBTADAQH/MBoGA1UdEQQTMBGCCWxvY2FsaG9z
+dIcEfwAAATANBgkqhkiG9w0BAQsFAAOCAQEAHpbHKTelmRfi5UV3Nox79ttqu2GM
+CIHoTJBD5hdjcE31wbHt/fK76dWknGR0wG5v5vC071lAWliQoYRlJfloy536XOXc
+zPvVs6UqXfPji6kWyHA74qM1zKjLvoPQhWuDJqepb6CYhM1iX3tV4LHWXCDASNuV
+wIaFqUOx2vU/DLcH47+VEnEtrmodMvownUojvO+eZ1aODpPyYQg4Iqt5StSLURFz
+JSsW5YzWatjMPka0HLgfbf7gv0+QFF7vGd9TqUO7ZD7NuPDuKuT5BMa6XxoQYkIO
+TTVKDw9WMB6CyIX5kV0cOG/S8OO+1l3ZPaogkzj0P5OnJaYPvpp2kpGrlQ==
+-----END CERTIFICATE-----`;
+
+// The inline WORKFLOW_SERVER_URL_OVERRIDE wins over the loopback server's
+// `VERCEL_WORKFLOW_SERVER_URL`, so these run only when it is empty.
+describe.skipIf(WORKFLOW_SERVER_URL_OVERRIDE !== '')(
+  'stream append retries over real TLS HTTP/2',
+  () => {
+    it('resends the complete body after an early 429', async () => {
+      const httpClient = await import('./http-client.js');
+      const { createStreamer } = await import('./streamer.js');
+      let attempts = 0;
+      const received: Buffer[] = [];
+      const saved: Buffer[] = [];
+      const protocols = new Set<string | false | null | undefined>();
+      const server = createSecureServer({ key: TEST_KEY, cert: TEST_CERT });
+      // close() waits for open sessions, and a failed append can leave one
+      // open. Track them so a regression fails fast instead of hanging cleanup.
+      const sessions = new Set<ServerHttp2Session>();
+      server.on('session', (session) => sessions.add(session));
+      server.on('stream', (stream) => {
+        stream.on('error', () => {});
+        const attempt = ++attempts;
+        protocols.add(
+          (stream.session?.socket as TLSSocket | undefined)?.alpnProtocol
+        );
+        const chunks: Buffer[] = [];
+        stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+        stream.on('end', () => {
+          const body = Buffer.concat(chunks);
+          received.push(body);
+          if (attempt > 1) {
+            saved.push(body);
+            stream.respond({ ':status': 200 });
+            stream.end();
+          }
+        });
+        if (attempt === 1) {
+          stream.respond({ ':status': 429, 'retry-after': '1' });
+          stream.end();
+        }
+      });
+      const dispatcher = createStreamDispatcher(STREAM_RETRY_OPTIONS, {
+        connect: { rejectUnauthorized: false },
+      });
+      vi.spyOn(httpClient, 'getStreamDispatcher').mockReturnValue(dispatcher);
+      try {
+        await new Promise<void>((resolve) =>
+          server.listen(0, '127.0.0.1', resolve)
+        );
+        vi.stubEnv(
+          'VERCEL_WORKFLOW_SERVER_URL',
+          `https://127.0.0.1:${(server.address() as AddressInfo).port}`
+        );
+        const payload = new TextEncoder().encode('Hello, 世界 👋');
+        await createStreamer().streams.write('wrun_test', 'data', payload);
+        const expected = Buffer.from(payload);
+        expect(protocols).toEqual(new Set(['h2']));
+        expect(attempts).toBe(2);
+        expect(received).toEqual([expected, expected]);
+        expect(saved).toEqual([expected]);
+      } finally {
+        vi.restoreAllMocks();
+        await dispatcher.destroy();
+        for (const session of sessions) session.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+  }
+);
+
+// Proves the exact mechanism the v4 events path relies on: a request issued
+// through the *global* `fetch` with an `allowH2` undici dispatcher actually
+// negotiates HTTP/2 over ALPN. `fetchV4` (events-v4.ts) routes through global
+// `fetch` for observability instrumentation rather than `undici.request`, so we
+// verify h2 survives that route. The server only speaks h2 (allowHTTP1 left at
+// its default of false), so a client that fell back to HTTP/1.1 would fail to
+// connect instead of silently passing.
+describe('HTTP/2 over global fetch with an undici dispatcher', () => {
+  let server: Http2SecureServer;
+  let port: number;
+  let negotiatedAlpn: string | false | null | undefined;
+  const agent = new Agent({
+    allowH2: true,
+    connect: { rejectUnauthorized: false },
+  });
+
+  beforeAll(async () => {
+    server = createSecureServer({ key: TEST_KEY, cert: TEST_CERT });
+    // 'stream' only fires for HTTP/2 sessions.
+    server.on('stream', (stream) => {
+      negotiatedAlpn = (stream.session?.socket as TLSSocket | undefined)
+        ?.alpnProtocol;
+      stream.respond({ ':status': 200 });
+      stream.end('ok');
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    await agent.close();
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  });
+
+  it('negotiates h2 (global fetch honors the dispatcher)', async () => {
+    const res = await fetch(`https://127.0.0.1:${port}/`, {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+      dispatcher: agent,
+    } as any);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('ok');
+    expect(negotiatedAlpn).toBe('h2');
+  });
+});
+
+// Negotiating h2 is not the same as using it. This measures the property the
+// events agent actually exists for: concurrent POSTs sharing ONE connection as
+// parallel H2 streams. It is the regression test the config-only assertions
+// above cannot be — before the pipelining + interceptor fix, `allowH2` was true
+// and ALPN was h2, yet 16 concurrent requests still produced 8 serialized
+// requests over 8 TCP connections, exactly like the H1 agent.
+describe('HTTP/2 multiplexing (events vs stream-write agents)', () => {
+  const CONCURRENCY = 16;
+
+  let server: Http2SecureServer;
+  let port: number;
+  let sessions: number;
+  let maxConcurrentStreams: number;
+  let inFlight: number;
+  let receivedBodies: string[];
+  let release: Array<() => void>;
+  let flakyAttempts: number;
+
+  /**
+   * Holds every request open until `CONCURRENCY` of them are in flight, so peak
+   * concurrency is observed rather than timed. A periodic flush (see `burst`)
+   * drains whatever is waiting when that target is never reached — which is the
+   * expected outcome for a non-multiplexing agent, and must fail the assertion
+   * rather than hang the test.
+   */
+  function onArrival(path: string): Promise<void> {
+    // The pool-warming request is not part of the barrier — it must complete on
+    // its own so the burst starts from an established session.
+    if (!path.startsWith('/req-')) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      inFlight++;
+      maxConcurrentStreams = Math.max(maxConcurrentStreams, inFlight);
+      release.push(resolve);
+      if (release.length >= CONCURRENCY) {
+        for (const r of release.splice(0)) r();
+      }
+    });
+  }
+
+  beforeAll(async () => {
+    server = createSecureServer({ key: TEST_KEY, cert: TEST_CERT });
+    server.on('session', (session) => {
+      sessions++;
+      // Agents are closed while the pool still holds idle sessions; the
+      // resulting resets are expected teardown noise, not test failures.
+      session.on('error', () => undefined);
+    });
+    server.on('sessionError', () => undefined);
+    server.on('clientError', () => undefined);
+    server.on('stream', (stream, headers) => {
+      stream.on('error', () => undefined);
+      const chunks: Buffer[] = [];
+      stream.on('data', (c: Buffer) => chunks.push(c));
+      stream.on('end', () => {
+        void (async () => {
+          const path = String(headers[':path']);
+          receivedBodies.push(Buffer.concat(chunks).toString());
+          await onArrival(path);
+          if (path.startsWith('/req-')) inFlight--;
+          // `/flaky` fails once so RetryAgent re-dispatches it.
+          if (path === '/flaky' && ++flakyAttempts === 1) {
+            stream.respond({ ':status': 503 });
+            stream.end('retry me');
+            return;
+          }
+          stream.respond({ ':status': 200 });
+          stream.end(path);
+        })();
+      });
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  });
+
+  /** Loopback TLS escape hatch — the only deviation from production wiring. */
+  const LOOPBACK = { connect: { rejectUnauthorized: false } };
+
+  async function burst(dispatcher: unknown) {
+    sessions = 0;
+    maxConcurrentStreams = 0;
+    inFlight = 0;
+    receivedBodies = [];
+    release = [];
+    flakyAttempts = 0;
+    // Warm the pool so connection setup isn't conflated with the stream gate:
+    // a cold burst races ALPN negotiation and fans out across connections.
+    await fetch(`https://127.0.0.1:${port}/warm`, {
+      dispatcher,
+      method: 'POST',
+      body: 'warm',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+    } as any);
+    const sessionsAfterWarm = sessions;
+    // Repeating, not one-shot: an agent that caps in-flight requests below
+    // CONCURRENCY delivers the burst in several waves, and every wave needs
+    // draining or the remainder blocks forever.
+    const timer = setInterval(() => {
+      for (const r of release.splice(0)) r();
+    }, 250);
+    const bodies = await Promise.all(
+      Array.from({ length: CONCURRENCY }, (_, i) =>
+        fetch(`https://127.0.0.1:${port}/req-${i}`, {
+          method: 'POST',
+          body: JSON.stringify({ i }),
+          dispatcher,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+        } as any).then((r) => r.text())
+      )
+    );
+    clearInterval(timer);
+    return { bodies, sessionsAfterWarm };
+  }
+
+  it('multiplexes concurrent event writes onto a single connection', async () => {
+    // The real production factory — so dropping the interceptor from
+    // createEventsDispatcher fails here, not just changing the constants.
+    const agent = createEventsDispatcher(LOOPBACK);
+    try {
+      const { bodies, sessionsAfterWarm } = await burst(agent);
+
+      expect(maxConcurrentStreams).toBe(CONCURRENCY);
+      // No new TCP/TLS session beyond the warmed one — the whole point.
+      expect(sessions).toBe(sessionsAfterWarm);
+      // Re-buffering the body must not corrupt or cross-wire payloads.
+      expect(bodies.sort()).toEqual(
+        Array.from({ length: CONCURRENCY }, (_, i) => `/req-${i}`).sort()
+      );
+      expect(receivedBodies.filter((b) => b !== 'warm').sort()).toEqual(
+        Array.from({ length: CONCURRENCY }, (_, i) =>
+          JSON.stringify({ i })
+        ).sort()
+      );
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it('does not multiplex stream writes (non-idempotent appends stay isolated)', async () => {
+    const agent = createStreamDispatcher(STREAM_RETRY_OPTIONS, LOOPBACK);
+    try {
+      await burst(agent);
+      // Bounded by the pool size, not by CONCURRENCY: each connection carries
+      // at most one append, so a reset can only ever fail one write.
+      expect(maxConcurrentStreams).toBeLessThanOrEqual(
+        STREAM_AGENT_OPTIONS.connections
+      );
+      expect(maxConcurrentStreams).toBeLessThan(CONCURRENCY);
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it('resends the full body when a re-buffered request is retried', async () => {
+    // The interceptor consumes the request body to make it multiplexable, but
+    // RetryAgent re-dispatches with the *original* (now exhausted) stream. If the
+    // drained buffer were not reused, the retry would arrive with an empty body.
+    const agent = createEventsDispatcher(LOOPBACK);
+    receivedBodies = [];
+    flakyAttempts = 0;
+    const payload = JSON.stringify({ chunk: 'x'.repeat(64) });
+    try {
+      const response = await fetch(`https://127.0.0.1:${port}/flaky`, {
+        method: 'PUT',
+        body: payload,
+        dispatcher: agent,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+      } as any);
+      expect(response.status).toBe(200);
+      expect(flakyAttempts).toBe(2);
+      expect(receivedBodies).toEqual([payload, payload]);
+    } finally {
+      await agent.close();
+    }
+  });
+});
+
+// undici dispatches a streamed request body on HTTP/2 only once the connection
+// has no stream in flight, and stops its whole queue behind it until then. The
+// multiplexing interceptor re-buffers small bodies to avoid that, so the
+// production shape that still hit it was a body too large to re-buffer (a
+// multi-MiB run input or event batch) on a connection that never drained.
+describe('events dispatcher on a busy HTTP/2 connection', () => {
+  const LARGE_BODY_BYTES = 2 * 1024 * 1024;
+  const LOOPBACK = { connect: { rejectUnauthorized: false } };
+
+  let server: Http2SecureServer;
+  let origin: string;
+  let seen: Array<{ path: string; httpVersion: string; bytes: number }>;
+  let releaseHold: (() => void) | undefined;
+  let holdArrived: Promise<void>;
+  let resetAttempts: number;
+
+  beforeAll(async () => {
+    // allowHTTP1 so one origin serves both the h2 stream and the h1 fallback.
+    server = createSecureServer({
+      key: TEST_KEY,
+      cert: TEST_CERT,
+      allowHTTP1: true,
+    });
+    server.on('sessionError', () => undefined);
+    server.on('clientError', () => undefined);
+    server.on('request', (req, res) => {
+      req.stream?.on('error', () => undefined);
+      const path = String(req.url);
+      let bytes = 0;
+      req.on('data', (chunk: Buffer) => {
+        bytes += chunk.length;
+      });
+      req.on('end', () => {
+        seen.push({ path, httpVersion: req.httpVersion, bytes });
+        if (path === '/hold') {
+          holdArrivedResolve();
+          releaseHold = () => {
+            res.writeHead(200);
+            res.end('held');
+          };
+          return;
+        }
+        // The edge's per-stream reset on a busy connection. `/reset-once`
+        // answers the retry; `/reset-always` never does.
+        if (
+          (path === '/reset-once' && ++resetAttempts === 1) ||
+          path === '/reset-always'
+        ) {
+          if (path === '/reset-always') resetAttempts++;
+          req.stream.close(http2Constants.NGHTTP2_ENHANCE_YOUR_CALM);
+          return;
+        }
+        res.writeHead(200);
+        res.end(path);
+      });
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    origin = `https://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  });
+
+  let holdArrivedResolve: () => void;
+  beforeEach(() => {
+    seen = [];
+    releaseHold = undefined;
+    resetAttempts = 0;
+    holdArrived = new Promise<void>((resolve) => {
+      holdArrivedResolve = resolve;
+    });
+  });
+
+  /**
+   * Opens a GET that the origin holds, so the H2 connection never drains.
+   * Resolves once the origin has it, to a wrapper (not the response promise
+   * itself, which an async return would await).
+   */
+  async function holdStreamOpen(dispatcher: unknown) {
+    const held = fetch(`${origin}/hold`, {
+      dispatcher,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+    } as any).then((r) => r.text());
+    await holdArrived;
+    return { held };
+  }
+
+  function postLarge(dispatcher: unknown) {
+    return fetch(`${origin}/large`, {
+      method: 'POST',
+      body: new Uint8Array(LARGE_BODY_BYTES),
+      dispatcher,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+    } as any).then((r) => r.text());
+  }
+
+  /** Resolves to 'settled' or 'pending' after `ms`. */
+  function stateAfter(promise: Promise<unknown>, ms: number) {
+    return Promise.race([
+      promise.then(() => 'settled' as const),
+      new Promise<'pending'>((resolve) => {
+        setTimeout(() => resolve('pending'), ms);
+      }),
+    ]);
+  }
+
+  // Establishes the premise with the interceptor alone (no fallback): the
+  // large POST cannot start while the held stream is in flight.
+  it('queues behind an in-flight H2 stream without the fallback (the failure this fixes)', async () => {
+    const agent = new Agent({ ...EVENTS_AGENT_OPTIONS, ...LOOPBACK });
+    const dispatcher = agent.compose(h2MultiplexInterceptor);
+    try {
+      const { held } = await holdStreamOpen(dispatcher);
+      const large = postLarge(dispatcher);
+      expect(await stateAfter(large, 1_000)).toBe('pending');
+      expect(seen.map((s) => s.path)).toEqual(['/hold']);
+
+      releaseHold?.();
+      expect(await held).toBe('held');
+      expect(await large).toBe('/large');
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it('sends it over HTTP/1.1 so it does not wait for the H2 connection to drain', async () => {
+    const agent = createEventsDispatcher(LOOPBACK);
+    try {
+      const { held } = await holdStreamOpen(agent);
+      const large = postLarge(agent);
+      expect(await stateAfter(large, 5_000)).toBe('settled');
+      expect(await large).toBe('/large');
+      expect(seen).toContainEqual({
+        path: '/large',
+        httpVersion: '1.1',
+        bytes: LARGE_BODY_BYTES,
+      });
+
+      releaseHold?.();
+      expect(await held).toBe('held');
+      expect(seen).toContainEqual({
+        path: '/hold',
+        httpVersion: '2.0',
+        bytes: 0,
+      });
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it('retries an event-log read whose stream the peer reset', async () => {
+    const agent = createEventsDispatcher(LOOPBACK);
+    try {
+      const response = await fetch(`${origin}/reset-once`, {
+        dispatcher: agent,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+      } as any);
+      expect(await response.text()).toBe('/reset-once');
+      expect(resetAttempts).toBe(2);
+    } finally {
+      await agent.close();
+    }
+  });
+
+  // undici before 7.30.0 retired the wrong request when an H2 stream failed out
+  // of order, leaving a phantom "running" slot on the connection for good
+  // (nodejs/undici#5410, #5569). A streamed body then never dispatched on that
+  // connection again, since it waits for zero running streams. Pins the undici
+  // version this package depends on.
+  it('leaves no phantom running stream after a peer reset', async () => {
+    const agent = new Agent({ ...EVENTS_AGENT_OPTIONS, ...LOOPBACK });
+    try {
+      await (
+        await fetch(`${origin}/warm`, {
+          dispatcher: agent,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+        } as any)
+      ).text();
+      await expect(
+        fetch(`${origin}/reset-always`, {
+          dispatcher: agent,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+        } as any)
+      ).rejects.toThrow();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(agent.stats[origin]?.running).toBe(0);
+    } finally {
+      await agent.close();
+    }
+  });
+
+  // An event write may already have committed when its stream is reset, so it
+  // must surface the error rather than be replayed.
+  it('does not retry an event write whose stream the peer reset', async () => {
+    const agent = createEventsDispatcher(LOOPBACK);
+    try {
+      await expect(
+        fetch(`${origin}/reset-always`, {
+          method: 'POST',
+          body: 'x',
+          dispatcher: agent,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+        } as any)
+      ).rejects.toThrow();
+      expect(resetAttempts).toBe(1);
+    } finally {
+      await agent.close();
+    }
+  });
+});
+
+// The transport fault this whole mechanism exists for: an HTTP/2 session whose
+// TCP connection stays established while no bytes cross it. undici keeps such a
+// session in service — on a stream timeout it deliberately does not destroy the
+// socket, and `keepAliveTimeout` is never read on the H2 path — so every request
+// the pool routes onto it times out, indefinitely.
+//
+// The origin here is a real h2 server behind a TCP proxy that stops forwarding
+// bytes for one chosen flow, which is the closest reproduction of the production
+// shape (a middlebox dropping an established mapping) that a test can be.
+describe('wedged HTTP/2 session', () => {
+  // Any value above the pool's connection count, so the loop cannot pass merely
+  // by exhausting the poisoned connection.
+  const REQUESTS_AFTER_BLACKHOLE = 12;
+  // Long enough that a healthy loopback request never hits it, short enough that
+  // a wedged one gives up quickly. This is the timeout that turns a black hole
+  // into the UND_ERR_INFO stream timeout seen in production.
+  const STREAM_TIMEOUT_MS = 300;
+
+  let server: Http2SecureServer;
+  let proxy: Server;
+  let origin: string;
+  let flows: number;
+  let holed: Set<number>;
+  let httpVersions: string[];
+
+  /** Options that point an events agent at the loopback proxy. */
+  const AGENT_OVERRIDES = {
+    connect: { rejectUnauthorized: false },
+    bodyTimeout: STREAM_TIMEOUT_MS,
+    headersTimeout: STREAM_TIMEOUT_MS,
+  };
+
+  beforeAll(async () => {
+    // allowHTTP1 so the same origin can serve the kill-switch case, which takes
+    // the agent off h2 entirely.
+    server = createSecureServer({
+      key: TEST_KEY,
+      cert: TEST_CERT,
+      allowHTTP1: true,
+    });
+    server.on('sessionError', () => undefined);
+    server.on('clientError', () => undefined);
+    server.on('request', (req, res) => {
+      httpVersions.push(req.httpVersion);
+      res.writeHead(200);
+      res.end('ok');
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const originPort = (server.address() as AddressInfo).port;
+
+    // Byte-forwarding proxy. A flow in `holed` keeps both sockets open and
+    // simply drops everything in both directions.
+    proxy = createServer((client) => {
+      const id = ++flows;
+      const upstream = connect(originPort, '127.0.0.1');
+      client.on('data', (b) => {
+        if (!holed.has(id)) upstream.write(b);
+      });
+      upstream.on('data', (b) => {
+        if (!holed.has(id)) client.write(b);
+      });
+      const kill = () => {
+        client.destroy();
+        upstream.destroy();
+      };
+      for (const socket of [client, upstream]) {
+        socket.on('error', kill);
+        socket.on('close', kill);
+      }
+    });
+    await new Promise<void>((resolve) => {
+      proxy.listen(0, '127.0.0.1', resolve);
+    });
+    origin = `https://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => {
+      proxy.close(() => resolve());
+    });
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  });
+
+  beforeEach(() => {
+    flows = 0;
+    holed = new Set();
+    httpVersions = [];
+  });
+
+  /** One request through `dispatcher`; resolves to the error, or undefined. */
+  async function attempt(dispatcher: unknown): Promise<unknown> {
+    try {
+      const response = await fetch(`${origin}/`, {
+        method: 'POST',
+        body: 'x',
+        dispatcher,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher type doesn't match @types/node's RequestInit
+      } as any);
+      await response.text();
+      return undefined;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  // Establishes the premise. Without the failure accounting, an events agent
+  // whose session has been black-holed never recovers on its own — which is why
+  // one bad flow produced a 25-minute outage rather than a blip.
+  it('never recovers on its own (the failure this fixes)', async () => {
+    const agent = createEventsDispatcher(AGENT_OVERRIDES);
+    try {
+      expect(await attempt(agent)).toBeUndefined();
+      holed.add(1);
+
+      const errors: unknown[] = [];
+      for (let i = 0; i < REQUESTS_AFTER_BLACKHOLE; i++) {
+        const error = await attempt(agent);
+        if (error) errors.push(error);
+      }
+      // Every single one, and every one for the reason we key the rebuild off.
+      expect(errors).toHaveLength(REQUESTS_AFTER_BLACKHOLE);
+      expect(errors.every(isRecyclableTransportError)).toBe(true);
+      // The pool never opened a replacement connection.
+      expect(flows).toBe(1);
+    } finally {
+      await agent.close();
+    }
+  });
+
+  it('recovers after the failure threshold, and stays recovered', async () => {
+    const recycler = createDispatcherRecycler(
+      () => createEventsDispatcher(AGENT_OVERRIDES),
+      'test transport'
+    );
+    const first = recycler.get();
+    try {
+      recycler.note(first, await attempt(first));
+      holed.add(1);
+
+      const failures: number[] = [];
+      const successes: number[] = [];
+      for (let i = 0; i < REQUESTS_AFTER_BLACKHOLE; i++) {
+        // Re-resolved per request, exactly as fetchV4 does — caching the
+        // dispatcher across requests would pin the caller to the retired pool.
+        const dispatcher = recycler.get();
+        const error = await attempt(dispatcher);
+        recycler.note(dispatcher, error);
+        (error ? failures : successes).push(i);
+      }
+
+      // Bounded, not merely eventually-fine: the threshold is the entire cost of
+      // the fault, and everything after it succeeds on the rebuilt pool.
+      expect(failures).toHaveLength(EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES);
+      expect(successes[0]).toBe(EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES);
+      expect(recycler.get()).not.toBe(first);
+      expect(flows).toBeGreaterThan(1);
+    } finally {
+      await recycler.get().close();
+      await first.close();
+    }
+  });
+
+  // The kill switch has to reach `allowH2`, not just the multiplexing
+  // interceptor: with H2 still enabled the pool keeps the wedged session and the
+  // switch mitigates nothing. On H1, undici destroys the socket when the request
+  // times out, so the next request opens a fresh connection by itself.
+  it('WORKFLOW_H2_MULTIPLEX=0 takes the events agent off h2, restoring self-healing', async () => {
+    const previous = process.env.WORKFLOW_H2_MULTIPLEX;
+    process.env.WORKFLOW_H2_MULTIPLEX = '0';
+    // Read when the dispatcher is built, so the switch only affects agents
+    // created after it is set.
+    const agent = createEventsDispatcher(AGENT_OVERRIDES);
+    try {
+      expect(await attempt(agent)).toBeUndefined();
+      expect(httpVersions).toEqual(['1.1']);
+      holed.add(1);
+
+      const errors: unknown[] = [];
+      for (let i = 0; i < REQUESTS_AFTER_BLACKHOLE; i++) {
+        const error = await attempt(agent);
+        if (error) errors.push(error);
+      }
+      // A handful of connections are lost to the black hole; the point is that
+      // the agent keeps making progress instead of wedging forever.
+      expect(errors.length).toBeLessThan(REQUESTS_AFTER_BLACKHOLE);
+      expect(flows).toBeGreaterThan(1);
+    } finally {
+      await agent.close();
+      if (previous === undefined) {
+        delete process.env.WORKFLOW_H2_MULTIPLEX;
+      } else {
+        process.env.WORKFLOW_H2_MULTIPLEX = previous;
+      }
+    }
+  });
+});
+
+describe('dispatcher recycling accounting', () => {
+  const stub = () =>
+    ({ close: async () => undefined }) as unknown as RetryAgent;
+  const h2StreamTimeout = () =>
+    // The shape production sees: `fetch` rejects with its own TypeError and the
+    // undici error is only reachable through `cause`.
+    new TypeError('fetch failed', {
+      cause: Object.assign(new Error('HTTP/2: "stream timeout after 300"'), {
+        code: 'UND_ERR_INFO',
+      }),
+    });
+
+  function fail(recycler: DispatcherRecycler, times: number): void {
+    for (let i = 0; i < times; i++) {
+      recycler.note(recycler.get(), h2StreamTimeout());
+    }
+  }
+
+  it('rebuilds only once the failures are consecutive', () => {
+    const recycler = createDispatcherRecycler(stub, 'test');
+    const first = recycler.get();
+
+    fail(recycler, EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES - 1);
+    expect(recycler.get()).toBe(first);
+    // A delivered response means the pool works; the count starts over.
+    recycler.note(recycler.get());
+    fail(recycler, EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES - 1);
+    expect(recycler.get()).toBe(first);
+
+    recycler.note(recycler.get(), h2StreamTimeout());
+    expect(recycler.get()).not.toBe(first);
+  });
+
+  // The tail of the batch that provoked a rebuild reports its failures late, on
+  // the already-retired dispatcher. Counting those would recycle the replacement
+  // immediately and, under sustained concurrency, every pool after it.
+  it('ignores outcomes from a dispatcher it no longer owns', () => {
+    const recycler = createDispatcherRecycler(stub, 'test');
+    const first = recycler.get();
+    fail(recycler, EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES);
+    const second = recycler.get();
+    expect(second).not.toBe(first);
+
+    for (let i = 0; i < EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES; i++) {
+      recycler.note(first, h2StreamTimeout());
+    }
+    expect(recycler.get()).toBe(second);
+
+    // Same guard covers a caller-supplied dispatcher (APIConfig.dispatcher):
+    // its failures say nothing about the shared pool.
+    for (let i = 0; i < EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES; i++) {
+      recycler.note({}, h2StreamTimeout());
+    }
+    expect(recycler.get()).toBe(second);
+  });
+
+  // A rebuild only helps for failures that happened on an established
+  // connection. Connect/DNS/TLS errors would hit the same wall from a new pool,
+  // and an abort is the caller's own doing.
+  it('counts only transport failures a rebuild can fix', () => {
+    expect(isRecyclableTransportError(h2StreamTimeout())).toBe(true);
+    for (const code of [
+      'UND_ERR_HEADERS_TIMEOUT',
+      'UND_ERR_BODY_TIMEOUT',
+      'ERR_HTTP2_GOAWAY_SESSION',
+      'ERR_HTTP2_INVALID_SESSION',
+      'ERR_HTTP2_SESSION_ERROR',
+      'ERR_HTTP2_STREAM_ERROR',
+    ]) {
+      expect(
+        isRecyclableTransportError(Object.assign(new Error(code), { code }))
+      ).toBe(true);
+    }
+    for (const code of [
+      'UND_ERR_CONNECT_TIMEOUT',
+      'UND_ERR_ABORTED',
+      'ENOTFOUND',
+      'ECONNREFUSED',
+      'CERT_HAS_EXPIRED',
+      'ERR_HTTP2_INVALID_HEADER_VALUE',
+      'ERR_HTTP2_STREAM_CANCEL',
+    ]) {
+      expect(
+        isRecyclableTransportError(Object.assign(new Error(code), { code }))
+      ).toBe(false);
+    }
+    expect(isRecyclableTransportError(new Error('nope'))).toBe(false);
+    expect(isRecyclableTransportError(undefined)).toBe(false);
+
+    const recycler = createDispatcherRecycler(stub, 'test');
+    const first = recycler.get();
+    for (let i = 0; i < EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES * 2; i++) {
+      recycler.note(
+        recycler.get(),
+        Object.assign(new Error('aborted'), { code: 'UND_ERR_ABORTED' })
+      );
+    }
+    expect(recycler.get()).toBe(first);
+  });
+
+  // Cycles are self-limiting: a `cause` chain that loops must not hang the walk.
+  it('survives a self-referential cause chain', () => {
+    const error = new Error('loop') as Error & { cause?: unknown };
+    error.cause = error;
+    expect(isRecyclableTransportError(error)).toBe(false);
+  });
+});
+
+describe('queue client transport', () => {
+  it('gives the queue client its own dispatcher, not the shared default', () => {
+    expect(getQueueDispatcher()).toBe(getQueueDispatcher());
+    expect(getQueueDispatcher()).not.toBe(getDispatcher());
+  });
+
+  it('still yields to a caller-supplied dispatcher', () => {
+    const custom = {};
+    expect(getQueueDispatcher({ dispatcher: custom })).toBe(custom);
+  });
+
+  // The queue client issues about two small requests per invocation, so its
+  // concurrency tracks how many invocations the instance is serving, not any
+  // per-request fan-out. Sharing the control-plane pool's 8-connection cap made
+  // invocation concurrency the binding constraint on acknowledging messages.
+  it('gives the queue a connection budget well above the shared pool', () => {
+    expect(getQueueAgentOptions().connections).toBe(QUEUE_AGENT_CONNECTIONS);
+    expect(getQueueAgentOptions().connections).toBeGreaterThan(
+      DEFAULT_AGENT_OPTIONS.connections
+    );
+  });
+
+  // Nothing else bounds this path: QueueClient calls global fetch itself and
+  // takes no fetch override, so without these it inherits undici's 300s
+  // defaults. See QUEUE_REQUEST_TIMEOUT_MS.
+  it('arms explicit per-phase deadlines instead of undici defaults', () => {
+    const options = getQueueAgentOptions();
+    expect(options.headersTimeout).toBe(QUEUE_REQUEST_TIMEOUT_MS);
+    expect(options.bodyTimeout).toBe(QUEUE_REQUEST_TIMEOUT_MS);
+    expect(options.headersTimeout).toBeLessThan(NODE_HTTP_HEADERS_TIMEOUT_MS);
+  });
+
+  it('reads the deadline override, clamped', () => {
+    vi.stubEnv('WORKFLOW_VERCEL_QUEUE_TIMEOUT_MS', '45000');
+    expect(getQueueRequestTimeoutMs()).toBe(45_000);
+    vi.stubEnv('WORKFLOW_VERCEL_QUEUE_TIMEOUT_MS', '1');
+    expect(getQueueRequestTimeoutMs()).toBe(5_000);
+  });
+
+  // Instances publish every few seconds to minutes; a gap above the idle
+  // timeout reopens the connection inside the send. See
+  // QUEUE_AGENT_KEEP_ALIVE_TIMEOUT_MS.
+  it('keeps idle queue connections longer than the shared pool', () => {
+    const options = getQueueAgentOptions();
+    expect(options.keepAliveTimeout).toBe(QUEUE_AGENT_KEEP_ALIVE_TIMEOUT_MS);
+    expect(options.keepAliveTimeout).toBeGreaterThan(
+      DEFAULT_AGENT_OPTIONS.keepAliveTimeout
+    );
+    // Bounded well below the queue endpoint's idle timeout.
+    expect(options.keepAliveTimeout).toBeLessThanOrEqual(240_000);
+  });
+
+  it('reads the keep-alive override, clamped', () => {
+    vi.stubEnv('WORKFLOW_VERCEL_QUEUE_KEEP_ALIVE_MS', '30000');
+    expect(getQueueAgentOptions().keepAliveTimeout).toBe(30_000);
+    vi.stubEnv('WORKFLOW_VERCEL_QUEUE_KEEP_ALIVE_MS', '900000');
+    expect(getQueueAgentOptions().keepAliveTimeout).toBe(240_000);
+    vi.stubEnv('WORKFLOW_VERCEL_QUEUE_KEEP_ALIVE_MS', '1');
+    expect(getQueueAgentOptions().keepAliveTimeout).toBe(1_000);
+  });
+
+  it('reads the connection override', () => {
+    vi.stubEnv('WORKFLOW_VERCEL_QUEUE_CONNECTIONS', '16');
+    expect(getQueueAgentOptions().connections).toBe(16);
+  });
+
+  // The regression this guards is not "an ack is slow", it is that waiting for
+  // a free connection is not covered by headersTimeout: undici arms that only
+  // once a request reaches a socket. With one connection and a server that
+  // never answers, an unbounded queue wait would settle the k-th request at
+  // k x deadline. The deadline is armed at dispatch and delivered through the
+  // controller onRequestStart hands over, so the whole backlog drains at the
+  // deadline instead.
+  it('bounds the pool queue wait, not just time on the wire', async () => {
+    const DEADLINE_MS = 5_000;
+    const DEPTH = 6;
+    vi.stubEnv('WORKFLOW_VERCEL_QUEUE_TIMEOUT_MS', String(DEADLINE_MS));
+    vi.stubEnv('WORKFLOW_VERCEL_QUEUE_CONNECTIONS', '1');
+
+    // Accepts the connection, never responds.
+    const silent = createHttpServer(() => {});
+    await new Promise<void>((resolve) =>
+      silent.listen(0, '127.0.0.1', () => resolve())
+    );
+    const { port } = silent.address() as AddressInfo;
+    const dispatcher = createQueueDispatcher();
+
+    const started = Date.now();
+    const settled = await Promise.all(
+      Array.from({ length: DEPTH }, () =>
+        fetch(`http://127.0.0.1:${port}/ack`, {
+          method: 'POST',
+          body: '{}',
+          // @ts-expect-error -- `dispatcher` is undici's extension to RequestInit.
+          dispatcher,
+        })
+          .then(() => 'resolved')
+          .catch(() => 'aborted')
+      )
+    );
+    const elapsed = Date.now() - started;
+
+    silent.close();
+    await dispatcher.close();
+
+    expect(settled).toEqual(Array.from({ length: DEPTH }, () => 'aborted'));
+    // Serialised behind one connection with no queue-wait bound this would be
+    // DEPTH x DEADLINE_MS (30s). Allow generous slack for CI scheduling while
+    // staying far below that product.
+    expect(elapsed).toBeLessThan(DEADLINE_MS * 2);
+  }, 40_000);
+});
+
+describe('node:http mode', () => {
+  beforeEach(() => {
+    vi.stubEnv(NODE_HTTP_ENV_VAR, '1');
+    _resetNodeHttpAgentsForTests();
+  });
+
+  afterEach(() => {
+    _resetNodeHttpAgentsForTests();
+  });
+
+  // `undefined` is the contract, not a placeholder: it is the signal the two
+  // dispatch sites read to send the request over `node:http` / `node:https`
+  // instead. Every call site in this package sources its dispatcher from one
+  // of these four getters, so covering them covers the transport switch.
+  it('hands every call site an undefined dispatcher', () => {
+    expect(getDispatcher()).toBeUndefined();
+    expect(getEventsDispatcher()).toBeUndefined();
+    expect(getStreamDispatcher()).toBeUndefined();
+    expect(getStreamCloseDispatcher()).toBeUndefined();
+  });
+
+  // The queue client is the one path `undefined` cannot move to `node:http`,
+  // because `QueueClient` takes a dispatcher and no `fetch` override. It still
+  // has to honor the flag: `undefined` moves the request onto the runtime's own
+  // undici instead of the copy this package bundles, and a deployment where the
+  // bundled copy is broken is exactly what the flag is for. Leaving it on the
+  // bundled agent stranded queue acknowledgements, and an unacknowledged
+  // message is redelivered for as long as the platform keeps killing the
+  // invocation holding it.
+  it('hands the queue client an undefined dispatcher too', () => {
+    expect(getQueueDispatcher()).toBeUndefined();
+  });
+
+  it('keeps the tuned agent for the queue client with the flag off', () => {
+    vi.stubEnv(NODE_HTTP_ENV_VAR, '0');
+    expect(getQueueDispatcher()).toBeDefined();
+    expect(getQueueDispatcher()).toBe(getQueueDispatcher());
+    // Its own agent, not the one the flag-off path hands every other call
+    // site: see QUEUE_AGENT_CONNECTIONS for why the two pools differ.
+    expect(getQueueDispatcher()).not.toBe(getDispatcher());
+  });
+
+  it('still yields to a caller-supplied dispatcher on that path too', () => {
+    const custom = {};
+    expect(getQueueDispatcher({ dispatcher: custom })).toBe(custom);
+  });
+
+  // node:http has no deadline of its own and the agents above set none, so
+  // these restate the undici Client defaults the agents inherit. Dropping them
+  // would leave every `timeoutMs: null` call site unbounded.
+  it('carries the undici default per-phase deadlines', () => {
+    expect(NODE_HTTP_HEADERS_TIMEOUT_MS).toBe(300_000);
+    expect(NODE_HTTP_BODY_TIMEOUT_MS).toBe(300_000);
+  });
+
+  // The flag picks which *default* this package builds. It is not a veto on
+  // `createVercelWorld({ dispatcher })`, which stays a supported override.
+  it('still yields to a caller-supplied dispatcher', () => {
+    const custom = {};
+    expect(getDispatcher({ dispatcher: custom })).toBe(custom);
+    expect(getEventsDispatcher({ dispatcher: custom })).toBe(custom);
+    expect(getStreamDispatcher({ dispatcher: custom })).toBe(custom);
+    expect(getStreamCloseDispatcher({ dispatcher: custom })).toBe(custom);
+  });
+
+  // No undici pool means nothing to rebuild. The events path calls
+  // noteEventsTransportOutcome on every failure regardless of transport, so it
+  // has to tolerate the dispatcher it is handed being undefined.
+  it('leaves the events recycler untouched', () => {
+    const h2Timeout = Object.assign(new Error('timeout'), {
+      code: 'UND_ERR_H2_STREAM_TIMEOUT',
+    });
+    for (let i = 0; i < EVENTS_RECYCLE_AFTER_CONSECUTIVE_FAILURES * 2; i++) {
+      expect(() =>
+        noteEventsTransportOutcome(getEventsDispatcher(), h2Timeout)
+      ).not.toThrow();
+    }
+    expect(getEventsDispatcher()).toBeUndefined();
+
+    // The pool the recycler owns is still intact for a process that flips back.
+    vi.stubEnv(NODE_HTTP_ENV_VAR, '0');
+    expect(getEventsDispatcher()).toBe(getEventsDispatcher());
+  });
+
+  // Read per call, not memoized at module load, so one process (or one test
+  // file) can exercise both transports.
+  it('is re-read on every call', () => {
+    expect(getDispatcher()).toBeUndefined();
+    vi.stubEnv(NODE_HTTP_ENV_VAR, '0');
+    expect(getDispatcher()).toBeDefined();
+    vi.stubEnv(NODE_HTTP_ENV_VAR, 'true');
+    expect(getDispatcher()).toBeUndefined();
+  });
+
+  // Keep-alive is the whole reason the pool exists, so it must outlive a
+  // single request. One pool serves every call site, because the four undici
+  // agents differ only in HTTP/2 and retry settings that Node's client has no
+  // equivalent for.
+  it('reuses one socket pool across calls', () => {
+    const agents = getNodeHttpAgents();
+    expect(agents).toBeDefined();
+    expect(getNodeHttpAgents()).toBe(agents);
+    expect(agents?.http.options.keepAlive).toBe(true);
+    expect(agents?.https.options.keepAlive).toBe(true);
+    // Sized from the same constants the undici agents use, not a second copy.
+    expect(agents?.https.options.maxSockets).toBe(
+      DEFAULT_AGENT_OPTIONS.connections
+    );
+    expect(agents?.https.options.keepAliveMsecs).toBe(
+      DEFAULT_AGENT_OPTIONS.keepAliveTimeout
+    );
+  });
+
+  // Same rule as the dispatcher getters: supplying a dispatcher is an
+  // instruction to use undici, so the request must stay on `fetch`.
+  it('builds no pool when the caller supplied a dispatcher', () => {
+    expect(getNodeHttpAgents({ dispatcher: {} })).toBeUndefined();
+  });
+
+  it('builds no pool when the flag is off', () => {
+    vi.stubEnv(NODE_HTTP_ENV_VAR, '0');
+    expect(getNodeHttpAgents()).toBeUndefined();
+  });
+});

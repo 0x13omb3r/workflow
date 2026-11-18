@@ -1,0 +1,1269 @@
+import {
+  EntityConflictError,
+  FatalError,
+  START_HOOK_CANDIDATE_CANCELLED,
+  WorkflowRunFailedError,
+  WorkflowRunNotFoundError,
+  WorkflowWorldError,
+} from '@workflow/errors';
+import { WORKFLOW_DESERIALIZE, WORKFLOW_SERIALIZE } from '@workflow/serde';
+import {
+  type Event,
+  SPEC_VERSION_CURRENT,
+  SPEC_VERSION_LEGACY,
+  SPEC_VERSION_MAX_SUPPORTED,
+  SPEC_VERSION_SINGLE_ORCHESTRATOR,
+  type World,
+} from '@workflow/world';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// Mock version module to avoid missing generated file
+vi.mock('../version.js', () => ({ version: '0.0.0-test' }));
+
+// Stub `start` so recreateRunFromExisting can be tested for the options it
+// forwards without exercising the full run-creation pipeline (serialization,
+// telemetry, queueing).
+vi.mock('./start.js', () => ({ start: vi.fn() }));
+
+// Keep serialization real except for argument hydration, which needs a real
+// serialized payload we don't have in these unit tests.
+vi.mock('../serialization.js', async (importActual) => {
+  const actual = await importActual<typeof import('../serialization.js')>();
+  return { ...actual, hydrateWorkflowArguments: vi.fn().mockResolvedValue([]) };
+});
+
+import { registerSerializationClass } from '../class-serialization.js';
+import { deriveRunPayloadKeys } from '../serialization/encryption.js';
+import {
+  dehydrateRunError,
+  dehydrateStepReturnValue,
+  dehydrateWorkflowReturnValue,
+  getSerializeStream,
+  hydrateStepReturnValue,
+} from '../serialization.js';
+import { getReturnValuePollIntervalMs, Run } from './run.js';
+import {
+  cancelRun,
+  cancelRuns,
+  pendingWakeUpWaits,
+  recreateRunFromExisting,
+  reenqueueRun,
+  wakeUpRun,
+} from './runs.js';
+import { start } from './start.js';
+import { setWorld } from './world.js';
+
+function createMockWorld(
+  overrides: {
+    run?: Partial<
+      ReturnType<World['runs']['get']> extends Promise<infer T> ? T : never
+    >;
+    events?: Event[];
+    createError?: Error;
+  } = {}
+): World {
+  const run = {
+    runId: 'wrun_123',
+    workflowName: 'test-workflow',
+    status: 'running' as const,
+    specVersion: 2,
+    input: [],
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    startedAt: new Date(),
+    deploymentId: 'test-deployment',
+    ...overrides.run,
+  };
+
+  const events = overrides.events ?? [];
+
+  return {
+    specVersion: SPEC_VERSION_CURRENT,
+    runs: {
+      get: vi.fn().mockResolvedValue(run),
+    },
+    events: {
+      list: vi.fn().mockResolvedValue({
+        data: events,
+        hasMore: false,
+        cursor: null,
+      }),
+      create: overrides.createError
+        ? vi.fn().mockRejectedValue(overrides.createError)
+        : vi.fn().mockResolvedValue({ event: {} }),
+    },
+    queue: vi.fn().mockResolvedValue(undefined),
+  } as unknown as World;
+}
+
+describe('wakeUpRun', () => {
+  it('should count 409 conflict as a successful stop', async () => {
+    const events: Event[] = [
+      {
+        eventId: 'evnt_0',
+        runId: 'wrun_123',
+        eventType: 'wait_created',
+        correlationId: 'wait_abc',
+        eventData: { resumeAt: new Date('2024-01-01T00:00:01.000Z') },
+        createdAt: new Date(),
+      },
+    ];
+
+    const conflict = new EntityConflictError('Wait already completed');
+
+    const world = createMockWorld({ events, createError: conflict });
+    const result = await wakeUpRun(world, 'wrun_123');
+
+    expect(result.stoppedCount).toBe(1);
+    expect(world.events.list).toHaveBeenCalledWith({
+      runId: 'wrun_123',
+      pagination: { sortOrder: 'asc' },
+      resolveData: 'none',
+      // The run's own version, as the World's read hint.
+      specVersion: 2,
+    });
+    expect(world.queue).toHaveBeenCalled();
+  });
+
+  it('should throw for non-409 errors', async () => {
+    const events: Event[] = [
+      {
+        eventId: 'evnt_0',
+        runId: 'wrun_123',
+        eventType: 'wait_created',
+        correlationId: 'wait_abc',
+        eventData: { resumeAt: new Date('2024-01-01T00:00:01.000Z') },
+        createdAt: new Date(),
+      },
+    ];
+
+    const serverError = new WorkflowWorldError('Internal server error', {
+      status: 500,
+    });
+
+    const world = createMockWorld({ events, createError: serverError });
+
+    await expect(wakeUpRun(world, 'wrun_123')).rejects.toThrow(AggregateError);
+  });
+
+  it('should re-enqueue to the namespaced queue when namespace is provided', async () => {
+    const events: Event[] = [
+      {
+        eventId: 'evnt_0',
+        runId: 'wrun_123',
+        eventType: 'wait_created',
+        correlationId: 'wait_abc',
+        eventData: { resumeAt: new Date('2024-01-01T00:00:01.000Z') },
+        createdAt: new Date(),
+      },
+    ];
+
+    const world = createMockWorld({ events });
+    await wakeUpRun(world, 'wrun_123', { namespace: 'eve' });
+
+    expect(world.queue).toHaveBeenCalledWith(
+      '__eve_wkf_workflow_test-workflow',
+      expect.anything(),
+      expect.anything()
+    );
+  });
+});
+
+describe('reenqueueRun', () => {
+  it('should enqueue to the default queue when no namespace is provided', async () => {
+    const world = createMockWorld();
+    await reenqueueRun(world, 'wrun_123');
+
+    expect(world.queue).toHaveBeenCalledWith(
+      '__wkf_workflow_test-workflow',
+      // The routing hint is the run's own spec version.
+      { runId: 'wrun_123', runSpecVersion: 2 },
+      expect.anything()
+    );
+  });
+
+  it('should enqueue to the namespaced queue when namespace is provided', async () => {
+    const world = createMockWorld();
+    await reenqueueRun(world, 'wrun_123', { namespace: 'eve' });
+
+    expect(world.queue).toHaveBeenCalledWith(
+      '__eve_wkf_workflow_test-workflow',
+      // The routing hint is the run's own spec version.
+      { runId: 'wrun_123', runSpecVersion: 2 },
+      expect.anything()
+    );
+  });
+});
+
+describe('cancelRun of a run that does not exist', () => {
+  function missingRunWorld(
+    cancelAnswer: () => Promise<unknown>,
+    atomicStartHook = true
+  ) {
+    const world = createMockWorld();
+    if (atomicStartHook) {
+      (world as { capabilities?: unknown }).capabilities = {
+        atomicStartHook: { active: true },
+      };
+    }
+    vi.mocked(world.runs.get).mockRejectedValue(
+      new WorkflowRunNotFoundError('wrun_123')
+    );
+    vi.mocked(world.events.create).mockImplementation(
+      cancelAnswer as typeof world.events.create
+    );
+    return world;
+  }
+
+  it('still posts run_cancelled, at this SDK version, and succeeds for a fenced start Hook candidate', async () => {
+    const world = missingRunWorld(async () => {
+      throw new WorkflowWorldError('cancelled before it was created', {
+        status: 409,
+        code: START_HOOK_CANDIDATE_CANCELLED,
+      });
+    });
+
+    await cancelRun(world, 'wrun_123');
+
+    expect(vi.mocked(world.events.create).mock.calls[0][1]).toMatchObject({
+      eventType: 'run_cancelled',
+      specVersion: SPEC_VERSION_CURRENT,
+    });
+  });
+
+  it('posts nothing on a World without start Hooks', async () => {
+    const world = missingRunWorld(async () => undefined, false);
+
+    await expect(cancelRun(world, 'wrun_123')).rejects.toThrow(
+      /Failed to cancel run/
+    );
+    expect(world.events.create).not.toHaveBeenCalled();
+  });
+
+  it('throws a typed WorkflowRunNotFoundError when the World has no such run either', async () => {
+    const world = missingRunWorld(async () => {
+      throw new WorkflowRunNotFoundError('wrun_123');
+    });
+
+    const error = await cancelRun(world, 'wrun_123').catch((e: unknown) => e);
+    expect(WorkflowRunNotFoundError.is(error)).toBe(true);
+  });
+});
+
+// A run started by a newer SDK: this one cannot write that version's format,
+// so everything it writes to the run is capped at the highest it supports.
+const NEWER_THAN_THIS_SDK = SPEC_VERSION_MAX_SUPPORTED + 1;
+
+describe('writes to a run started by a newer SDK', () => {
+  const waitCreated: Event = {
+    eventId: 'evnt_0',
+    runId: 'wrun_123',
+    eventType: 'wait_created',
+    correlationId: 'wait_abc',
+    eventData: { resumeAt: new Date('2024-01-01T00:00:01.000Z') },
+    createdAt: new Date(),
+  };
+
+  it("caps cancelRun's run_cancelled at this SDK's version", async () => {
+    const world = createMockWorld({
+      run: { specVersion: NEWER_THAN_THIS_SDK },
+    });
+    await cancelRun(world, 'wrun_123');
+
+    expect(vi.mocked(world.events.create).mock.calls[0][1]).toMatchObject({
+      eventType: 'run_cancelled',
+      specVersion: SPEC_VERSION_MAX_SUPPORTED,
+    });
+  });
+
+  it("caps wakeUpRun's wake at this SDK's version, and leaves the wait to the orchestrator", async () => {
+    const world = createMockWorld({
+      run: { specVersion: NEWER_THAN_THIS_SDK },
+      events: [waitCreated],
+    });
+    await wakeUpRun(world, 'wrun_123');
+
+    // A single-orchestrator run's waits are completed in-band by its
+    // orchestrator: the wake names them instead.
+    expect(world.events.create).not.toHaveBeenCalled();
+    expect(vi.mocked(world.queue).mock.calls[0][1]).toMatchObject({
+      runId: 'wrun_123',
+      completeWaits: [waitCreated.correlationId],
+    });
+    // An ordinary orchestrator message: best-effort on a queue that
+    // coalesces it into a running delivery.
+    expect(vi.mocked(world.queue).mock.calls[0][2]).toEqual({
+      deploymentId: expect.any(String),
+      specVersion: SPEC_VERSION_MAX_SUPPORTED,
+    });
+  });
+
+  it("caps reenqueueRun's queue spec version at this SDK's", async () => {
+    const world = createMockWorld({
+      run: { specVersion: NEWER_THAN_THIS_SDK },
+    });
+    await reenqueueRun(world, 'wrun_123');
+
+    expect(vi.mocked(world.queue).mock.calls[0][2]).toMatchObject({
+      specVersion: SPEC_VERSION_MAX_SUPPORTED,
+    });
+  });
+
+  it('still treats a run with no recorded version as legacy', async () => {
+    const world = createMockWorld({ run: { specVersion: undefined } });
+    await reenqueueRun(world, 'wrun_123');
+    await cancelRun(world, 'wrun_123');
+
+    expect(vi.mocked(world.queue).mock.calls[0][2]).toMatchObject({
+      specVersion: SPEC_VERSION_LEGACY,
+    });
+    expect(vi.mocked(world.events.create).mock.calls[0][1]).toMatchObject({
+      specVersion: SPEC_VERSION_LEGACY,
+    });
+  });
+});
+
+describe('wakeUpRun pending-wake marks', () => {
+  const openWait = (runId: string, correlationId: string): Event =>
+    ({
+      eventId: `evnt_${correlationId}`,
+      runId,
+      eventType: 'wait_created',
+      correlationId,
+      eventData: { resumeAt: new Date(Date.now() + 3_600_000) },
+      createdAt: new Date(),
+    }) as Event;
+
+  function singleOrchestratorWorld(runId: string, events: Event[]) {
+    const world = createMockWorld({
+      run: { runId, specVersion: SPEC_VERSION_SINGLE_ORCHESTRATOR },
+      events,
+    });
+    return world;
+  }
+
+  it('leaves a sleep open to waitForSleep after a wake whose publish failed', async () => {
+    const runId = 'wrun_wake_publish_failed';
+    const world = singleOrchestratorWorld(runId, [openWait(runId, 'wait_a')]);
+    vi.mocked(world.queue).mockRejectedValueOnce(new Error('queue down'));
+
+    await expect(wakeUpRun(world, runId)).rejects.toThrow('queue down');
+
+    expect(world.events.create).not.toHaveBeenCalled();
+    expect(pendingWakeUpWaits(runId).has('wait_a')).toBe(false);
+  });
+
+  it('keeps the mark of an earlier published wake when a later one fails', async () => {
+    const runId = 'wrun_wake_earlier_mark';
+    const world = singleOrchestratorWorld(runId, [
+      openWait(runId, 'wait_a'),
+      openWait(runId, 'wait_b'),
+    ]);
+    await wakeUpRun(world, runId, { correlationIds: ['wait_a'] });
+    expect(pendingWakeUpWaits(runId).has('wait_a')).toBe(true);
+
+    vi.mocked(world.queue).mockRejectedValueOnce(new Error('queue down'));
+    await expect(wakeUpRun(world, runId)).rejects.toThrow('queue down');
+
+    expect([...pendingWakeUpWaits(runId)]).toEqual(['wait_a']);
+  });
+});
+
+describe('recreateRunFromExisting', () => {
+  afterEach(() => {
+    vi.mocked(start).mockReset();
+  });
+
+  it('forwards the source run id to start as replayedFromRunId', async () => {
+    const world = createMockWorld({
+      run: { runId: 'wrun_source', deploymentId: 'deploy_source' },
+    });
+    vi.mocked(start).mockResolvedValue({ runId: 'wrun_new' } as Run<unknown>);
+
+    const newRunId = await recreateRunFromExisting(world, 'wrun_source');
+
+    expect(newRunId).toBe('wrun_new');
+    expect(start).toHaveBeenCalledWith(
+      { workflowId: 'test-workflow' },
+      expect.any(Array),
+      expect.objectContaining({
+        replayedFromRunId: 'wrun_source',
+        deploymentId: 'deploy_source',
+      })
+    );
+  });
+
+  it("never forwards the source run's start Hook", async () => {
+    // A re-run is a new run by intent; forwarding the reservation would make
+    // it a duplicate of the source and refuse it with HookConflictError.
+    const world = createMockWorld({
+      run: {
+        runId: 'wrun_source',
+        deploymentId: 'deploy_source',
+        startHook: { token: 'order:1' },
+      },
+    });
+    vi.mocked(start).mockResolvedValue({ runId: 'wrun_new' } as Run<unknown>);
+
+    await recreateRunFromExisting(world, 'wrun_source');
+
+    const opts = vi.mocked(start).mock.calls[0][2] as Record<string, unknown>;
+    expect(opts).not.toHaveProperty('hook');
+    expect(JSON.stringify(opts)).not.toContain('order:1');
+  });
+
+  it('pins the source run spec version for a replay on its own deployment', async () => {
+    const world = createMockWorld({
+      run: { deploymentId: 'deploy_source', specVersion: 6 },
+    });
+    vi.mocked(start).mockResolvedValue({ runId: 'wrun_new' } as Run<unknown>);
+
+    await recreateRunFromExisting(world, 'wrun_source', {
+      deploymentId: 'deploy_source',
+    });
+
+    expect(vi.mocked(start).mock.calls[0][2]).toMatchObject({
+      deploymentId: 'deploy_source',
+      specVersion: 6,
+    });
+  });
+
+  it('leaves the spec version to start() when the replay targets another deployment', async () => {
+    // The source run's version describes its own deployment, not the one
+    // the replay is redirected to; start() probes the target instead.
+    const world = createMockWorld({
+      run: { deploymentId: 'deploy_source', specVersion: 6 },
+    });
+    vi.mocked(start).mockResolvedValue({ runId: 'wrun_new' } as Run<unknown>);
+
+    await recreateRunFromExisting(world, 'wrun_source', {
+      deploymentId: 'deploy_other',
+    });
+
+    const opts = vi.mocked(start).mock.calls[0][2];
+    expect(opts).toMatchObject({ deploymentId: 'deploy_other' });
+    expect(opts?.specVersion).toBeUndefined();
+  });
+
+  it('still honours an explicit specVersion on a redirected replay', async () => {
+    const world = createMockWorld({
+      run: { deploymentId: 'deploy_source', specVersion: 6 },
+    });
+    vi.mocked(start).mockResolvedValue({ runId: 'wrun_new' } as Run<unknown>);
+
+    await recreateRunFromExisting(world, 'wrun_source', {
+      deploymentId: 'deploy_other',
+      specVersion: 7,
+    });
+
+    expect(vi.mocked(start).mock.calls[0][2]?.specVersion).toBe(7);
+  });
+
+  it("defaults the region to the source run's region", async () => {
+    const world = createMockWorld({ run: { runId: 'wrun_source' } });
+    const regionForRunId = vi.fn().mockReturnValue('cle1');
+    Object.assign(world, { regionForRunId });
+    vi.mocked(start).mockResolvedValue({ runId: 'wrun_new' } as Run<unknown>);
+
+    await recreateRunFromExisting(world, 'wrun_source');
+
+    expect(regionForRunId).toHaveBeenCalledWith('wrun_source');
+    expect(vi.mocked(start).mock.calls[0][2]?.region).toBe('cle1');
+  });
+
+  it('prefers an explicit region over the source run region', async () => {
+    const world = createMockWorld();
+    Object.assign(world, { regionForRunId: vi.fn().mockReturnValue('cle1') });
+    vi.mocked(start).mockResolvedValue({ runId: 'wrun_new' } as Run<unknown>);
+
+    await recreateRunFromExisting(world, 'wrun_source', { region: 'fra1' });
+
+    expect(vi.mocked(start).mock.calls[0][2]?.region).toBe('fra1');
+  });
+
+  it("leaves the region to start() when the world can't derive one", async () => {
+    const world = createMockWorld();
+    vi.mocked(start).mockResolvedValue({ runId: 'wrun_new' } as Run<unknown>);
+
+    await recreateRunFromExisting(world, 'wrun_source');
+
+    expect(vi.mocked(start).mock.calls[0][2]).not.toHaveProperty('region');
+  });
+
+  it('keeps a world-vercel run in its own region rather than the caller region', async () => {
+    // The observability dashboard replays runs from whatever region its own
+    // function runs in. Without this, a replay was tagged (and its data
+    // stored) in that region instead of the original run's.
+    const { createRunId, regionForRunId } = await import(
+      '@workflow/world-vercel'
+    );
+    vi.stubEnv('VERCEL_REGION', 'sfo1');
+    try {
+      const sourceRunId = `wrun_${createRunId({ region: 'cle1' })}`;
+      const world = createMockWorld({ run: { runId: sourceRunId } });
+      Object.assign(world, { regionForRunId });
+      vi.mocked(start).mockResolvedValue({
+        runId: 'wrun_new',
+      } as Run<unknown>);
+
+      await recreateRunFromExisting(world, sourceRunId);
+
+      expect(vi.mocked(start).mock.calls[0][2]?.region).toBe('cle1');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('refuses a dynamic run rather than creating one with no code behind it', async () => {
+    // Starting by name alone would create a run carrying the dynamic
+    // workflow id and none of the stored code, which no delivery could run.
+    const world = createMockWorld({
+      run: {
+        runId: 'wrun_dynamic',
+        workflowName: 'workflow//dynamic/abc123//workflow',
+        executionContext: {
+          dynamicWorkflow: {
+            version: 1,
+            sourceHash: 'abc123',
+            exportName: 'workflow',
+            steps: {},
+          },
+        },
+      },
+    });
+
+    await expect(
+      recreateRunFromExisting(world, 'wrun_dynamic')
+    ).rejects.toThrow(/dynamic workflow run; re-running it is not supported/);
+    expect(start).not.toHaveBeenCalled();
+  });
+});
+
+describe('Run.exists', () => {
+  afterEach(() => {
+    setWorld(undefined as unknown as World);
+  });
+
+  it('should return true when the run exists', async () => {
+    const world = createMockWorld();
+    setWorld(world);
+
+    const run = new Run('wrun_123');
+    const result = await run.exists;
+
+    expect(result).toBe(true);
+  });
+
+  it('should return false when the run does not exist', async () => {
+    const world = createMockWorld();
+    (world.runs.get as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new WorkflowRunNotFoundError('wrun_nonexistent')
+    );
+    setWorld(world);
+
+    const run = new Run('wrun_nonexistent');
+    const result = await run.exists;
+
+    expect(result).toBe(false);
+  });
+
+  it('should re-throw non-WorkflowRunNotFoundError errors', async () => {
+    const world = createMockWorld();
+    (world.runs.get as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('Internal server error')
+    );
+    setWorld(world);
+
+    const run = new Run('wrun_123');
+    await expect(run.exists).rejects.toThrow('Internal server error');
+  });
+});
+
+describe('Run.status', () => {
+  afterEach(() => {
+    setWorld(undefined as unknown as World);
+  });
+
+  it('reads metadata without resolving run payloads', async () => {
+    const world = createMockWorld();
+    setWorld(world);
+
+    await expect(new Run('wrun_123').status).resolves.toBe('running');
+
+    expect(world.runs.get).toHaveBeenCalledOnce();
+    expect(world.runs.get).toHaveBeenCalledWith('wrun_123', {
+      resolveData: 'none',
+    });
+  });
+});
+
+describe('Run.getReadable', () => {
+  afterEach(() => {
+    setWorld(undefined as unknown as World);
+  });
+
+  async function encryptedFrames(value: unknown, material: Uint8Array) {
+    const serialize = getSerializeStream(
+      {},
+      await deriveRunPayloadKeys(material)
+    );
+    const reader = serialize.readable.getReader();
+    const read = reader.read();
+    const writer = serialize.writable.getWriter();
+    await writer.write(value);
+    await writer.close();
+    const first = await read;
+    if (!first.value) throw new Error('Expected serialized frame');
+    return first.value;
+  }
+
+  it('does not fetch the run encryption key for an empty stream', async () => {
+    const world = createMockWorld();
+    world.getEncryptionKeyForRun = vi.fn().mockResolvedValue(undefined);
+    world.streams = {
+      get: vi.fn().mockResolvedValue(
+        new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        })
+      ),
+    } as unknown as World['streams'];
+    setWorld(world);
+
+    new Run('wrun_123').getReadable();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(world.streams.get).not.toHaveBeenCalled();
+    expect(world.runs.get).not.toHaveBeenCalled();
+    expect(world.getEncryptionKeyForRun).not.toHaveBeenCalled();
+  });
+
+  it('prefetches the run key when a consumed stream is empty', async () => {
+    const world = createMockWorld();
+    world.getEncryptionKeyForRun = vi.fn().mockResolvedValue(undefined);
+    world.streams = {
+      get: vi.fn().mockResolvedValue(
+        new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        })
+      ),
+    } as unknown as World['streams'];
+    setWorld(world);
+
+    await expect(
+      new Run('wrun_123').getReadable().getReader().read()
+    ).resolves.toMatchObject({ done: true });
+    expect(world.streams.get).toHaveBeenCalledOnce();
+    expect(world.runs.get).toHaveBeenCalledOnce();
+    expect(world.getEncryptionKeyForRun).toHaveBeenCalledOnce();
+  });
+
+  it('resolves supplied ops when the caller releases an open readable lock', async () => {
+    const ops: Promise<any>[] = [];
+    const material = new Uint8Array(32).fill(6);
+    const frame = await encryptedFrames({ open: true }, material);
+    const world = createMockWorld();
+    world.getEncryptionKeyForRun = vi.fn().mockResolvedValue(material);
+    world.streams = {
+      get: vi.fn().mockResolvedValue(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(frame);
+            // Deliberately remain open: releaseLock(), not EOF, is the signal.
+          },
+        })
+      ),
+    } as unknown as World['streams'];
+    setWorld(world);
+
+    const reader = new Run('wrun_123').getReadable({ ops }).getReader();
+    await reader.read();
+    reader.releaseLock();
+    await expect(Promise.all(ops)).resolves.toEqual([undefined]);
+  });
+
+  it('starts stream GET and the cached run-key lookup on first read', async () => {
+    const material = new Uint8Array(32).fill(7);
+    const frame = await encryptedFrames({ first: true }, material);
+    let resolveRun: (run: any) => void;
+    const runPromise = new Promise<any>((resolve) => {
+      resolveRun = resolve;
+    });
+    const world = createMockWorld();
+    world.runs.get = vi.fn().mockReturnValue(runPromise);
+    world.getEncryptionKeyForRun = vi.fn().mockResolvedValue(material);
+    world.streams = {
+      get: vi.fn().mockResolvedValue(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(frame);
+            controller.close();
+          },
+        })
+      ),
+    } as unknown as World['streams'];
+    setWorld(world);
+
+    const read = new Run('wrun_123').getReadable().getReader().read();
+    await vi.waitFor(() => {
+      expect(world.streams.get).toHaveBeenCalledOnce();
+      expect(world.runs.get).toHaveBeenCalledOnce();
+    });
+    resolveRun?.({
+      runId: 'wrun_123',
+      deploymentId: 'test-deployment',
+    });
+
+    await expect(read).resolves.toMatchObject({ value: { first: true } });
+    expect(world.getEncryptionKeyForRun).toHaveBeenCalledOnce();
+  });
+
+  it('reuses one run-key promise across readable sessions', async () => {
+    const material = new Uint8Array(32).fill(8);
+    const frame = await encryptedFrames({ reusable: true }, material);
+    const world = createMockWorld();
+    world.getEncryptionKeyForRun = vi.fn().mockResolvedValue(material);
+    world.streams = {
+      get: vi.fn().mockImplementation(
+        async () =>
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(frame);
+              controller.close();
+            },
+          })
+      ),
+    } as unknown as World['streams'];
+    setWorld(world);
+
+    const run = new Run('wrun_123');
+    await expect(run.getReadable().getReader().read()).resolves.toMatchObject({
+      value: { reusable: true },
+    });
+    await expect(run.getReadable().getReader().read()).resolves.toMatchObject({
+      value: { reusable: true },
+    });
+
+    expect(world.runs.get).toHaveBeenCalledOnce();
+    expect(world.getEncryptionKeyForRun).toHaveBeenCalledOnce();
+    expect(world.streams.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces a prefetched key failure when an encrypted frame is consumed', async () => {
+    const material = new Uint8Array(32).fill(9);
+    const frame = await encryptedFrames({ secret: true }, material);
+    const keyError = new Error('key lookup failed');
+    const world = createMockWorld();
+    world.getEncryptionKeyForRun = vi.fn().mockRejectedValue(keyError);
+    world.streams = {
+      get: vi.fn().mockResolvedValue(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(frame);
+            controller.close();
+          },
+        })
+      ),
+    } as unknown as World['streams'];
+    setWorld(world);
+
+    await expect(
+      new Run('wrun_123').getReadable().getReader().read()
+    ).rejects.toThrow('key lookup failed');
+    expect(world.runs.get).toHaveBeenCalledOnce();
+    expect(world.getEncryptionKeyForRun).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Run.wakeUp', () => {
+  afterEach(() => {
+    setWorld(undefined as unknown as World);
+  });
+
+  it('should delegate to wakeUpRun with default options', async () => {
+    const events: Event[] = [
+      {
+        eventId: 'evnt_0',
+        runId: 'wrun_123',
+        eventType: 'wait_created',
+        correlationId: 'wait_abc',
+        eventData: { resumeAt: new Date('2024-01-01T00:00:01.000Z') },
+        createdAt: new Date(),
+      },
+    ];
+
+    const world = createMockWorld({ events });
+    setWorld(world);
+
+    const run = new Run('wrun_123');
+    const result = await run.wakeUp();
+
+    expect(result.stoppedCount).toBe(1);
+    expect(world.queue).toHaveBeenCalled();
+    expect(world.events.create).toHaveBeenCalledWith(
+      'wrun_123',
+      expect.objectContaining({
+        eventType: 'wait_completed',
+        eventData: {
+          resumeAt: new Date('2024-01-01T00:00:01.000Z'),
+        },
+        correlationId: 'wait_abc',
+      }),
+      expect.anything()
+    );
+  });
+
+  it('should pass correlationIds option through', async () => {
+    const events: Event[] = [
+      {
+        eventId: 'evnt_0',
+        runId: 'wrun_123',
+        eventType: 'wait_created',
+        correlationId: 'wait_abc',
+        eventData: { resumeAt: new Date('2024-01-01T00:00:01.000Z') },
+        createdAt: new Date(),
+      },
+      {
+        eventId: 'evnt_1',
+        runId: 'wrun_123',
+        eventType: 'wait_created',
+        correlationId: 'wait_def',
+        eventData: { resumeAt: new Date('2024-01-01T00:00:02.000Z') },
+        createdAt: new Date(),
+      },
+    ];
+
+    const world = createMockWorld({ events });
+    setWorld(world);
+
+    const run = new Run('wrun_123');
+    const result = await run.wakeUp({ correlationIds: ['wait_abc'] });
+
+    expect(result.stoppedCount).toBe(1);
+    // Should only complete wait_abc, not wait_def
+    expect(world.events.create).toHaveBeenCalledTimes(1);
+    expect(world.events.create).toHaveBeenCalledWith(
+      'wrun_123',
+      expect.objectContaining({
+        eventType: 'wait_completed',
+        eventData: {
+          resumeAt: new Date('2024-01-01T00:00:01.000Z'),
+        },
+        correlationId: 'wait_abc',
+      }),
+      expect.anything()
+    );
+  });
+
+  it('should return stoppedCount of 0 when no pending waits', async () => {
+    const world = createMockWorld({ events: [] });
+    setWorld(world);
+
+    const run = new Run('wrun_123');
+    const result = await run.wakeUp();
+
+    expect(result.stoppedCount).toBe(0);
+    // Should not re-enqueue when nothing was stopped
+    expect(world.queue).not.toHaveBeenCalled();
+  });
+});
+
+describe('Run custom serialization', () => {
+  // In production builds, the SWC plugin auto-registers the class via an
+  // inline IIFE. In tests (no SWC), we register manually.
+  registerSerializationClass('Run', Run);
+
+  afterEach(() => {
+    setWorld(undefined as unknown as World);
+  });
+
+  it('should expose WORKFLOW_SERIALIZE and WORKFLOW_DESERIALIZE methods', () => {
+    const run = new Run('wrun_serialize');
+    const serialized = Run[WORKFLOW_SERIALIZE](run);
+    const deserialized = Run[WORKFLOW_DESERIALIZE]({
+      runId: 'wrun_deserialize',
+    });
+
+    expect(serialized).toEqual({
+      runId: 'wrun_serialize',
+      resilientStart: false,
+    });
+    expect(deserialized).toBeInstanceOf(Run);
+    expect(deserialized.runId).toBe('wrun_deserialize');
+  });
+
+  it('should roundtrip through step serialization boundary', async () => {
+    const run = new Run('wrun_roundtrip');
+    const dehydrated = await dehydrateStepReturnValue(
+      run,
+      'wrun_parent',
+      undefined
+    );
+
+    const hydrated = await hydrateStepReturnValue(
+      dehydrated,
+      'wrun_parent',
+      undefined
+    );
+
+    expect(hydrated).toBeInstanceOf(Run);
+    expect((hydrated as Run<unknown>).runId).toBe('wrun_roundtrip');
+  });
+});
+
+describe('Run.returnValue polling interval', () => {
+  const envName = 'WORKFLOW_RETURN_VALUE_POLL_INTERVAL_MS';
+  const originalValue = process.env[envName];
+
+  afterEach(() => {
+    if (originalValue === undefined) {
+      delete process.env[envName];
+    } else {
+      process.env[envName] = originalValue;
+    }
+  });
+
+  it('defaults to one second', () => {
+    delete process.env[envName];
+
+    expect(getReturnValuePollIntervalMs()).toBe(1_000);
+  });
+
+  it('accepts a runtime override', () => {
+    process.env[envName] = '5000';
+
+    expect(getReturnValuePollIntervalMs()).toBe(5_000);
+  });
+});
+
+describe('Run.returnValue payload resolution', () => {
+  afterEach(() => {
+    setWorld(undefined as unknown as World);
+  });
+
+  it('polls metadata before resolving a completed run payload', async () => {
+    const output = await dehydrateWorkflowReturnValue(
+      42,
+      'wrun_123',
+      undefined
+    );
+    const world = createMockWorld({
+      run: {
+        status: 'completed',
+        output,
+        completedAt: new Date(),
+      },
+    });
+    setWorld(world);
+
+    await expect(new Run<number>('wrun_123').returnValue).resolves.toBe(42);
+
+    expect(world.runs.get).toHaveBeenCalledTimes(2);
+    expect(world.runs.get).toHaveBeenNthCalledWith(1, 'wrun_123', {
+      resolveData: 'none',
+    });
+    expect(world.runs.get).toHaveBeenNthCalledWith(2, 'wrun_123', {
+      resolveData: 'all',
+    });
+  });
+});
+
+describe('Run.returnValue when run.status === "failed"', () => {
+  // Register the FatalError class so the run-error serialization pipeline
+  // can find it during hydration (the SWC plugin does this in production).
+  registerSerializationClass('@workflow/errors//FatalError', FatalError);
+
+  afterEach(() => {
+    setWorld(undefined as unknown as World);
+  });
+
+  function makeFailedRunWorld(error: Uint8Array, errorCode?: string): World {
+    return {
+      specVersion: SPEC_VERSION_CURRENT,
+      runs: {
+        get: vi.fn().mockResolvedValue({
+          runId: 'wrun_failed',
+          workflowName: 'failing-workflow',
+          status: 'failed',
+          specVersion: 2,
+          input: [],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          startedAt: new Date(),
+          completedAt: new Date(),
+          deploymentId: 'test-deployment',
+          error,
+          errorCode,
+        }),
+      },
+      events: {
+        list: vi.fn().mockResolvedValue({
+          data: [],
+          hasMore: false,
+          cursor: null,
+        }),
+        create: vi.fn(),
+      },
+      queue: vi.fn().mockResolvedValue(undefined),
+    } as unknown as World;
+  }
+
+  it('should throw WorkflowRunFailedError with the original FatalError as cause', async () => {
+    const original = new FatalError('boom');
+    const serialized = await dehydrateRunError(
+      original,
+      'wrun_failed',
+      undefined
+    );
+    const world = makeFailedRunWorld(serialized, 'USER_ERROR');
+    setWorld(world);
+
+    const run = new Run('wrun_failed');
+    let caught: WorkflowRunFailedError | undefined;
+    try {
+      await run.returnValue;
+    } catch (err) {
+      caught = err as WorkflowRunFailedError;
+    }
+
+    expect(caught).toBeInstanceOf(WorkflowRunFailedError);
+    expect(caught?.runId).toBe('wrun_failed');
+    expect(caught?.errorCode).toBe('USER_ERROR');
+
+    // The original thrown value flows through verbatim — preserving the
+    // FatalError class identity, message, and the `fatal` marker.
+    const cause = caught?.cause;
+    expect(FatalError.is(cause)).toBe(true);
+    expect(cause).toBeInstanceOf(FatalError);
+    expect((cause as FatalError).message).toBe('boom');
+    expect((cause as FatalError).fatal).toBe(true);
+    expect(world.runs.get).toHaveBeenCalledTimes(2);
+    expect(world.runs.get).toHaveBeenNthCalledWith(1, 'wrun_failed', {
+      resolveData: 'none',
+    });
+    expect(world.runs.get).toHaveBeenNthCalledWith(2, 'wrun_failed', {
+      resolveData: 'all',
+    });
+  });
+
+  it('should preserve a plain Error cause through hydration', async () => {
+    const original = new Error('unexpected');
+    original.stack = 'Error: unexpected\n    at someFn (a.js:1:1)';
+    const serialized = await dehydrateRunError(
+      original,
+      'wrun_failed',
+      undefined
+    );
+    setWorld(makeFailedRunWorld(serialized, 'RUNTIME_ERROR'));
+
+    const run = new Run('wrun_failed');
+    let caught: WorkflowRunFailedError | undefined;
+    try {
+      await run.returnValue;
+    } catch (err) {
+      caught = err as WorkflowRunFailedError;
+    }
+
+    expect(caught).toBeInstanceOf(WorkflowRunFailedError);
+    expect(caught?.errorCode).toBe('RUNTIME_ERROR');
+    expect(caught?.cause).toBeInstanceOf(Error);
+    expect((caught?.cause as Error).message).toBe('unexpected');
+    expect((caught?.cause as Error).stack).toBe(original.stack);
+  });
+
+  it('should preserve a non-Error thrown value (string) as cause', async () => {
+    const serialized = await dehydrateRunError(
+      'thrown string',
+      'wrun_failed',
+      undefined
+    );
+    setWorld(makeFailedRunWorld(serialized));
+
+    const run = new Run('wrun_failed');
+    let caught: WorkflowRunFailedError | undefined;
+    try {
+      await run.returnValue;
+    } catch (err) {
+      caught = err as WorkflowRunFailedError;
+    }
+
+    expect(caught).toBeInstanceOf(WorkflowRunFailedError);
+    expect(caught?.cause).toBe('thrown string');
+    // Message should be derived from the thrown string itself.
+    expect(caught?.message).toContain('thrown string');
+  });
+
+  it('should preserve an Error cause chain across hydration', async () => {
+    const root = new TypeError('bad input');
+    const wrapped = new FatalError('outer');
+    (wrapped as Error).cause = root;
+    const serialized = await dehydrateRunError(
+      wrapped,
+      'wrun_failed',
+      undefined
+    );
+    setWorld(makeFailedRunWorld(serialized, 'USER_ERROR'));
+
+    const run = new Run('wrun_failed');
+    let caught: WorkflowRunFailedError | undefined;
+    try {
+      await run.returnValue;
+    } catch (err) {
+      caught = err as WorkflowRunFailedError;
+    }
+
+    expect(caught).toBeInstanceOf(WorkflowRunFailedError);
+    const cause = caught?.cause;
+    expect(FatalError.is(cause)).toBe(true);
+    expect((cause as FatalError).message).toBe('outer');
+    const nested = (cause as Error).cause;
+    expect(nested).toBeInstanceOf(TypeError);
+    expect((nested as TypeError).message).toBe('bad input');
+  });
+
+  it('should fall back to a generic Error when hydration fails', async () => {
+    // Pass a corrupted payload (random bytes that are not a valid prefix)
+    // to force hydrateRunError to throw inside Run.returnValue, exercising
+    // the catch branch that surfaces a generic fallback.
+    const corrupt = new Uint8Array([0xff, 0x00, 0x00, 0x00, 0x00]);
+    setWorld(makeFailedRunWorld(corrupt, 'RUNTIME_ERROR'));
+
+    const run = new Run('wrun_failed');
+    let caught: WorkflowRunFailedError | undefined;
+    try {
+      await run.returnValue;
+    } catch (err) {
+      caught = err as WorkflowRunFailedError;
+    }
+
+    expect(caught).toBeInstanceOf(WorkflowRunFailedError);
+    // Even on hydration failure, errorCode is still surfaced from the run.
+    expect(caught?.errorCode).toBe('RUNTIME_ERROR');
+    expect(caught?.cause).toBeInstanceOf(Error);
+    expect((caught?.cause as Error).message).toContain(
+      'Failed to hydrate workflow run error'
+    );
+  });
+});
+
+describe('cancelRuns', () => {
+  it('fast path: delegates the whole batch to world.runs.cancelMany once', async () => {
+    const cancelMany = vi.fn().mockResolvedValue({
+      summary: {
+        requested: 3,
+        cancelled: 3,
+        alreadyCancelled: 0,
+        notCancellable: 0,
+        notFound: 0,
+        failed: 0,
+      },
+      results: [
+        { runId: 'a', outcome: 'cancelled' },
+        { runId: 'b', outcome: 'cancelled' },
+        { runId: 'c', outcome: 'cancelled' },
+      ],
+    });
+    const world = {
+      runs: { get: vi.fn(), cancelMany },
+      events: { create: vi.fn() },
+    } as unknown as World;
+
+    const result = await cancelRuns(world, ['a', 'b', 'c'], {
+      cancelReason: 'cleanup',
+    });
+
+    expect(cancelMany).toHaveBeenCalledTimes(1);
+    expect(cancelMany).toHaveBeenCalledWith({
+      runIds: ['a', 'b', 'c'],
+      cancelReason: 'cleanup',
+    });
+    // The single-run path must not be touched on the fast path.
+    expect(world.events.create).not.toHaveBeenCalled();
+    expect(result.summary.cancelled).toBe(3);
+  });
+
+  it('fallback: runs single-run cancellation with at most 20 concurrent operations', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+
+    const create = vi.fn().mockImplementation(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Yield so overlapping calls accumulate before any resolve.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+      return { event: {} };
+    });
+
+    // No cancelMany → forces the fallback path.
+    const world = {
+      runs: {
+        get: vi.fn().mockResolvedValue({
+          runId: 'r',
+          workflowName: 'wf',
+          status: 'running',
+          specVersion: 2,
+          deploymentId: 'dpl',
+        }),
+      },
+      events: { create },
+    } as unknown as World;
+
+    const runIds = Array.from({ length: 100 }, (_, i) => `wrun_${i}`);
+    const result = await cancelRuns(world, runIds);
+
+    expect(create).toHaveBeenCalledTimes(100);
+    expect(maxInFlight).toBeGreaterThan(0);
+    expect(maxInFlight).toBeLessThanOrEqual(20);
+    expect(result.summary.requested).toBe(100);
+    expect(result.summary.cancelled).toBe(100);
+    // Order preserved.
+    expect(result.results.map((r) => r.runId)).toEqual(runIds);
+  });
+
+  it('fallback: reports failures as failed/internal_error/retryable', async () => {
+    const world = {
+      runs: {
+        get: vi.fn().mockRejectedValue(new Error('boom')),
+      },
+      events: { create: vi.fn() },
+    } as unknown as World;
+
+    const result = await cancelRuns(world, ['a', 'b']);
+
+    expect(result.summary.failed).toBe(2);
+    expect(result.results).toEqual([
+      {
+        runId: 'a',
+        outcome: 'failed',
+        code: 'internal_error',
+        retryable: true,
+      },
+      {
+        runId: 'b',
+        outcome: 'failed',
+        code: 'internal_error',
+        retryable: true,
+      },
+    ]);
+  });
+
+  it('rejects an empty list', async () => {
+    const world = { runs: {}, events: {} } as unknown as World;
+    await expect(cancelRuns(world, [])).rejects.toThrow(/at least one/i);
+  });
+
+  it('rejects duplicate IDs', async () => {
+    const world = { runs: {}, events: {} } as unknown as World;
+    await expect(cancelRuns(world, ['a', 'a'])).rejects.toThrow(/unique/i);
+  });
+
+  it('rejects more than 500 IDs', async () => {
+    const world = { runs: {}, events: {} } as unknown as World;
+    const runIds = Array.from({ length: 501 }, (_, i) => `wrun_${i}`);
+    await expect(cancelRuns(world, runIds)).rejects.toThrow(/at most 500/i);
+  });
+});

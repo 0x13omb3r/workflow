@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import { OpenAI } from 'openai';
 import { createHook, getStepMetadata, getWorkflowMetadata } from 'workflow';
 
 /**
@@ -17,6 +17,8 @@ async function stepWithGetMetadata() {
   if (Math.random() < 0.5) {
     throw new Error('Retryable error');
   }
+
+  return ctx;
 }
 
 export async function withWorkflowMetadata() {
@@ -24,7 +26,9 @@ export async function withWorkflowMetadata() {
   const ctx = getWorkflowMetadata();
   console.log('workflow context', ctx);
 
-  await stepWithGetMetadata();
+  const stepCtx = await stepWithGetMetadata();
+
+  return { workflowCtx: ctx, stepCtx };
 }
 
 async function initiateOpenAIResponse() {
@@ -62,7 +66,7 @@ export async function withCreateHook() {
 
   // Register the hook with the token that is specific
   // to the response ID that we are interested in.
-  const hook = createHook<{ type: string; data: { id: string } }>({
+  using hook = createHook<{ type: string; data: { id: string } }>({
     token: `openai:${respId}`,
   });
   console.log('Registered hook:', hook.token);

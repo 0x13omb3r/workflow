@@ -1,46 +1,52 @@
 {
   "name": "@workflow/world-testing",
-  "version": "4.0.1-beta.5",
-  "description": "Testing utilities and World implementation for Workflow DevKit",
+  "version": "5.1.2",
+  "description": "Testing utilities and World implementation for Workflow SDK",
   "main": "dist/src/index.mjs",
   "files": [
-    "dist"
+    "dist",
+    "!dist/**/*.test.*",
+    "!dist/**/*.d.ts.map"
   ],
   "publishConfig": {
     "access": "public"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/vercel/workflow.git",
     "directory": "packages/world-testing"
   },
   "scripts": {
-    "build": "wf build && tsc",
+    "build": "wf build && node scripts/generate-well-known-dts.mjs && tsc && cp .well-known/workflow/v1/*.mjs dist/.well-known/workflow/v1/",
     "clean": "tsc --build --clean && rm -rf dist .well-known* .workflow-data",
     "start": "node --watch src/server.mts",
-    "test": "vitest"
+    "test": "vitest run --config=../../vitest.config.ts"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.5",
+    "@hono/node-server": "1.19.18",
     "@workflow/cli": "workspace:*",
-    "workflow": "workspace:*",
+    "@workflow/core": "workspace:*",
     "@workflow/world": "workspace:*",
-    "chalk": "^5.6.2",
-    "hono": "^4.9.10",
-    "jsonlines": "^0.1.1",
+    "@workflow/world-local": "workspace:*",
+    "chalk": "5.6.2",
+    "hono": "4.13.17",
+    "jsonlines": "0.1.1",
+    "ulid": "catalog:",
+    "workflow": "workspace:*",
     "zod": "catalog:"
   },
   "devDependencies": {
+    "@types/jsonlines": "0.1.5",
     "@types/node": "catalog:",
-    "@types/jsonlines": "^0.1.5",
     "@workflow/tsconfig": "workspace:*",
+    "typescript": "catalog:",
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "vitest": "catalog:"
+    "vitest": "^4.1.10 || ^5.0.0"
   },
   "keywords": [],
   "author": "",
-  "packageManager": "pnpm@10.15.1"
+  "packageManager": "pnpm@11.28.11"
 }

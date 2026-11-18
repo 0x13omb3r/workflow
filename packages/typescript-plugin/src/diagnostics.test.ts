@@ -72,8 +72,8 @@ describe('getCustomDiagnostics', () => {
     });
   });
 
-  describe('Error 9002: Step function must be async', () => {
-    it('warns when step function is not async', () => {
+  describe('Sync step functions are allowed (no error 9002)', () => {
+    it('does not warn when step function is sync', () => {
       const source = `
         function myStep() {
           'use step';
@@ -84,10 +84,7 @@ describe('getCustomDiagnostics', () => {
       const { program } = createTestProgram(source);
       const diagnostics = getCustomDiagnostics('test.ts', program, ts);
 
-      expectDiagnostic(diagnostics, {
-        code: 9002,
-        messageIncludes: 'async',
-      });
+      expectNoDiagnostic(diagnostics, 9002);
     });
 
     it('does not warn when step function is async', () => {
@@ -105,7 +102,7 @@ describe('getCustomDiagnostics', () => {
     });
   });
 
-  describe('Error 9003: Node.js API usage in workflows', () => {
+  describe('Error 9003: Node.js or Bun API usage in workflows', () => {
     it('warns when using fs with default import', () => {
       const source = `
         import fs from 'fs';
@@ -194,6 +191,117 @@ describe('getCustomDiagnostics', () => {
           'use step';
           const data = fs.readFileSync('/tmp/test.txt', 'utf-8');
           return data;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectNoDiagnostic(diagnostics, 9003);
+    });
+
+    it('does not warn when Bun is used in step function', () => {
+      const source = `
+        import { RedisClient } from 'bun';
+
+        async function myStep() {
+          'use step';
+          new RedisClient();
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectNoDiagnostic(diagnostics, 9003);
+    });
+
+    it('warns when Bun module is used in workflow function', () => {
+      const source = `
+        import { file } from 'bun';
+
+        export async function myWorkflow() {
+          'use workflow';
+          const f = file('/tmp/test.txt');
+          return f;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9003,
+        messageIncludes: 'bun',
+      });
+    });
+
+    it('shows Bun in error message when Bun module is used', () => {
+      const source = `
+        import { file } from 'bun';
+
+        export async function myWorkflow() {
+          'use workflow';
+          const f = file('/tmp/test.txt');
+          return f;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9003,
+        messageIncludes: 'Bun API',
+      });
+    });
+
+    it('warns when bun:sqlite is used in workflow function', () => {
+      const source = `
+        import { Database } from 'bun:sqlite';
+
+        export async function myWorkflow() {
+          'use workflow';
+          Database.open(':memory:');
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9003,
+        messageIncludes: 'bun:sqlite',
+      });
+    });
+
+    it('warns when bun:ffi is used in workflow function', () => {
+      const source = `
+        import { dlopen } from 'bun:ffi';
+
+        export async function myWorkflow() {
+          'use workflow';
+          const lib = dlopen('./lib.so', {});
+          return lib;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9003,
+        messageIncludes: 'bun:ffi',
+      });
+    });
+
+    it('does not warn when bun:sqlite is used in step function', () => {
+      const source = `
+        import { Database } from 'bun:sqlite';
+
+        async function myStep() {
+          'use step';
+          Database.open(':memory:');
         }
       `;
 
@@ -674,6 +782,488 @@ describe('getCustomDiagnostics', () => {
         code: 9008,
         messageIncludes: "'use workflow'",
       });
+    });
+  });
+
+  describe('Error 9009: Direct workflow function invocation', () => {
+    it('does not warn when calling workflow function directly from another workflow', () => {
+      const source = `
+        export async function myWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        export async function anotherWorkflow() {
+          'use workflow';
+          await myWorkflow();
+          return 456;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectNoDiagnostic(diagnostics, 9009);
+    });
+
+    it('does not warn when calling imported workflow function from another workflow', () => {
+      const { program } = createTestProgram(
+        [
+          {
+            fileName: 'child.ts',
+            source: `
+              export async function childWorkflow() {
+                'use workflow';
+                return 123;
+              }
+            `,
+          },
+          {
+            fileName: 'parent.ts',
+            source: `
+              import { childWorkflow } from './child';
+
+              export async function parentWorkflow() {
+                'use workflow';
+                return await childWorkflow();
+              }
+            `,
+          },
+        ],
+        'parent.ts'
+      );
+
+      const diagnostics = getCustomDiagnostics('parent.ts', program, ts);
+
+      expectNoDiagnostic(diagnostics, 9009);
+    });
+
+    it('does not warn when static workflow method calls workflow function directly', () => {
+      const source = `
+        export async function childWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        class ParentWorkflow {
+          static async run() {
+            'use workflow';
+            return await childWorkflow();
+          }
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectNoDiagnostic(diagnostics, 9009);
+    });
+
+    it('warns when calling workflow function directly from API route', () => {
+      const source = `
+        export async function myWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        export async function POST(req: Request) {
+          const result = await myWorkflow();
+          return Response.json(result);
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9009,
+        messageIncludes: 'start()',
+      });
+    });
+
+    it('warns when calling workflow function directly from regular function', () => {
+      const source = `
+        export async function myWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        export async function regularFunction() {
+          const result = await myWorkflow();
+          return result;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9009,
+        messageIncludes: 'workflow/api',
+      });
+    });
+
+    it('warns when calling workflow function directly from step function', () => {
+      const source = `
+        export async function myWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        export async function myStep() {
+          'use step';
+          const result = await myWorkflow();
+          return result;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9009,
+        messageIncludes: 'workflow/api',
+      });
+    });
+
+    it('warns when calling workflow function directly from step getter nested in a workflow', () => {
+      const source = `
+        export async function childWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        export async function parentWorkflow() {
+          'use workflow';
+
+          class Sensor {
+            get reading() {
+              'use step';
+              return childWorkflow();
+            }
+          }
+
+          return await new Sensor().reading;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9009,
+        messageIncludes: 'workflow/api',
+      });
+    });
+
+    it('does not warn when using start() function to invoke workflow', () => {
+      const source = `
+        import { start } from 'workflow/api';
+
+        export async function myWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        export async function handler() {
+          const run = await start(myWorkflow);
+          return run;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectNoDiagnostic(diagnostics, 9009);
+    });
+
+    it('warns when invoking through await expression', () => {
+      const source = `
+        export async function myWorkflow() {
+          'use workflow';
+          return 'result';
+        }
+
+        export async function caller() {
+          const x = await myWorkflow();
+          return x;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9009,
+      });
+    });
+
+    it('warns when invoking without await', () => {
+      const source = `
+        export async function myWorkflow() {
+          'use workflow';
+          return 'result';
+        }
+
+        export function caller() {
+          myWorkflow();
+          return 'done';
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9009,
+      });
+    });
+
+    it('warns multiple times if workflow called multiple times', () => {
+      const source = `
+        export async function myWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        export async function handler() {
+          await myWorkflow();
+          await myWorkflow();
+          return 'done';
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      // Should have at least 2 warnings for the two calls
+      const warnings = diagnostics.filter((d) => d.code === 9009);
+      expect(warnings.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('does not warn when calling non-workflow functions', () => {
+      const source = `
+        export async function regularFunction() {
+          return 123;
+        }
+
+        export async function caller() {
+          const result = await regularFunction();
+          return result;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectNoDiagnostic(diagnostics, 9009);
+    });
+
+    it('warns when calling workflow from Next.js Server Action', () => {
+      const source = `
+        'use server';
+
+        export async function myWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        export async function serverAction() {
+          const result = await myWorkflow();
+          return result;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9009,
+        messageIncludes: 'start()',
+      });
+    });
+
+    it('shows warning level (not error) for direct invocation', () => {
+      const source = `
+        export async function myWorkflow() {
+          'use workflow';
+          return 123;
+        }
+
+        export async function caller() {
+          await myWorkflow();
+          return 'done';
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      const warning = diagnostics.find((d) => d.code === 9009);
+      expect(warning).toBeDefined();
+      expect(warning?.category).toBe(ts.DiagnosticCategory.Warning);
+    });
+
+    it('warns when calling exported const arrow function with "use workflow"', () => {
+      const source = `
+        export const myWorkflow = async () => {
+          'use workflow';
+          return 123;
+        };
+
+        export async function caller() {
+          const result = await myWorkflow();
+          return result;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      expectDiagnostic(diagnostics, {
+        code: 9009,
+        messageIncludes: 'start()',
+      });
+    });
+
+    it('detects nested workflow function calls - both outer and inner', () => {
+      const source = `
+        export async function wf1() {
+          'use workflow';
+          return 1;
+        }
+
+        export async function wf2() {
+          'use workflow';
+          return 2;
+        }
+
+        export async function caller() {
+          const x = wf1(wf2());
+          return x;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      // Should have warnings for BOTH wf1() and wf2() calls
+      const warnings = diagnostics.filter((d) => d.code === 9009);
+      expect(warnings.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('detects deeply nested workflow function calls', () => {
+      const source = `
+        export async function wf1() {
+          'use workflow';
+          return 1;
+        }
+
+        export async function wf2() {
+          'use workflow';
+          return 2;
+        }
+
+        export async function wf3() {
+          'use workflow';
+          return 3;
+        }
+
+        export async function caller() {
+          const x = wf1(wf2(wf3()));
+          return x;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      // Should have warnings for wf1(), wf2(), and wf3() calls
+      const warnings = diagnostics.filter((d) => d.code === 9009);
+      expect(warnings.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it('detects multiple nested calls in different arguments', () => {
+      const source = `
+        export async function wf1() {
+          'use workflow';
+          return 1;
+        }
+
+        export async function wf2() {
+          'use workflow';
+          return 2;
+        }
+
+        export async function wf3() {
+          'use workflow';
+          return 3;
+        }
+
+        export async function caller() {
+          const x = wf1(wf2(), wf3());
+          return x;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      // Should have warnings for wf1(), wf2(), and wf3() calls
+      const warnings = diagnostics.filter((d) => d.code === 9009);
+      expect(warnings.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it('detects nested calls in array literals', () => {
+      const source = `
+        export async function wf1() {
+          'use workflow';
+          return 1;
+        }
+
+        export async function wf2() {
+          'use workflow';
+          return 2;
+        }
+
+        export async function caller() {
+          const arr = [wf1(), wf2()];
+          return arr;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      // Should have warnings for both wf1() and wf2() calls
+      const warnings = diagnostics.filter((d) => d.code === 9009);
+      expect(warnings.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('detects nested calls in object properties', () => {
+      const source = `
+        export async function wf1() {
+          'use workflow';
+          return 1;
+        }
+
+        export async function wf2() {
+          'use workflow';
+          return 2;
+        }
+
+        export async function caller() {
+          const obj = { a: wf1(), b: wf2() };
+          return obj;
+        }
+      `;
+
+      const { program } = createTestProgram(source);
+      const diagnostics = getCustomDiagnostics('test.ts', program, ts);
+
+      // Should have warnings for both wf1() and wf2() calls
+      const warnings = diagnostics.filter((d) => d.code === 9009);
+      expect(warnings.length).toBeGreaterThanOrEqual(2);
     });
   });
 });

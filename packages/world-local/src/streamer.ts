@@ -1,203 +1,399 @@
-import { EventEmitter } from 'node:events';
-import path from 'node:path';
-import type { Streamer } from '@workflow/world';
-import { monotonicFactory } from 'ulid';
-import { listJSONFiles, readBuffer, write } from './fs.js';
+/**
+ * Run streams, stored as rows of `stream_chunks` in the data directory's
+ * database.
+ *
+ * A chunk's index is assigned in the transaction that inserts it (one past
+ * the stream's last), so a stream's chunks are totally ordered at commit,
+ * densely numbered, and never reordered or duplicated for a reader: a reader
+ * that opens mid-write sees the committed prefix and then the rest, in index
+ * order. The end of a stream is a row with `eof = 1` after its last chunk.
+ *
+ * Readers in this process are woken by an in-process signal; readers in
+ * other processes (a test runner reading an app's stream) poll for rows past
+ * the last index they delivered, an index seek however long the stream is.
+ */
 
-// Create a monotonic ULID factory that ensures ULIDs are always increasing
-// even when generated within the same millisecond
-const monotonicUlid = monotonicFactory(() => Math.random());
+import { EventEmitter } from 'node:events';
+import { globalSingleton } from '@workflow/utils';
+import type {
+  GetChunksOptions,
+  StreamChunksResponse,
+  Streamer,
+  StreamInfoResponse,
+  WorkflowRun,
+} from '@workflow/world';
+import { decode } from './db/codec.js';
+import { type Database, databaseFor } from './db/index.js';
+import { ranPurge } from './storage/run-retention.js';
+
+/** How often a reader checks for chunks written by another process. */
+const POLL_INTERVAL_MS = 100;
 
 /**
- * A chunk consists of a boolean `eof` indicating if it's the last chunk,
- * and a `chunk` which is a Buffer of data.
- * The serialized format is:
- * - 1 byte for `eof` (0 or 1)
- * - and the rest is the chunk data.
+ * How many chunks a reader reads at once. A reader reads the next batch only
+ * once the consumer has taken the last, so this bounds what it holds.
  */
-export interface Chunk {
-  eof: boolean;
-  chunk: Buffer;
+const READ_BATCH_CHUNKS = 16;
+
+/** Reads that fail in a row before a reader gives up with the error. */
+const MAX_CONSECUTIVE_READ_FAILURES = 50;
+
+const signals = globalSingleton(
+  '@workflow/world-local//streamSignals',
+  1,
+  () => {
+    const emitter = new EventEmitter();
+    emitter.setMaxListeners(0);
+    return { emitter };
+  }
+);
+
+function signalKey(db: Database, name: string): string {
+  return `${db.file}\0${name}`;
 }
 
-export function serializeChunk(chunk: Chunk) {
-  const eofByte = Buffer.from([chunk.eof ? 1 : 0]);
-  return Buffer.concat([eofByte, chunk.chunk]);
+function toBytes(chunk: string | Uint8Array): Uint8Array {
+  return typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk;
 }
 
-export function deserializeChunk(serialized: Buffer) {
-  const eof = serialized[0] === 1;
-  const chunk = serialized.subarray(1);
-  return { eof, chunk };
+interface ChunkRow {
+  idx: number;
+  data: Uint8Array | null;
+  eof: number;
 }
 
-export function createStreamer(basedir: string): Streamer {
-  const streamEmitter = new EventEmitter<{
-    [key: `chunk:${string}`]: [
-      {
-        streamName: string;
-        chunkData: Uint8Array;
-        chunkId: string;
-      },
-    ];
-    [key: `close:${string}`]: [
-      {
-        streamName: string;
-      },
-    ];
-  }>();
+export function createStreamer(
+  basedir: string,
+  tag?: string
+): Streamer & {
+  /** Kept for callers of the filesystem implementation; nothing to clear. */
+  clearCache(): void;
+} {
+  const db = databaseFor(basedir);
+  // Writes to one stream from this instance land in call order, even when
+  // their runId is a promise several writes are waiting on.
+  const turns = new Map<string, Promise<unknown>>();
+
+  function inTurn<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    const previous = turns.get(name) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(fn);
+    turns.set(name, next);
+    const forget = () => {
+      if (turns.get(name) === next) turns.delete(name);
+    };
+    // Both outcomes handled: a failed write rejects for its caller only.
+    next.then(forget, forget);
+    return next;
+  }
+
+  /**
+   * The stream's last row: one primary-key seek, however long the stream.
+   * The end marker is always the last row (see `append`), so this is also
+   * how a reader learns the stream has ended.
+   */
+  function lastRow(name: string): { idx: number; eof: boolean } | undefined {
+    const row = db.get<{ idx: number; eof: number }>(
+      'SELECT idx, eof FROM stream_chunks WHERE name = ? ORDER BY idx DESC LIMIT 1',
+      name
+    );
+    return row
+      ? { idx: Number(row.idx), eof: Number(row.eof) === 1 }
+      : undefined;
+  }
+
+  function runWasPurged(runId: string): boolean {
+    const row = db.get<{ doc: string }>(
+      'SELECT doc FROM runs WHERE run_id = ?',
+      runId
+    );
+    return row !== undefined && ranPurge(decode<WorkflowRun>(row.doc));
+  }
+
+  /**
+   * Appends chunks (and optionally the end marker) in one transaction. A
+   * stream that has ended takes nothing more, so its end marker stays its
+   * last row.
+   */
+  async function append(
+    runId: string,
+    name: string,
+    chunks: Uint8Array[],
+    eof: boolean
+  ): Promise<void> {
+    // Waits for another process's write lock without blocking the thread.
+    const appended = await db.transactAsync(() => {
+      const last = lastRow(name);
+      if (last?.eof) return false;
+      // The purge of a zero-retention run ended every stream it had; one
+      // first written after it (by a step still running when the run ended)
+      // is ended the same way, with nothing in it.
+      if (!last && runWasPurged(runId)) {
+        db.run(
+          'INSERT INTO stream_chunks (name, idx, run_id, tag, data, eof) VALUES (?, 0, ?, ?, NULL, 1)',
+          name,
+          runId,
+          tag ?? null
+        );
+        return true;
+      }
+      let idx = last?.idx ?? 0;
+      for (const chunk of chunks) {
+        idx++;
+        db.run(
+          'INSERT INTO stream_chunks (name, idx, run_id, tag, data, eof) VALUES (?, ?, ?, ?, ?, 0)',
+          name,
+          idx,
+          runId,
+          tag ?? null,
+          chunk
+        );
+      }
+      if (eof) {
+        idx++;
+        db.run(
+          'INSERT INTO stream_chunks (name, idx, run_id, tag, data, eof) VALUES (?, ?, ?, ?, NULL, 1)',
+          name,
+          idx,
+          runId,
+          tag ?? null
+        );
+      }
+      return true;
+    });
+    if (appended) signals.emitter.emit(signalKey(db, name));
+  }
+
+  function rowsAfter(
+    name: string,
+    afterIdx: number,
+    limit?: number
+  ): ChunkRow[] {
+    const rows = db.all<ChunkRow>(
+      `SELECT idx, data, eof FROM stream_chunks WHERE name = ? AND idx > ? ORDER BY idx${
+        limit === undefined ? '' : ' LIMIT ?'
+      }`,
+      name,
+      afterIdx,
+      ...(limit === undefined ? [] : [limit])
+    );
+    return rows.map((row) => ({
+      idx: Number(row.idx),
+      data: row.data ? new Uint8Array(row.data) : null,
+      eof: Number(row.eof),
+    }));
+  }
+
+  /** Data chunks so far, and whether the stream has ended. */
+  function info(name: string): { count: number; done: boolean } {
+    // Data chunks are numbered from 1 with no gaps, and the end marker comes
+    // right after the last one (a purged stream has only its marker, at 0).
+    const last = lastRow(name);
+    if (!last) return { count: 0, done: false };
+    return {
+      count: Math.max(0, last.eof ? last.idx - 1 : last.idx),
+      done: last.eof,
+    };
+  }
 
   return {
-    async writeToStream(name, chunk) {
-      const chunkId = `strm_${monotonicUlid()}`;
+    clearCache() {},
 
-      if (typeof chunk === 'string') {
-        chunk = new TextEncoder().encode(chunk);
-      }
-      const serialized = serializeChunk({
-        chunk: Buffer.from(chunk),
-        eof: false,
-      });
+    streams: {
+      async write(_runId: string | Promise<string>, name: string, chunk) {
+        const bytes = toBytes(chunk);
+        await inTurn(name, async () => {
+          const runId = await _runId;
+          await append(runId, name, [bytes], false);
+        });
+      },
 
-      const chunkPath = path.join(
-        basedir,
-        'streams',
-        'chunks',
-        `${name}-${chunkId}.json`
-      );
+      async writeMulti(
+        _runId: string | Promise<string>,
+        name: string,
+        chunks: (string | Uint8Array)[]
+      ) {
+        if (chunks.length === 0) return;
+        const bytes = chunks.map(toBytes);
+        await inTurn(name, async () => {
+          const runId = await _runId;
+          await append(runId, name, bytes, false);
+        });
+      },
 
-      await write(chunkPath, serialized);
+      async close(_runId: string | Promise<string>, name: string) {
+        await inTurn(name, async () => {
+          const runId = await _runId;
+          // Closing twice records one end.
+          if (info(name).done) return;
+          await append(runId, name, [], true);
+        });
+      },
 
-      // Emit real-time event
-      const chunkData =
-        typeof chunk === 'string'
-          ? new TextEncoder().encode(chunk)
-          : chunk instanceof Buffer
-            ? new Uint8Array(chunk)
-            : chunk;
+      async list(runId: string) {
+        return db
+          .all<{ name: string }>(
+            'SELECT DISTINCT name FROM stream_chunks WHERE run_id = ? ORDER BY name',
+            runId
+          )
+          .map((row) => row.name);
+      },
 
-      streamEmitter.emit(`chunk:${name}` as const, {
-        streamName: name,
-        chunkData,
-        chunkId,
-      });
-    },
+      async getChunks(
+        _runId: string,
+        name: string,
+        options?: GetChunksOptions
+      ): Promise<StreamChunksResponse> {
+        const limit = options?.limit ?? 100;
+        let startIndex = 0;
+        if (options?.cursor) {
+          try {
+            startIndex = JSON.parse(
+              Buffer.from(options.cursor, 'base64').toString('utf-8')
+            ).i;
+          } catch {
+            startIndex = 0;
+          }
+        }
+        // Data chunks are numbered from index 1 with no gaps, so data index
+        // i is row idx i + 1.
+        const rows = rowsAfter(name, startIndex, limit + 1);
+        const data: { index: number; data: Uint8Array }[] = [];
+        let done = false;
+        let hasMore = false;
+        for (const row of rows) {
+          if (row.eof) {
+            done = true;
+            break;
+          }
+          if (data.length === limit) {
+            hasMore = true;
+            break;
+          }
+          data.push({ index: row.idx - 1, data: row.data ?? new Uint8Array() });
+        }
+        // Read to the end of a finished stream (or past it, or a purged
+        // stream, whose end sits at index 0).
+        if (!done && !hasMore) done = info(name).done;
+        return {
+          data,
+          cursor: hasMore
+            ? Buffer.from(
+                JSON.stringify({ i: startIndex + data.length })
+              ).toString('base64')
+            : null,
+          hasMore,
+          done,
+        };
+      },
 
-    async closeStream(name) {
-      const chunkId = `strm_${monotonicUlid()}`;
-      const chunkPath = path.join(
-        basedir,
-        'streams',
-        'chunks',
-        `${name}-${chunkId}.json`
-      );
+      async getInfo(_runId: string, name: string): Promise<StreamInfoResponse> {
+        const { count, done } = info(name);
+        return { tailIndex: count - 1, done };
+      },
 
-      await write(
-        chunkPath,
-        serializeChunk({ chunk: Buffer.from([]), eof: true })
-      );
+      async get(_runId: string, name: string, startIndex = 0) {
+        // Chunks are read as the consumer asks for them, a bounded batch at a
+        // time, never the whole unread backlog: a long stream costs a reader
+        // one batch of memory, and a reader cancelled mid-stream stops reading.
+        let lastIdx = startIndex;
+        let closed = false;
+        let failures = 0;
+        let wake: (() => void) | null = null;
+        let timer: ReturnType<typeof setInterval> | null = null;
+        const key = signalKey(db, name);
+        const onSignal = () => wake?.();
+        const stopWaiting = () => {
+          wake = null;
+          signals.emitter.off(key, onSignal);
+          if (timer) {
+            clearInterval(timer);
+            timer = null;
+          }
+        };
 
-      streamEmitter.emit(`close:${name}` as const, { streamName: name });
-    },
-
-    async readFromStream(name, startIndex = 0) {
-      const chunksDir = path.join(basedir, 'streams', 'chunks');
-      let removeListeners = () => {};
-
-      return new ReadableStream<Uint8Array>({
-        async start(controller) {
-          // Track chunks delivered via events to prevent duplicates and maintain order.
-          const deliveredChunkIds = new Set<string>();
-          // Buffer for chunks that arrive via events during disk reading
-          const bufferedEventChunks: Array<{
-            chunkId: string;
-            chunkData: Uint8Array;
-          }> = [];
-          let isReadingFromDisk = true;
-
-          const chunkListener = (event: {
-            streamName: string;
-            chunkData: Uint8Array;
-            chunkId: string;
-          }) => {
-            deliveredChunkIds.add(event.chunkId);
-
-            if (isReadingFromDisk) {
-              // Buffer chunks that arrive during disk reading to maintain order
-              bufferedEventChunks.push({
-                chunkId: event.chunkId,
-                chunkData: event.chunkData,
-              });
-            } else {
-              // After disk reading is complete, deliver chunks immediately
-              controller.enqueue(event.chunkData);
+        /**
+         * Enqueues the next batch of chunks, or ends the stream. False when
+         * there is nothing to deliver yet, or the read failed transiently.
+         */
+        const read = (
+          controller: ReadableStreamDefaultController<Uint8Array>
+        ): boolean => {
+          const finish = () => {
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // Already closed or cancelled.
             }
           };
-
-          const closeListener = () => {
-            // Remove listeners before closing
-            streamEmitter.off(`chunk:${name}` as const, chunkListener);
-            streamEmitter.off(`close:${name}` as const, closeListener);
-            controller.close();
-          };
-          removeListeners = closeListener;
-
-          // Set up listeners FIRST to avoid missing events
-          streamEmitter.on(`chunk:${name}` as const, chunkListener);
-          streamEmitter.on(`close:${name}` as const, closeListener);
-
-          // Now load existing chunks from disk
-          const files = await listJSONFiles(chunksDir);
-          const chunkFiles = files
-            .filter((file) => file.startsWith(`${name}-`))
-            .sort(); // ULID lexicographic sort = chronological order
-
-          // Process existing chunks, skipping any already delivered via events
-          let isComplete = false;
-          for (let i = startIndex; i < chunkFiles.length; i++) {
-            const file = chunkFiles[i];
-            // Extract chunk ID from filename: "streamName-chunkId"
-            const chunkId = file.substring(name.length + 1);
-
-            // Skip if already delivered via event
-            if (deliveredChunkIds.has(chunkId)) {
-              continue;
+          try {
+            let delivered = false;
+            for (;;) {
+              const rows = rowsAfter(name, lastIdx, READ_BATCH_CHUNKS);
+              failures = 0;
+              for (const row of rows) {
+                lastIdx = row.idx;
+                if (row.eof) {
+                  finish();
+                  return true;
+                }
+                if (row.data && row.data.byteLength > 0) {
+                  controller.enqueue(row.data);
+                  delivered = true;
+                }
+              }
+              if (delivered) return true;
+              // A batch of empty chunks only: read on.
+              if (rows.length < READ_BATCH_CHUNKS) break;
             }
-
-            const chunk = deserializeChunk(
-              await readBuffer(path.join(chunksDir, `${file}.json`))
-            );
-            if (chunk?.eof === true) {
-              isComplete = true;
-              break;
+            // Ended below the read position: started past the tail of a
+            // finished stream, or a purged one (its end sits at index 0).
+            // One seek, not a scan of the stream: an idle reader at the
+            // tail of a long stream costs the same as at a short one.
+            const last = lastRow(name);
+            if (last?.eof && last.idx <= lastIdx) {
+              finish();
+              return true;
             }
-            if (chunk.chunk.byteLength) {
-              controller.enqueue(chunk.chunk);
-            }
+            return false;
+          } catch (error) {
+            // A transient read failure (the database busy with another
+            // process's recovery, say): the next poll reads from the
+            // same position. Repeated failures end the stream.
+            failures++;
+            if (failures < MAX_CONSECUTIVE_READ_FAILURES) return false;
+            closed = true;
+            controller.error(error);
+            return true;
           }
+        };
 
-          // Finished reading from disk - now deliver buffered event chunks in chronological order
-          isReadingFromDisk = false;
-
-          // Sort buffered chunks by ULID (chronological order)
-          bufferedEventChunks.sort((a, b) =>
-            a.chunkId.localeCompare(b.chunkId)
-          );
-          for (const buffered of bufferedEventChunks) {
-            controller.enqueue(buffered.chunkData);
-          }
-
-          if (isComplete) {
-            removeListeners();
-            controller.close();
-            return;
-          }
-        },
-
-        cancel() {
-          removeListeners();
-        },
-      });
+        return new ReadableStream<Uint8Array>({
+          start() {
+            if (startIndex < 0)
+              lastIdx = Math.max(0, info(name).count + startIndex);
+          },
+          async pull(controller) {
+            if (closed || read(controller)) return;
+            // At the tail: wait for a write in this process, or poll for one
+            // from another, until a chunk arrives or the reader cancels.
+            await new Promise<void>((resolve) => {
+              wake = () => {
+                if (!closed && !read(controller)) return;
+                stopWaiting();
+                resolve();
+              };
+              signals.emitter.on(key, onSignal);
+              timer = setInterval(onSignal, POLL_INTERVAL_MS);
+            });
+          },
+          cancel() {
+            closed = true;
+            wake?.();
+            stopWaiting();
+          },
+        });
+      },
     },
   };
 }

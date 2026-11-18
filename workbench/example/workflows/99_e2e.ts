@@ -1,3 +1,6 @@
+// Test path alias resolution - imports a helper from outside the workbench directory
+/** biome-ignore-all lint/complexity/noStaticOnlyClass: <explanation> */
+import { pathsAliasHelper } from '@repo/lib/steps/paths-alias-test';
 import {
   createHook,
   createWebhook,
@@ -7,8 +10,14 @@ import {
   getWorkflowMetadata,
   getWritable,
   type RequestWithResponse,
+  RetryableError,
+  setAttributes,
   sleep,
 } from 'workflow';
+import { getHookByToken, getRun, Run, resumeHook, start } from 'workflow/api';
+import { HookConflictError, HookForceClaimedError } from 'workflow/errors';
+import { importedStepOnly } from './_imported_step_only';
+import { callThrower, stepThatThrowsFromHelper } from './helpers';
 
 //////////////////////////////////////////////////////////
 
@@ -72,10 +81,17 @@ export async function promiseAnyWorkflow() {
   'use workflow';
   const winner = await Promise.any([
     stepThatFails(),
-    specificDelay(1000, 'b'), // "b" should always win
-    specificDelay(3000, 'c'),
+    specificDelay(100, 'b'), // "b" should always win
+    specificDelay(6000, 'c'),
   ]);
   return winner;
+}
+
+//////////////////////////////////////////////////////////
+
+export async function importedStepOnlyWorkflow() {
+  'use workflow';
+  return await importedStepOnly();
 }
 
 //////////////////////////////////////////////////////////
@@ -113,7 +129,7 @@ export async function hookWorkflow(token: string, customData: string) {
 
   type Payload = { message: string; customData: string; done?: boolean };
 
-  const hook = createHook<Payload>({
+  using hook = createHook<Payload>({
     token,
     metadata: { customData },
   });
@@ -139,26 +155,21 @@ async function sendWebhookResponse(req: RequestWithResponse) {
   return body;
 }
 
-export async function webhookWorkflow(
-  token: string,
-  token2: string,
-  token3: string
-) {
+export async function webhookWorkflow() {
   'use workflow';
 
   type Payload = { url: string; method: string; body: string };
   const payloads: Payload[] = [];
 
-  const webhookWithDefaultResponse = createWebhook({ token });
+  // All webhooks must be created upfront so they're all registered
+  // before the test sends HTTP requests to them
+  const webhookWithDefaultResponse = createWebhook();
 
   const res = new Response('Hello from static response!', { status: 402 });
-  console.log('res', res);
   const webhookWithStaticResponse = createWebhook({
-    token: token2,
     respondWith: res,
   });
   const webhookWithManualResponse = createWebhook({
-    token: token3,
     respondWith: 'manual',
   });
 
@@ -188,20 +199,120 @@ export async function webhookWorkflow(
 
 //////////////////////////////////////////////////////////
 
-export async function sleepingWorkflow() {
+export async function sleepingWorkflow(durationMs = 10_000) {
   'use workflow';
   const startTime = Date.now();
-  await sleep('10s');
+  await sleep(durationMs);
   const endTime = Date.now();
   return { startTime, endTime };
 }
 
-export async function sleepingDateWorkflow(endDate: Date) {
+export async function parallelSleepWorkflow() {
   'use workflow';
   const startTime = Date.now();
-  await sleep(endDate);
+  await Promise.all(Array.from({ length: 10 }, () => sleep('1s')));
   const endTime = Date.now();
   return { startTime, endTime };
+}
+
+//////////////////////////////////////////////////////////
+
+async function delayMsStep(ms: number, label: string) {
+  'use step';
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  return label;
+}
+
+export async function sleepWinsRaceWorkflow() {
+  'use workflow';
+  const startTime = Date.now();
+  const winner = await Promise.race([
+    delayMsStep(10_000, 'step'),
+    sleep('1s').then(() => 'sleep'),
+  ]);
+  const endTime = Date.now();
+  return { winner, durationMs: endTime - startTime };
+}
+
+export async function stepWinsRaceWorkflow() {
+  'use workflow';
+  const startTime = Date.now();
+  const winner = await Promise.race([
+    delayMsStep(1_000, 'step'),
+    sleep('10s').then(() => 'sleep'),
+  ]);
+  const endTime = Date.now();
+  return { winner, durationMs: endTime - startTime };
+}
+
+//////////////////////////////////////////////////////////
+
+// Times come from inside the step, on the host clock: the workflow's own
+// `Date.now()` is the replay clock, which says nothing about when a step ran.
+async function timedDelayStep(ms: number, label: string) {
+  'use step';
+  const startedAt = Date.now();
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  return { label, startedAt, endedAt: Date.now() };
+}
+
+/**
+ * A two-step chain beside one long step (vercel/workflow#4457). The chain's
+ * second step should start once its first settles, not once the long step
+ * beside it does.
+ */
+export async function parallelBranchesAdvanceIndependentlyWorkflow() {
+  'use workflow';
+  const [chain, long] = await Promise.all([
+    (async () => [
+      await timedDelayStep(500, 'chain1'),
+      await timedDelayStep(500, 'chain2'),
+    ])(),
+    timedDelayStep(10_000, 'long'),
+  ]);
+  return { chain, long };
+}
+
+//////////////////////////////////////////////////////////
+
+// Takes an OBJECT argument: under VM retention (WORKFLOW_RETAINED_VM), a
+// boundary whose new step has a non-primitive input falls back to cold
+// replay instead of resuming the retained VM.
+async function unwrapValue(box: { value: number }) {
+  'use step';
+  return box.value;
+}
+
+/**
+ * Interleaves every retention mode the runtime can hit: retained boundaries
+ * (primitive step args), demoted boundaries (object args), wait boundaries
+ * (sleep, step-vs-sleep race), and a hook awaited in parallel with a step.
+ * The chained arithmetic makes any dropped, duplicated, or misordered
+ * boundary visible in the final output.
+ */
+export async function retainedInterleavingWorkflow(token: string) {
+  'use workflow';
+  // Retained: sequential primitive-arg step.
+  const a = await add(1, 2); // 3
+  // Demoted: object argument.
+  const b = await unwrapValue({ value: a }); // 3
+  // Retained: parallel all-primitive batch.
+  const [c, d] = await Promise.all([add(b, 10), add(b, 20)]); // 13, 23
+  // Demoted: mixed parallel batch (one object arg, one primitive).
+  const [e, f] = await Promise.all([unwrapValue({ value: c }), add(d, 1)]); // 13, 24
+  // Wait boundary: step races (and beats) a sleep.
+  const winner = await Promise.race([
+    delayMsStep(100, 'step'),
+    sleep('30s').then(() => 'sleep'),
+  ]); // 'step'
+  // Wait boundary: plain sleep.
+  await sleep('1s');
+  // Hook boundary: hook payload awaited in parallel with a primitive step.
+  using hook = createHook<{ delta: number }>({ token });
+  const [payload, g] = await Promise.all([hook, add(e + f, 100)]); // _, 137
+  // Retained again after all the demotions.
+  const h = await add(g, payload.delta); // 137 + delta
+  return { a, b, c, d, e, f, winner, g, h };
 }
 
 //////////////////////////////////////////////////////////
@@ -233,9 +344,11 @@ export async function workflowAndStepMetadataWorkflow() {
     await stepWithMetadata();
   return {
     workflowMetadata: {
+      workflowName: workflowMetadata.workflowName,
       workflowRunId: workflowMetadata.workflowRunId,
       workflowStartedAt: workflowMetadata.workflowStartedAt,
       url: workflowMetadata.url,
+      features: workflowMetadata.features,
     },
     stepMetadata,
     innerWorkflowMetadata,
@@ -283,6 +396,87 @@ export async function outputStreamWorkflow() {
   await sleep('1s');
   await stepCloseOutputStream(writable);
   await stepCloseOutputStream(namedWritable);
+  return 'done';
+}
+
+//////////////////////////////////////////////////////////
+
+async function stepWithOutputStreamInsideStep(text: string) {
+  'use step';
+  // Call getWritable directly inside the step function
+  const writable = getWritable();
+  const writer = writable.getWriter();
+  await writer.write(new TextEncoder().encode(text));
+  writer.releaseLock();
+}
+
+async function stepWithNamedOutputStreamInsideStep(
+  namespace: string,
+  obj: any
+) {
+  'use step';
+  // Call getWritable with namespace directly inside the step function
+  const writable = getWritable({ namespace });
+  const writer = writable.getWriter();
+  await writer.write(obj);
+  writer.releaseLock();
+}
+
+async function stepCloseOutputStreamInsideStep(namespace?: string) {
+  'use step';
+  // Call getWritable directly inside the step function and close it
+  const writable = getWritable({ namespace });
+  await writable.close();
+}
+
+export async function outputStreamInsideStepWorkflow() {
+  'use workflow';
+  await sleep('1s');
+  await stepWithOutputStreamInsideStep('Hello from step!');
+  await sleep('1s');
+  await stepWithNamedOutputStreamInsideStep('step-ns', {
+    message: 'Hello from named stream in step!',
+  });
+  await sleep('1s');
+  await stepWithOutputStreamInsideStep('Second message');
+  await sleep('1s');
+  await stepWithNamedOutputStreamInsideStep('step-ns', { counter: 42 });
+  await sleep('1s');
+  await stepCloseOutputStreamInsideStep();
+  await stepCloseOutputStreamInsideStep('step-ns');
+  return 'done';
+}
+
+//////////////////////////////////////////////////////////
+
+async function stepWriteUtf8Text(writable: WritableStream, text: string) {
+  'use step';
+  const writer = writable.getWriter();
+  await writer.write(new TextEncoder().encode(text));
+  writer.releaseLock();
+}
+
+async function stepWriteUtf8Json(writable: WritableStream, value: unknown) {
+  'use step';
+  const writer = writable.getWriter();
+  await writer.write(new TextEncoder().encode(JSON.stringify(value)));
+  writer.releaseLock();
+}
+
+// Emits a sequence of Uint8Array chunks containing UTF-8 encoded text,
+// including multi-byte sequences (Latin Extended, CJK, emoji, RTL), plus
+// one chunk whose decoded text is a valid JSON document. Used to validate
+// that typed-array stream chunks round-trip as UTF-8 end-to-end.
+export async function utf8StreamWorkflow() {
+  'use workflow';
+  const writable = getWritable();
+  await sleep('1s');
+  await stepWriteUtf8Text(writable, 'Hello, world!');
+  await stepWriteUtf8Text(writable, 'Café — naïve résumé');
+  await stepWriteUtf8Text(writable, '你好，世界！🌍✨');
+  await stepWriteUtf8Text(writable, 'مرحبا بالعالم');
+  await stepWriteUtf8Json(writable, { greeting: '안녕하세요', emoji: '🎉' });
+  await stepCloseOutputStream(writable);
   return 'done';
 }
 
@@ -359,4 +553,4199 @@ export async function retryAttemptCounterWorkflow() {
 
   console.log(`Workflow completed with final attempt: ${finalAttempt}`);
   return { finalAttempt };
+}
+
+//////////////////////////////////////////////////////////
+
+async function stepThatThrowsRetryableError() {
+  'use step';
+  const { attempt, stepStartedAt } = getStepMetadata();
+  if (attempt === 1) {
+    throw new RetryableError('Retryable error', {
+      retryAfter: '10s',
+    });
+  }
+  return {
+    attempt,
+    stepStartedAt,
+    duration: Date.now() - stepStartedAt.getTime(),
+  };
+}
+
+export async function crossFileErrorWorkflow() {
+  'use workflow';
+  // This will throw an error from the imported helpers.ts file
+  callThrower();
+  return 'never reached';
+}
+
+//////////////////////////////////////////////////////////
+
+export async function retryableAndFatalErrorWorkflow() {
+  'use workflow';
+
+  const retryableResult = await stepThatThrowsRetryableError();
+
+  let gotFatalError = false;
+  try {
+    await stepThatFails();
+  } catch (error: any) {
+    if (FatalError.is(error)) {
+      gotFatalError = true;
+    }
+  }
+
+  return { retryableResult, gotFatalError };
+}
+
+//////////////////////////////////////////////////////////
+
+// Test that maxRetries = 0 means the step runs once but does not retry on failure
+async function stepWithNoRetries() {
+  'use step';
+  const { attempt } = getStepMetadata();
+  console.log(`stepWithNoRetries - attempt: ${attempt}`);
+  // Always fail - with maxRetries = 0, this should only run once
+  throw new Error(`Failed on attempt ${attempt}`);
+}
+stepWithNoRetries.maxRetries = 0;
+
+// Test that maxRetries = 0 works when the step succeeds
+async function stepWithNoRetriesThatSucceeds() {
+  'use step';
+  const { attempt } = getStepMetadata();
+  console.log(`stepWithNoRetriesThatSucceeds - attempt: ${attempt}`);
+  return { attempt };
+}
+stepWithNoRetriesThatSucceeds.maxRetries = 0;
+
+export async function maxRetriesZeroWorkflow() {
+  'use workflow';
+  console.log('Starting maxRetries = 0 workflow');
+
+  // First, verify that a step with maxRetries = 0 can still succeed
+  const successResult = await stepWithNoRetriesThatSucceeds();
+
+  // Now test that a failing step with maxRetries = 0 does NOT retry
+  let failedAttempt: number | null = null;
+  let gotError = false;
+  try {
+    await stepWithNoRetries();
+  } catch (error: any) {
+    gotError = true;
+    console.log('Received error', typeof error, error, error.message);
+    // Extract the attempt number from the error message
+    const match = error.message?.match(/attempt (\d+)/);
+    if (match) {
+      failedAttempt = parseInt(match[1], 10);
+    }
+  }
+
+  console.log(
+    `Workflow completed: successResult=${JSON.stringify(successResult)}, gotError=${gotError}, failedAttempt=${failedAttempt}`
+  );
+
+  return {
+    successResult,
+    gotError,
+    failedAttempt,
+  };
+}
+
+//////////////////////////////////////////////////////////
+
+export async function hookCleanupTestWorkflow(
+  token: string,
+  customData: string
+) {
+  'use workflow';
+
+  type Payload = { message: string; customData: string };
+
+  using hook = createHook<Payload>({
+    token,
+    metadata: { customData },
+  });
+
+  const payload = await hook;
+
+  return {
+    message: payload.message,
+    customData: payload.customData,
+    hookCleanupTestData: 'workflow_completed',
+  };
+}
+
+//////////////////////////////////////////////////////////
+
+export async function hookGetConflictWorkflow(
+  token: string,
+  customData: string
+) {
+  'use workflow';
+
+  using hook = createHook({
+    token,
+    metadata: { customData },
+  });
+
+  // Awaiting `getConflict()` suspends the workflow to commit the hook
+  // registration without waiting for payload data. It resolves with the
+  // conflicting `Run` when another active hook owns the token, or `null`
+  // once this hook is registered.
+  const conflict = await hook.getConflict();
+
+  if (conflict) {
+    // The conflicting Run's methods are durable step proxies, so the
+    // duplicate run can inspect the active owner before deciding.
+    const conflictStatus = await conflict.status;
+    return {
+      token,
+      customData,
+      conflictRunId: conflict.runId,
+      conflictStatus,
+      hookGetConflictTestData: 'hook_token_conflict_detected',
+    };
+  }
+
+  return {
+    token,
+    customData,
+    conflictRunId: null,
+    hookGetConflictTestData: 'hook_registered_without_payload',
+  };
+}
+
+async function hookGetConflictStep(customData: string) {
+  'use step';
+  return {
+    customData,
+    hookGetConflictStepData: 'step_completed',
+  };
+}
+
+async function hookGetConflictTimedStep(label: 'A' | 'B', delayMs: number) {
+  'use step';
+  const { stepStartedAt } = getStepMetadata();
+  const startedAt = stepStartedAt.getTime();
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+  return {
+    label,
+    startedAt,
+    endedAt: Date.now(),
+  };
+}
+
+export async function hookGetConflictWithPriorStepWorkflow(
+  token: string,
+  customData: string
+) {
+  'use workflow';
+
+  using hook = createHook({
+    token,
+    metadata: { customData },
+  });
+
+  const stepPromise = hookGetConflictStep(customData);
+
+  const conflict = await hook.getConflict();
+
+  return {
+    token,
+    customData,
+    conflictRunId: conflict ? conflict.runId : null,
+    stepResult: await stepPromise,
+    hookGetConflictTestData: 'prior_step_completed_after_registration',
+  };
+}
+
+export async function hookGetConflictWithParallelStepWorkflow(
+  token: string,
+  customData: string
+) {
+  'use workflow';
+
+  using hook = createHook({
+    token,
+    metadata: { customData },
+  });
+
+  const [stepResult, conflict] = await Promise.all([
+    hookGetConflictStep(customData),
+    hook.getConflict(),
+  ]);
+
+  return {
+    token,
+    customData,
+    conflictRunId: conflict ? conflict.runId : null,
+    stepResult,
+    hookGetConflictTestData: 'parallel_step_completed_with_registration',
+  };
+}
+
+export async function hookGetConflictThenStepParallelWorkflow(
+  token: string,
+  customData: string
+) {
+  'use workflow';
+
+  using hook = createHook({
+    token,
+    metadata: { customData },
+  });
+
+  const stepBPromise = hook
+    .getConflict()
+    .then(async () => await hookGetConflictTimedStep('B', 100));
+  const stepAResult = await hookGetConflictTimedStep('A', 10_000);
+  const stepBResult = await stepBPromise;
+
+  return {
+    token,
+    customData,
+    stepAResult,
+    stepBResult,
+    hookGetConflictTestData: 'registration_then_step_runs_in_parallel',
+  };
+}
+
+//////////////////////////////////////////////////////////
+// Run idempotency / conflict-handling strategy workflows.
+// These mirror the patterns documented in
+// docs/content/docs/*/foundations/idempotency.mdx.
+//////////////////////////////////////////////////////////
+
+/**
+ * Keeps its token reserved after this run ends. The Hook is intentionally left
+ * undisposed so duplicates continue to receive a conflict during retention.
+ */
+export async function hookMinRetentionWorkflow(
+  token: string,
+  minRetentionMs: number
+) {
+  'use workflow';
+
+  const hook = createHook({
+    token,
+    experimental_minRetention: minRetentionMs,
+  });
+  const conflict = await hook.getConflict();
+  if (conflict) {
+    return {
+      role: 'duplicate' as const,
+      conflictRunId: conflict.runId,
+      conflictStatus: await conflict.status,
+    };
+  }
+
+  return { role: 'owner' as const };
+}
+
+/**
+ * Claim-only run mutex: the hook is used purely for run idempotency —
+ * the workflow claims the token, holds it while doing unrelated work,
+ * and never awaits hook payload data. Duplicates started while the
+ * owner holds the token observe the conflict and return early.
+ */
+export async function hookClaimOnlyMutexWorkflow(
+  token: string,
+  holdMs: number
+) {
+  'use workflow';
+
+  using hook = createHook({ token });
+
+  const conflict = await hook.getConflict();
+  if (conflict) {
+    return {
+      role: 'duplicate' as const,
+      conflictRunId: conflict.runId,
+    };
+  }
+
+  // Hold the token for the duration of the work without ever awaiting
+  // hook payload data.
+  const work = await hookGetConflictTimedStep('A', holdMs);
+
+  return {
+    role: 'owner' as const,
+    workEndedAt: work.endedAt,
+  };
+}
+
+/**
+ * "Adopt the owner's result" strategy: the duplicate run waits for the
+ * active owner to finish and returns the owner's result, so callers
+ * cannot tell which run did the work.
+ */
+export async function hookAdoptOwnerResultWorkflow(
+  token: string,
+  marker: string
+) {
+  'use workflow';
+
+  using hook = createHook<{ value: string }>({ token });
+
+  const conflict = await hook.getConflict();
+  if (conflict) {
+    const adopted = await conflict.returnValue;
+    return {
+      role: 'duplicate' as const,
+      conflictRunId: conflict.runId,
+      adopted,
+    };
+  }
+
+  const payload = await hook;
+  return {
+    role: 'owner' as const,
+    marker,
+    value: payload.value,
+  };
+}
+
+async function forwardPayloadToOwner(token: string, message: string) {
+  'use step';
+  await resumeHook(token, { message });
+}
+
+/**
+ * "Signal the owner" strategy: the duplicate run forwards its input to
+ * the active owner's hook from a step instead of doing the work itself.
+ */
+export async function hookSignalOwnerWorkflow(token: string, message: string) {
+  'use workflow';
+
+  using hook = createHook<{ message: string }>({ token });
+
+  const conflict = await hook.getConflict();
+  if (conflict) {
+    await forwardPayloadToOwner(token, message);
+    return {
+      role: 'duplicate' as const,
+      forwardedTo: conflict.runId,
+    };
+  }
+
+  const payload = await hook;
+  return {
+    role: 'owner' as const,
+    received: payload.message,
+  };
+}
+
+/**
+ * The owner of a `start({ experimental_hook })` token. The start Hook exists from
+ * admission; `createHook()` with the start token binds this run to it (no
+ * write, never a conflict) and collects `expected` payloads, including any
+ * resumed before the body got here.
+ */
+export async function startHookOwnerWorkflow(token: string, expected: number) {
+  'use workflow';
+
+  using hook = createHook<{ message: string }>({ token });
+
+  // The start Hook is this run's own, so binding to it never conflicts.
+  const conflict = await hook.getConflict();
+  if (conflict) {
+    return { conflictRunId: conflict.runId, messages: [] as string[] };
+  }
+
+  const messages: string[] = [];
+  for await (const payload of hook) {
+    messages.push(payload.message);
+    if (messages.length >= expected) break;
+  }
+  return { conflictRunId: null, messages };
+}
+
+/**
+ * A `start({ experimental_hook })` run that waits on a separate gate token before it opens
+ * its start Hook, then reads `expected` payloads from it: payloads resumed
+ * before the gate opens are already in the log when `createHook()` runs.
+ */
+export async function startHookGateThenClaimWorkflow(
+  token: string,
+  gateToken: string,
+  expected: number
+) {
+  'use workflow';
+
+  {
+    using gate = createHook<{ release: true }>({ token: gateToken });
+    await gate;
+  }
+  using hook = createHook<{ message: string }>({ token });
+  const messages: string[] = [];
+  for await (const payload of hook) {
+    messages.push(payload.message);
+    if (messages.length >= expected) break;
+  }
+  return { messages };
+}
+
+/**
+ * A `start({ experimental_hook })` run that never opens its start Hook: the token is only
+ * its idempotency key. It waits on a separate gate token so a test can
+ * observe it while it runs.
+ */
+export async function startHookUnclaimedWorkflow(
+  gateToken: string,
+  value: string
+) {
+  'use workflow';
+
+  using gate = createHook<{ release: true }>({ token: gateToken });
+  await gate;
+  return { value };
+}
+
+/**
+ * A `start({ experimental_hook })` run that opens its start Hook late: it first waits on
+ * a gate token, then calls `createHook()` with the start token and awaits one
+ * payload. If another run force-claimed the token meanwhile, the await
+ * rejects with HookForceClaimedError, which this reports.
+ */
+export async function startHookLateClaimWorkflow(
+  token: string,
+  gateToken: string
+) {
+  'use workflow';
+
+  {
+    using gate = createHook<{ release: true }>({ token: gateToken });
+    await gate;
+  }
+
+  using hook = createHook<{ message: string }>({ token });
+  try {
+    const payload = await hook;
+    return { role: 'owner' as const, message: payload.message };
+  } catch (err) {
+    if (HookForceClaimedError.is(err)) {
+      return {
+        role: 'force_claimed' as const,
+        claimedByRunId: err.claimedByRunId,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * A `start({ experimental_hook })` run that reads one payload from its start Hook and
+ * disposes it (which frees the token), waits on a gate token, then calls
+ * `createHook()` with the same token again: an ordinary new Hook, which
+ * conflicts if another run took the token in between.
+ */
+export async function startHookReclaimWorkflow(
+  token: string,
+  gateToken: string
+) {
+  'use workflow';
+
+  const messages: string[] = [];
+  {
+    using hook = createHook<{ message: string }>({ token });
+    messages.push((await hook).message);
+  }
+  {
+    using gate = createHook<{ release: true }>({ token: gateToken });
+    await gate;
+  }
+  using again = createHook<{ message: string }>({ token });
+  const conflict = await again.getConflict();
+  if (conflict) {
+    return { messages, conflictRunId: conflict.runId };
+  }
+  messages.push((await again).message);
+  return { messages, conflictRunId: null };
+}
+
+/**
+ * A `start({ experimental_hook })` run that opens its start Hook but never reads from it:
+ * payloads resumed to it stay unconsumed, and the run still completes.
+ */
+export async function startHookClaimUnreadWorkflow(
+  token: string,
+  gateToken: string
+) {
+  'use workflow';
+
+  using hook = createHook<{ message: string }>({ token });
+  using gate = createHook<{ release: true }>({ token: gateToken });
+  await gate;
+  return { hookToken: hook.token };
+}
+
+/**
+ * Reads one payload from its start Hook and ends without disposing it, so a
+ * retention set on `start({ experimental_hook })` keeps the token past the run's end.
+ */
+export async function startHookRetainedOwnerWorkflow(token: string) {
+  'use workflow';
+
+  // Deliberately not `using`: disposing would free the token at scope exit.
+  const hook = createHook<{ message: string }>({ token });
+  const payload = await hook;
+  return { message: payload.message };
+}
+
+/**
+ * Passes an option that belongs on `start({ experimental_hook })` to `createHook()` with
+ * the start token, which throws.
+ */
+export async function startHookOptionsOnStartTokenWorkflow(
+  token: string,
+  option: 'metadata' | 'retention'
+) {
+  'use workflow';
+
+  using hook =
+    option === 'metadata'
+      ? createHook<{ message: string }>({ token, metadata: { late: true } })
+      : createHook<{ message: string }>({
+          token,
+          experimental_minRetention: '1h',
+        });
+  const payload = await hook;
+  return { message: payload.message };
+}
+
+/**
+ * Opens its start Hook, then calls `createHook()` with the same token again
+ * while the first is live: an ordinary second Hook, which conflicts with this
+ * very run. The start Hook still receives its payload.
+ */
+export async function startHookSecondCreateWorkflow(token: string) {
+  'use workflow';
+
+  using first = createHook<{ message: string }>({ token });
+  const second = createHook<{ message: string }>({ token });
+  const firstConflict = await first.getConflict();
+  const secondConflict = await second.getConflict();
+  const secondError = secondConflict
+    ? await second.then(
+        () => null,
+        (err: unknown) =>
+          HookConflictError.is(err)
+            ? (err.conflictingRunId ?? null)
+            : Promise.reject(err)
+      )
+    : null;
+  const payload = await first;
+  return {
+    runId: getWorkflowMetadata().workflowRunId,
+    firstConflictRunId: firstConflict ? firstConflict.runId : null,
+    secondConflictRunId: secondConflict ? secondConflict.runId : null,
+    secondErrorRunId: secondError,
+    message: payload.message,
+  };
+}
+
+/**
+ * "Supersede the owner" strategy (newest-wins): cancel the active owner
+ * and claim the released token. Cancellation disposes the owner's hooks;
+ * the retry loop covers the window where disposal has not propagated.
+ */
+export async function hookSupersedeOwnerWorkflow(token: string) {
+  'use workflow';
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    using hook = createHook<{ message: string }>({ token });
+
+    const conflict = await hook.getConflict();
+    if (!conflict) {
+      const payload = await hook;
+      return {
+        role: 'owner' as const,
+        attempt,
+        received: payload.message,
+      };
+    }
+
+    await conflict.cancel();
+  }
+
+  throw new Error(`Could not claim ${token} after cancelling the owner`);
+}
+
+//////////////////////////////////////////////////////////
+// createHook({ experimental_force: true })
+
+/**
+ * Owns `token` until another run takes it. Awaits one payload; when the token
+ * is taken over first, `await hook` rejects with HookForceClaimedError, which
+ * this workflow catches and reports — the run completes, so a completed run
+ * proves both the durable signal and the wake reached it.
+ */
+export async function hookForceClaimVictimWorkflow(token: string) {
+  'use workflow';
+
+  using hook = createHook<{ message: string }>({ token });
+  try {
+    const payload = await hook;
+    return { role: 'owner' as const, received: payload.message };
+  } catch (err) {
+    if (HookForceClaimedError.is(err)) {
+      return {
+        role: 'force_claimed' as const,
+        claimedByRunId: err.claimedByRunId,
+        claimedByHookId: err.claimedByHookId ?? null,
+        token: err.token,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Takes `token` over and awaits one payload, but — like the victim — reports
+ * a later takeover instead of failing. The middle link of a chain.
+ */
+export async function hookForceClaimVictimWorkflowForced(token: string) {
+  'use workflow';
+
+  using hook = createHook<{ message: string }>({
+    token,
+    experimental_force: true,
+  });
+  try {
+    const payload = await hook;
+    return { role: 'owner' as const, received: payload.message };
+  } catch (err) {
+    if (HookForceClaimedError.is(err)) {
+      return {
+        role: 'force_claimed' as const,
+        claimedByRunId: err.claimedByRunId,
+        claimedByHookId: err.claimedByHookId ?? null,
+        token: err.token,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Takes `token` over from whoever holds it and awaits one payload.
+ */
+export async function hookForceClaimClaimerWorkflow(token: string) {
+  'use workflow';
+
+  using hook = createHook<{ message: string }>({
+    token,
+    experimental_force: true,
+  });
+  const conflict = await hook.getConflict();
+  const payload = await hook;
+  return {
+    role: 'claimer' as const,
+    conflict: conflict ? conflict.runId : null,
+    received: payload.message,
+  };
+}
+
+/**
+ * Iterates payloads until the token is taken over, then reports what it
+ * received before that. Payloads delivered before the takeover stay with
+ * this run; the error arrives only once they are drained.
+ */
+export async function hookForceClaimIteratingVictimWorkflow(token: string) {
+  'use workflow';
+
+  using hook = createHook<{ n: number }>({ token });
+  const received: number[] = [];
+  try {
+    for await (const payload of hook) {
+      received.push(payload.n);
+    }
+  } catch (err) {
+    if (HookForceClaimedError.is(err)) {
+      return { received, claimedByRunId: err.claimedByRunId };
+    }
+    throw err;
+  }
+  return { received, claimedByRunId: null };
+}
+
+/**
+ * Takes `token` over and collects `count` payloads.
+ */
+export async function hookForceClaimCollectorWorkflow(
+  token: string,
+  count: number
+) {
+  'use workflow';
+
+  using hook = createHook<{ n: number }>({ token, experimental_force: true });
+  const received: number[] = [];
+  for await (const payload of hook) {
+    received.push(payload.n);
+    if (received.length >= count) break;
+  }
+  return { received };
+}
+
+/**
+ * Holds `token` past its own completion (`experimental_minRetention`), so a
+ * later forced creation takes it from a finished run.
+ */
+export async function hookForceClaimRetainedVictimWorkflow(token: string) {
+  'use workflow';
+
+  // Deliberately not `using`: disposing would release the token at scope
+  // exit, and the point is a token that outlives its run.
+  const hook = createHook<{ message: string }>({
+    token,
+    experimental_minRetention: '1h',
+  });
+  const payload = await hook;
+  return { received: payload.message };
+}
+
+/**
+ * Takes over its own earlier hook: the first hook's awaiter rejects with
+ * HookForceClaimedError naming this same run, the second receives the payload.
+ */
+export async function hookForceClaimOwnHookWorkflow(token: string) {
+  'use workflow';
+
+  const first = createHook<{ message: string }>({ token });
+  const firstOutcome = first.then(
+    (payload) => ({ ok: true as const, message: payload.message }),
+    (err: unknown) =>
+      HookForceClaimedError.is(err)
+        ? { ok: false as const, claimedByRunId: err.claimedByRunId }
+        : Promise.reject(err)
+  );
+  using second = createHook<{ message: string }>({
+    token,
+    experimental_force: true,
+  });
+  const payload = await second;
+  const firstResult = await firstOutcome;
+  first.dispose();
+  return { first: firstResult, second: payload.message };
+}
+
+/**
+ * Forces `token` but treats a refusal as the ordinary conflict it is: the
+ * World declines to take a token from a run whose runtime could not read the
+ * disposal (started below `SPEC_VERSION_SUPPORTS_HOOK_FORCE_CLAIM`), and the
+ * forced hook then rejects with `HookConflictError` naming that run.
+ */
+export async function hookForceClaimTolerantClaimerWorkflow(token: string) {
+  'use workflow';
+
+  using hook = createHook<{ message: string }>({
+    token,
+    experimental_force: true,
+  });
+  try {
+    const payload = await hook;
+    return { role: 'claimer' as const, received: payload.message };
+  } catch (err) {
+    if (HookConflictError.is(err)) {
+      return {
+        role: 'refused' as const,
+        conflictingRunId: err.conflictingRunId ?? null,
+      };
+    }
+    throw err;
+  }
+}
+
+//////////////////////////////////////////////////////////
+
+/**
+ * Workflow for testing early hook disposal - allows another workflow to reuse
+ * the token while this workflow is still running.
+ *
+ * The block scope with `using` releases the token before the sleep, so another
+ * workflow can claim the token while this one continues.
+ */
+export async function hookDisposeTestWorkflow(
+  token: string,
+  customData: string
+) {
+  'use workflow';
+
+  type Payload = { message: string; customData: string };
+
+  let message: string;
+  let customDataResult: string;
+
+  {
+    // Block scope releases the hook token when exited
+    using hook = createHook<Payload>({
+      token,
+      metadata: { customData },
+    });
+
+    const payload = await hook;
+    message = payload.message;
+    customDataResult = payload.customData;
+  }
+
+  // Token is now available for another workflow while we continue
+  await sleep('5s');
+
+  return {
+    message,
+    customData: customDataResult,
+    disposed: true,
+    hookDisposeTestData: 'workflow_completed',
+  };
+}
+
+//////////////////////////////////////////////////////////
+
+/**
+ * Workflow for testing same-run hook token recreation: each iteration
+ * recreates a hook with the same token after disposing the previous one.
+ *
+ * Regression workflow for issue #2777 — the disposal must be flushed
+ * before the next hook's creation is validated, otherwise the second
+ * round records a spurious conflict against the run's own disposed hook.
+ */
+export async function hookTokenReuseLoopWorkflow(
+  token: string,
+  rounds: number
+) {
+  'use workflow';
+
+  const received: string[] = [];
+  for (let round = 0; round < rounds; round++) {
+    const hook = createHook<{ message: string }>({ token });
+
+    const conflict = await hook.getConflict();
+    if (conflict) {
+      return { received, conflictRound: round };
+    }
+
+    const payload = await hook;
+    received.push(payload.message);
+    hook.dispose();
+  }
+
+  return { received, conflictRound: null };
+}
+
+//////////////////////////////////////////////////////////
+
+export async function stepFunctionPassingWorkflow() {
+  'use workflow';
+  // Pass a step function reference to another step (without closure vars)
+  const result = await stepWithStepFunctionArg(doubleNumber);
+  return result;
+}
+
+async function stepWithStepFunctionArg(stepFn: (x: number) => Promise<number>) {
+  'use step';
+  // Call the passed step function reference
+  const result = await stepFn(10);
+  return result * 2;
+}
+
+async function doubleNumber(x: number) {
+  'use step';
+  return x * 2;
+}
+
+//////////////////////////////////////////////////////////
+
+export async function stepFunctionWithClosureWorkflow() {
+  'use workflow';
+  const multiplier = 3;
+  const prefix = 'Result: ';
+
+  // Create a step function that captures closure variables
+  const calculate = async (x: number) => {
+    'use step';
+    return `${prefix}${x * multiplier}`;
+  };
+
+  // Pass the step function (with closure vars) to another step
+  const result = await stepThatCallsStepFn(calculate, 7);
+  return result;
+}
+
+async function stepThatCallsStepFn(
+  stepFn: (x: number) => Promise<string>,
+  value: number
+) {
+  'use step';
+  // Call the passed step function - closure vars should be preserved
+  const result = await stepFn(value);
+  return `Wrapped: ${result}`;
+}
+
+//////////////////////////////////////////////////////////
+
+export async function closureVariableWorkflow(baseValue: number) {
+  'use workflow';
+  // biome-ignore lint/style/useConst: Intentionally using `let` instead of `const`
+  let multiplier = 3;
+  const prefix = 'Result: ';
+
+  // Nested step function that uses closure variables
+  const calculate = async () => {
+    'use step';
+    const result = baseValue * multiplier;
+    return `${prefix}${result}`;
+  };
+
+  const output = await calculate();
+  return output;
+}
+
+//////////////////////////////////////////////////////////
+
+// Child workflow that will be spawned from another workflow
+export async function childWorkflow(value: number) {
+  'use workflow';
+  // Do some processing
+  const doubled = await doubleValue(value);
+  return { childResult: doubled, originalValue: value };
+}
+
+async function doubleValue(value: number) {
+  'use step';
+  return value * 2;
+}
+
+// Step function that spawns another workflow using start()
+async function spawnChildWorkflow(value: number) {
+  'use step';
+  // start() can only be called inside a step function, not directly in workflow code
+  const childRun = await start(childWorkflow, [value]);
+  return childRun.runId;
+}
+
+// Step function that waits for a workflow run to complete and returns its result
+async function awaitWorkflowResult<T>(runId: string) {
+  'use step';
+  const run = getRun<T>(runId);
+  const result = await run.returnValue;
+  return result;
+}
+
+export async function spawnWorkflowFromStepWorkflow(inputValue: number) {
+  'use workflow';
+  // Spawn the child workflow from inside a step function
+  const childRunId = await spawnChildWorkflow(inputValue);
+
+  // Wait for the child workflow to complete (also in a step)
+  const childResult = await awaitWorkflowResult<{
+    childResult: number;
+    originalValue: number;
+  }>(childRunId);
+
+  return {
+    parentInput: inputValue,
+    childRunId,
+    childResult,
+  };
+}
+
+async function spawnChildWorkflowRun(value: number) {
+  'use step';
+  return await start(childWorkflow, [value]);
+}
+
+async function getRunIdFromRun(run: Run<unknown>) {
+  'use step';
+  return run.runId;
+}
+
+async function awaitRunFromRun<T>(run: Run<T>) {
+  'use step';
+  return await run.returnValue;
+}
+
+export async function runClassSerializationWorkflow(inputValue: number) {
+  'use workflow';
+
+  const childRun = await spawnChildWorkflowRun(inputValue);
+  const isRunInWorkflow = childRun instanceof Run;
+  const runIdFromStep = await getRunIdFromRun(childRun);
+  const childResult = await awaitRunFromRun<{
+    childResult: number;
+    originalValue: number;
+  }>(childRun);
+
+  return {
+    childRunId: childRun.runId,
+    runIdFromStep,
+    isRunInWorkflow,
+    childResult,
+  };
+}
+
+//////////////////////////////////////////////////////////
+
+/**
+ * Step that calls a helper function imported via path alias.
+ */
+async function callPathsAliasHelper() {
+  'use step';
+  // Call the helper function imported via @repo/* path alias
+  return pathsAliasHelper();
+}
+
+/**
+ * Test that TypeScript path aliases work correctly.
+ * This workflow uses a step that calls a helper function imported via the @repo/* path alias,
+ * which resolves to a file outside the workbench directory.
+ */
+export async function pathsAliasWorkflow() {
+  'use workflow';
+  // Call the step that uses the path alias helper
+  const result = await callPathsAliasHelper();
+  return result;
+}
+
+// ============================================================
+// ERROR HANDLING E2E TEST WORKFLOWS
+// ============================================================
+// These workflows test error propagation and retry behavior.
+// Each workflow tests a specific error scenario with clear naming:
+//   error<Context><Behavior>
+// Where Context is "Workflow" or "Step", and Behavior describes what's tested.
+//
+// Organized into 3 sections:
+// 1. Error Propagation - message and stack trace preservation
+// 2. Retry Behavior - how different error types affect retries
+// 3. Catchability - catching errors in workflow code
+// ============================================================
+
+// ------------------------------------------------------------
+// SECTION 1: ERROR PROPAGATION
+// Tests that error messages and stack traces are preserved correctly
+// ------------------------------------------------------------
+
+// --- Workflow Errors (errors thrown directly in workflow code) ---
+
+function errorNested3() {
+  throw new Error('Nested workflow error');
+}
+
+function errorNested2() {
+  errorNested3();
+}
+
+function errorNested1() {
+  errorNested2();
+}
+
+/** Test: Workflow error from nested function calls preserves stack trace */
+export async function errorWorkflowNested() {
+  'use workflow';
+  errorNested1();
+  return 'never reached';
+}
+
+/** Test: Workflow error from imported module preserves file reference in stack */
+export async function errorWorkflowCrossFile() {
+  'use workflow';
+  callThrower(); // from helpers.ts - throws Error
+  return 'never reached';
+}
+
+// --- Step Errors (errors thrown in steps that propagate to workflow) ---
+
+async function errorStepFn() {
+  'use step';
+  throw new Error('Step error message');
+}
+errorStepFn.maxRetries = 0;
+
+/** Test: Step error message propagates correctly to workflow */
+export async function errorStepBasic() {
+  'use workflow';
+  try {
+    await errorStepFn();
+    return { caught: false, message: null, stack: null };
+  } catch (e: any) {
+    return { caught: true, message: e.message, stack: e.stack };
+  }
+}
+
+/** Test: Step error from imported module has function names in stack */
+export async function errorStepCrossFile() {
+  'use workflow';
+  try {
+    await stepThatThrowsFromHelper(); // from helpers.ts
+    return { caught: false, message: null, stack: null };
+  } catch (e: any) {
+    return { caught: true, message: e.message, stack: e.stack };
+  }
+}
+
+// ------------------------------------------------------------
+// SECTION 2: RETRY BEHAVIOR
+// Tests how different error types affect step retry behavior
+// ------------------------------------------------------------
+
+async function retryUntilAttempt3() {
+  'use step';
+  const { attempt } = getStepMetadata();
+  if (attempt < 3) {
+    throw new Error(`Failed on attempt ${attempt}`);
+  }
+  return attempt;
+}
+
+/** Test: Regular Error retries until success (succeeds on attempt 3) */
+export async function errorRetrySuccess() {
+  'use workflow';
+  const attempt = await retryUntilAttempt3();
+  return { finalAttempt: attempt };
+}
+
+// ---
+
+async function throwFatalError() {
+  'use step';
+  throw new FatalError('Fatal step error');
+}
+
+/** Test: FatalError fails immediately without retry (attempt=1) */
+export async function errorRetryFatal() {
+  'use workflow';
+  await throwFatalError();
+  return 'never reached';
+}
+
+// ---
+
+async function throwRetryableError() {
+  'use step';
+  const { attempt, stepStartedAt } = getStepMetadata();
+  if (attempt === 1) {
+    throw new RetryableError('Retryable error', { retryAfter: '10s' });
+  }
+  return {
+    attempt,
+    duration: Date.now() - stepStartedAt.getTime(),
+  };
+}
+
+/** Test: RetryableError respects custom retryAfter timing (waits 10s+) */
+export async function errorRetryCustomDelay() {
+  'use workflow';
+  return await throwRetryableError();
+}
+
+// ---
+
+async function throwWithNoRetries() {
+  'use step';
+  const { attempt } = getStepMetadata();
+  throw new Error(`Failed on attempt ${attempt}`);
+}
+throwWithNoRetries.maxRetries = 0;
+
+/** Test: maxRetries=0 runs once without retry on failure */
+export async function errorRetryDisabled() {
+  'use workflow';
+  try {
+    await throwWithNoRetries();
+    return { failed: false, attempt: null };
+  } catch (e: any) {
+    // Extract attempt from error message
+    const match = e.message?.match(/attempt (\d+)/);
+    return { failed: true, attempt: match ? parseInt(match[1]) : null };
+  }
+}
+
+// ------------------------------------------------------------
+// SECTION 3: CATCHABILITY
+// Tests that errors can be caught and inspected in workflow code
+// ------------------------------------------------------------
+
+/** Test: FatalError can be caught and detected with FatalError.is() */
+export async function errorFatalCatchable() {
+  'use workflow';
+  try {
+    await throwFatalError();
+    return { caught: false, isFatal: false };
+  } catch (e: any) {
+    return { caught: true, isFatal: FatalError.is(e) };
+  }
+}
+
+/**
+ * Test: a step throws a FatalError; the workflow catches it and inspects
+ * the hydrated thrown value. Exercises the step error serialization
+ * pipeline (step throw → step_failed event → workflow catch).
+ */
+async function throwFatalErrorWithCause() {
+  'use step';
+  const root = new TypeError('underlying type error');
+  const wrapped = new FatalError('fatal with cause');
+  (wrapped as Error).cause = root;
+  throw wrapped;
+}
+
+export async function errorStepThrowFatalRoundTrip() {
+  'use workflow';
+  try {
+    await throwFatalErrorWithCause();
+    return { caught: false } as any;
+  } catch (err: any) {
+    return {
+      caught: true,
+      isFatal: FatalError.is(err),
+      isInstanceOf: err instanceof FatalError,
+      message: err.message,
+      name: err.name,
+      hasFatalProp: err.fatal === true,
+      causeIsTypeError: err.cause instanceof TypeError,
+      causeName: err.cause?.name,
+      causeMessage: err.cause?.message,
+    };
+  }
+}
+
+// ---
+
+/**
+ * Test: a workflow itself throws a FatalError with a cause chain.
+ * Exercises the run-error serialization pipeline (workflow throw →
+ * run_failed event → WorkflowRunFailedError.cause on the client side).
+ */
+export async function errorWorkflowThrowFatalRoundTrip() {
+  'use workflow';
+  const root = new RangeError('out of bounds');
+  const top = new FatalError('workflow exploded');
+  (top as Error).cause = root;
+  throw top;
+}
+
+// ---
+
+/**
+ * Test: a workflow throws a non-Error value (a plain object). The
+ * client-side hydrated `cause` on WorkflowRunFailedError should be
+ * exactly that object — not coerced into an Error.
+ */
+export async function errorWorkflowThrowNonErrorValue() {
+  'use workflow';
+  const value: Record<string, unknown> = {
+    kind: 'business-rule-violation',
+    code: 'INVOICE_LOCKED',
+    detail: { invoiceId: 'inv_123', userId: 'usr_456' },
+  };
+  // Throw a non-Error value (any JS value can be thrown). The serialization
+  // pipeline must round-trip this verbatim — not coerce it into an Error.
+  throw value;
+}
+
+// ---
+
+/**
+ * Test: a step throws a non-Error value (a plain object). Non-Error
+ * throws are NOT recognized as `FatalError` (no `name === 'FatalError'`)
+ * nor as `RetryableError`, so they take the transient retry path. With
+ * `maxRetries = 0` the step fails on first attempt; the runtime wraps
+ * the original thrown value as `cause` on a `FatalError` and the
+ * workflow catches that.
+ */
+async function throwNonErrorFromStep() {
+  'use step';
+  // Same shape as `errorWorkflowThrowNonErrorValue` so the test asserts
+  // a parallel round-trip on both throw boundaries.
+  const value: Record<string, unknown> = {
+    kind: 'business-rule-violation',
+    code: 'INVOICE_LOCKED',
+    detail: { invoiceId: 'inv_123', userId: 'usr_456' },
+  };
+  throw value;
+}
+throwNonErrorFromStep.maxRetries = 0;
+
+export async function errorStepThrowNonErrorValue() {
+  'use workflow';
+  try {
+    await throwNonErrorFromStep();
+    return { caught: false } as any;
+  } catch (err: any) {
+    // After max retries the step executor wraps the underlying thrown value
+    // as `cause` on a FatalError. The wrapping FatalError is what reaches
+    // the workflow's catch; the original non-Error object is on `err.cause`.
+    return {
+      caught: true,
+      isFatal: FatalError.is(err),
+      isInstanceOf: err instanceof FatalError,
+      // The wrapping message includes the retry count + the original
+      // non-Error value's `JSON.stringify` form.
+      messageIncludesKind:
+        typeof err?.message === 'string' &&
+        err.message.includes('business-rule-violation'),
+      causeIsObject:
+        err?.cause !== null &&
+        typeof err?.cause === 'object' &&
+        !(err.cause instanceof Error),
+      causeKind: err?.cause?.kind,
+      causeCode: err?.cause?.code,
+      causeDetail: err?.cause?.detail,
+    };
+  }
+}
+
+// ---
+
+/**
+ * A class instance with no registered serde model cannot cross the
+ * workflow/step boundary — the serializer rejects non-POJO instances.
+ * Used by the serialization-error tests below.
+ */
+class UnserializableValue {
+  secret = 'not-serializable';
+}
+
+async function acceptAnyValue(value: unknown) {
+  'use step';
+  return { received: value !== undefined };
+}
+
+/**
+ * Test: step ARGUMENTS that cannot be serialized. The suspension handler
+ * fails the step (step_created + step_failed) instead of failing the run
+ * from the outside, so a try/catch around the step call observes the
+ * SerializationError — same shape as catching a step-body failure.
+ */
+export async function serializationErrorStepArgsCaught() {
+  'use workflow';
+  try {
+    await acceptAnyValue(new UnserializableValue());
+    return { caught: false } as any;
+  } catch (err: any) {
+    return {
+      caught: true,
+      name: err?.name,
+      messageIncludesStepArguments:
+        typeof err?.message === 'string' &&
+        err.message.includes('Failed to serialize step arguments'),
+    };
+  }
+}
+
+/**
+ * Test: uncaught step-argument serialization failure fails the run as a
+ * fatal USER_ERROR immediately — no queue-redelivery retry loop.
+ */
+export async function serializationErrorStepArgsUncaught() {
+  'use workflow';
+  // Don't catch — the SerializationError propagates and fails the run.
+  await acceptAnyValue(new UnserializableValue());
+  return { caught: false };
+}
+
+async function returnUnserializableValue() {
+  'use step';
+  return new UnserializableValue();
+}
+
+/**
+ * Test: step RETURN VALUE that cannot be serialized. The step executor
+ * treats the SerializationError as fatal (skipping the retry loop) and
+ * writes step_failed, so the workflow can catch it.
+ */
+export async function serializationErrorStepReturnCaught() {
+  'use workflow';
+  try {
+    await returnUnserializableValue();
+    return { caught: false } as any;
+  } catch (err: any) {
+    return {
+      caught: true,
+      name: err?.name,
+      messageIncludesReturnValue:
+        typeof err?.message === 'string' &&
+        err.message.includes('Failed to serialize step return value'),
+    };
+  }
+}
+
+/**
+ * Test: uncaught step-return-value serialization failure fails the run as
+ * a fatal USER_ERROR.
+ */
+export async function serializationErrorStepReturnUncaught() {
+  'use workflow';
+  await returnUnserializableValue();
+  return { caught: false };
+}
+
+// ------------------------------------------------------------
+// SECTION 4: NOT REGISTERED ERRORS
+// Tests for step/workflow not registered in the current deployment
+// ------------------------------------------------------------
+
+/**
+ * Test: step not registered causes the step to fail (like FatalError),
+ * and the workflow can catch the error gracefully.
+ *
+ * This manually invokes useStep with a step ID that doesn't exist in the
+ * deployment bundle, simulating what would happen if a build/bundling issue
+ * caused a step to be missing.
+ */
+export async function stepNotRegisteredCatchable() {
+  'use workflow';
+  // Manually invoke a step that doesn't exist in the deployment.
+  // The SWC transform generates exactly this pattern for real step calls,
+  // so this is equivalent to calling a step that wasn't bundled.
+  const ghost = (globalThis as any)[Symbol.for('WORKFLOW_USE_STEP')](
+    'step//./workflows/99_e2e//nonExistentStep'
+  );
+  try {
+    await ghost();
+    return { caught: false, error: null };
+  } catch (e: any) {
+    return { caught: true, error: e.message };
+  }
+}
+
+/**
+ * Test: step not registered causes the run to fail when not caught.
+ */
+export async function stepNotRegisteredUncaught() {
+  'use workflow';
+  const ghost = (globalThis as any)[Symbol.for('WORKFLOW_USE_STEP')](
+    'step//./workflows/99_e2e//anotherNonExistentStep'
+  );
+  // Don't catch — the step failure should propagate and fail the run
+  return await ghost();
+}
+
+// ============================================================
+// STATIC METHOD STEP/WORKFLOW TESTS
+// ============================================================
+// Tests for static methods on classes with "use step" and "use workflow" directives.
+// ============================================================
+
+/**
+ * Service class with static step methods for math operations.
+ * These methods are transformed to be callable as workflow steps.
+ */
+export class MathService {
+  /** Static step: add two numbers */
+  static async add(a: number, b: number): Promise<number> {
+    'use step';
+    return a + b;
+  }
+
+  /** Static step: multiply two numbers */
+  static async multiply(a: number, b: number): Promise<number> {
+    'use step';
+    return a * b;
+  }
+}
+
+/**
+ * Workflow class with a static workflow method that uses static step methods.
+ */
+export class Calculator {
+  /** Static workflow: uses MathService static step methods */
+  static async calculate(x: number, y: number): Promise<number> {
+    'use workflow';
+    // Add x + y, then multiply by 2
+    const sum = await MathService.add(x, y);
+    const result = await MathService.multiply(sum, 2);
+    return result;
+  }
+}
+
+/**
+ * Alternative pattern: both step and workflow methods in the same class.
+ */
+export class AllInOneService {
+  static async double(n: number): Promise<number> {
+    'use step';
+    return n * 2;
+  }
+
+  static async triple(n: number): Promise<number> {
+    'use step';
+    return n * 3;
+  }
+
+  /** Static workflow: double(n) + triple(n) = 2n + 3n = 5n */
+  static async processNumber(n: number): Promise<number> {
+    'use workflow';
+    const doubled = await AllInOneService.double(n);
+    const tripled = await AllInOneService.triple(n);
+    return doubled + tripled;
+  }
+}
+
+/**
+ * Class that uses `this` in static step methods to reference the class itself.
+ * This tests that the class constructor is properly serialized when `this` is used.
+ */
+export class ChainableService {
+  /** The multiplier used by the multiply step */
+  static multiplier = 10;
+
+  /** Static step that uses `this` to access class properties */
+  static async multiplyByClassValue(
+    this: typeof ChainableService,
+    n: number
+  ): Promise<number> {
+    'use step';
+    // Use `this` to reference the class and access its static property
+    // `this` is the class constructor, so `this.multiplier` accesses the static property
+    // biome-ignore lint/complexity/noThisInStatic: Testing `this` serialization for static methods
+    return n * this.multiplier;
+  }
+
+  /** Static step that uses `this` to call another static method */
+  static async doubleAndMultiply(
+    this: typeof ChainableService,
+    n: number
+  ): Promise<number> {
+    'use step';
+    // Use `this` to access the static property on the class
+    // Note: We can't call another step from within a step, so we just reference a static property
+    // biome-ignore lint/complexity/noThisInStatic: Testing `this` serialization for static methods
+    return n * 2 * this.multiplier;
+  }
+
+  /** Static workflow that demonstrates `this` serialization with static methods */
+  static async processWithThis(n: number): Promise<{
+    multiplied: number;
+    doubledAndMultiplied: number;
+    sum: number;
+  }> {
+    'use workflow';
+    // When calling static methods via ClassName.method(), `this` inside the step
+    // will be the class constructor (ChainableService). The class constructor
+    // is serialized with its classId and passed to the step executor.
+    //
+    // NOTE: We use `ChainableService.method()` here instead of `this.method()` because
+    // the `this` argument is not currently passed through when invoking a workflow via
+    // `start()`. Workflows are executed as standalone functions, so `this` inside the
+    // workflow body is undefined. This could be revisited in the future if needed.
+    const multiplied = await ChainableService.multiplyByClassValue(n);
+    const doubledAndMultiplied = await ChainableService.doubleAndMultiply(n);
+
+    return {
+      multiplied, // n * 10
+      doubledAndMultiplied, // n * 2 * 10 = n * 20
+      sum: multiplied + doubledAndMultiplied, // n * 10 + n * 20 = n * 30
+    };
+  }
+}
+
+//////////////////////////////////////////////////////////
+// E2E test for `this` serialization with .call() and .apply()
+//////////////////////////////////////////////////////////
+
+/**
+ * A step function that uses `this` to access properties.
+ */
+async function multiplyByFactor(this: { factor: number }, value: number) {
+  'use step';
+  return value * this.factor;
+}
+
+/**
+ * Workflow that tests calling step functions with explicit `this` via .call() and .apply()
+ */
+export async function thisSerializationWorkflow(baseValue: number) {
+  'use workflow';
+  // Test .call() - multiply baseValue by 2
+  const result1 = await multiplyByFactor.call({ factor: 2 }, baseValue);
+
+  // Test .apply() - multiply result1 by 3
+  const result2 = await multiplyByFactor.apply({ factor: 3 }, [result1]);
+
+  // Test .call() again - multiply result2 by 5
+  const result3 = await multiplyByFactor.call({ factor: 5 }, result2);
+
+  // baseValue * 2 * 3 * 5 = baseValue * 30
+  return result3;
+}
+
+//////////////////////////////////////////////////////////
+// Custom Serialization E2E Test
+//////////////////////////////////////////////////////////
+
+/**
+ * A custom class with user-defined serialization using Symbol.for() directly.
+ * The SWC plugin detects these symbols and generates the classId and registration automatically.
+ *
+ * Note: The SWC plugin also supports named imports (WORKFLOW_SERIALIZE/WORKFLOW_DESERIALIZE)
+ * from the "@workflow/serde" package. We use Symbol.for() directly here for simplicity since
+ * the SWC plugin has its own tests for the named import case.
+ */
+export class Point {
+  constructor(
+    public x: number,
+    public y: number
+  ) {}
+
+  /** Custom serialization - converts instance to plain object */
+  static [Symbol.for('workflow-serialize')](instance: Point) {
+    return { x: instance.x, y: instance.y };
+  }
+
+  /** Custom deserialization - reconstructs instance from plain object */
+  static [Symbol.for('workflow-deserialize')](data: { x: number; y: number }) {
+    return new Point(data.x, data.y);
+  }
+
+  /** Helper method to compute distance from origin */
+  distanceFromOrigin(): number {
+    return Math.sqrt(this.x * this.x + this.y * this.y);
+  }
+}
+
+/**
+ * Step that receives a Point instance and returns a new Point
+ */
+async function transformPoint(point: Point, scale: number) {
+  'use step';
+  // Verify the point was properly deserialized and has its methods
+  // (calling distanceFromOrigin proves the prototype chain is intact)
+  console.log('Point distance from origin:', point.distanceFromOrigin());
+  // Create and return a new Point (will be serialized on return)
+  return new Point(point.x * scale, point.y * scale);
+}
+
+/**
+ * Step that receives an array of Points
+ */
+async function sumPoints(points: Point[]) {
+  'use step';
+  let totalX = 0;
+  let totalY = 0;
+  for (const p of points) {
+    totalX += p.x;
+    totalY += p.y;
+  }
+  return new Point(totalX, totalY);
+}
+
+/**
+ * Workflow that tests custom serialization of user-defined class instances.
+ * The Point class uses WORKFLOW_SERIALIZE and WORKFLOW_DESERIALIZE symbols
+ * to define how instances should be serialized/deserialized across the
+ * workflow/step boundary.
+ */
+export async function customSerializationWorkflow(x: number, y: number) {
+  'use workflow';
+
+  // Create a Point instance
+  const point = new Point(x, y);
+
+  // Pass it to a step - tests serialization of workflow -> step
+  const scaled = await transformPoint(point, 2);
+
+  // The returned Point should also work - tests serialization of step -> workflow
+  const scaledAgain = await transformPoint(scaled, 3);
+
+  // Test with an array of Points
+  const points = [new Point(1, 2), new Point(3, 4), new Point(5, 6)];
+  const sum = await sumPoints(points);
+
+  return {
+    original: { x: point.x, y: point.y },
+    scaled: { x: scaled.x, y: scaled.y },
+    scaledAgain: { x: scaledAgain.x, y: scaledAgain.y },
+    sum: { x: sum.x, y: sum.y },
+  };
+}
+
+//////////////////////////////////////////////////////////
+// Cross-Context Class Registration E2E Test
+//////////////////////////////////////////////////////////
+
+/**
+ * Import step functions that use Vector - but we do NOT import Vector directly.
+ * This tests that Vector class is registered in the workflow bundle even though
+ * the workflow code never directly references it.
+ */
+import {
+  addVectors,
+  createVector,
+  scaleVector,
+  sumVectors,
+} from './serde-steps';
+
+/**
+ * Workflow that tests cross-context class registration.
+ *
+ * IMPORTANT: This workflow does NOT import Vector directly. It only receives
+ * Vector instances through step return values. The cross-context class registration
+ * feature ensures Vector is registered in the workflow bundle even though
+ * the workflow code never imports it.
+ *
+ * Test flow:
+ * 1. Step creates Vector instance and returns it (step serializes)
+ * 2. Workflow receives Vector (workflow deserializes - THIS IS THE KEY TEST)
+ * 3. Workflow passes Vector to another step (workflow serializes)
+ * 4. Step receives Vector and operates on it (step deserializes)
+ * 5. Workflow returns results to client (as plain objects for simplicity)
+ *
+ * Without cross-context class registration, step 2 would fail because the
+ * workflow bundle wouldn't have Vector registered for deserialization.
+ */
+export async function crossContextSerdeWorkflow() {
+  'use workflow';
+
+  // Step 1: Create a vector in the step
+  // Tests: step creating instance -> workflow deserialization
+  // This is the KEY test - workflow must be able to deserialize Vector
+  // even though the workflow code never imports Vector
+  const v1 = await createVector(1, 2, 3);
+
+  // Step 2: Create another vector
+  const v2 = await createVector(10, 20, 30);
+
+  // Step 3: Pass the deserialized vectors back to a step
+  // Tests: workflow serializing Vector instances it received from steps
+  const sum = await addVectors(v1, v2);
+
+  // Step 4: Scale one of the vectors
+  // Tests: workflow passing a single deserialized Vector to step
+  const scaled = await scaleVector(v1, 5);
+
+  // Step 5: Sum an array of vectors
+  // Tests: array serialization with Vector instances
+  const vectors = [v1, v2, scaled];
+  const arraySum = await sumVectors(vectors);
+
+  // Return plain objects (not Vector instances) so the client doesn't need
+  // to deserialize Vector - we're testing workflow deserialization, not client
+  return {
+    v1: { x: v1.x, y: v1.y, z: v1.z },
+    v2: { x: v2.x, y: v2.y, z: v2.z },
+    sum: { x: sum.x, y: sum.y, z: sum.z },
+    scaled: { x: scaled.x, y: scaled.y, z: scaled.z },
+    arraySum: { x: arraySum.x, y: arraySum.y, z: arraySum.z },
+  };
+}
+
+//////////////////////////////////////////////////////////
+// Serde classes keyed by imported WORKFLOW_SERIALIZE symbols
+//////////////////////////////////////////////////////////
+
+import { createTemperature, warmTemperature } from './serde-steps';
+
+/**
+ * Round-trips a class whose only serde marker is a computed key imported from
+ * a non-`@workflow` module (the `@ai-sdk/openai` shape from #4897). The
+ * workflow never imports Temperature; it only moves instances between steps.
+ */
+export async function importedSerdeKeyWorkflow() {
+  'use workflow';
+
+  const cold = await createTemperature(20);
+  const warm = await warmTemperature(cold, 5);
+
+  return {
+    cold: { celsius: cold.celsius },
+    warm: { celsius: warm.celsius },
+  };
+}
+
+//////////////////////////////////////////////////////////
+// Built-in Error subclass round-trip
+//////////////////////////////////////////////////////////
+
+/**
+ * Step that echoes an array of thrown values straight back through the
+ * step return-value boundary. Used by `errorSubclassRoundTripWorkflow` to
+ * verify that built-in Error subclasses survive the step serialization
+ * boundary with their type identity, message, stack, and cause intact.
+ */
+async function echoErrors(errors: unknown[]): Promise<unknown[]> {
+  'use step';
+  return errors;
+}
+
+/**
+ * Round-trips an array of built-in Error subclass instances through every
+ * serialization boundary:
+ *
+ *   client (start args) → workflow → step (echoErrors) → workflow → client (return)
+ *
+ * This exercises the per-subclass reducers/revivers added in the
+ * "Add first-class serialization for built-in Error subclasses" change.
+ * Each subclass reducer must run BEFORE the generic Error reducer
+ * (devalue is first-match-wins); a regression would silently downgrade
+ * `TypeError` etc. to plain `Error` instances.
+ */
+export async function errorSubclassRoundTripWorkflow(
+  errors: unknown[]
+): Promise<unknown[]> {
+  'use workflow';
+  return await echoErrors(errors);
+}
+
+/**
+ * A class with instance methods that are marked as steps.
+ * This tests the new "use step" support for instance methods.
+ * The class uses custom serialization so the `this` value can be
+ * serialized across the workflow/step boundary.
+ */
+export class Counter {
+  constructor(public value: number) {}
+
+  /** Custom serialization - converts instance to plain object */
+  static [Symbol.for('workflow-serialize')](instance: Counter) {
+    return { value: instance.value };
+  }
+
+  /** Custom deserialization - reconstructs instance from plain object */
+  static [Symbol.for('workflow-deserialize')](data: { value: number }) {
+    return new Counter(data.value);
+  }
+
+  /**
+   * Instance method step: returns the sum of the counter's value and the given amount.
+   * The `this` context (the Counter instance) is serialized and passed
+   * to the step executor, then deserialized before the method is called.
+   */
+  async add(amount: number): Promise<number> {
+    'use step';
+    return this.value + amount;
+  }
+
+  /**
+   * Instance method step: multiplies the counter's value by the given factor.
+   */
+  async multiply(factor: number): Promise<number> {
+    'use step';
+    return this.value * factor;
+  }
+
+  /**
+   * Instance method step: returns an object with both the original and computed values.
+   * This tests that `this` is correctly preserved through the step execution.
+   */
+  async describe(label: string): Promise<{ label: string; value: number }> {
+    'use step';
+    return { label, value: this.value };
+  }
+
+  /**
+   * Returns a "tool"-shaped object whose `add` property is a nested arrow
+   * step that lexically captures `this`.
+   *
+   * This exercises the SWC plugin's lexical-`this` capture for nested arrow
+   * step functions: in workflow mode the proxy is wrapped with
+   * `.bind(this)` (so the queue item carries `thisVal`), and in step mode
+   * the body is hoisted as a regular `function` (so `stepFn.apply(thisVal,
+   * args)` can rebind). The captured `delta` exercises the closure-vars
+   * path alongside it.
+   *
+   * This is structurally identical to the AI SDK `tool({ execute: async
+   * (input) => { 'use step'; return this.x; } })` pattern from the
+   * upstream issue (vercel/workflow#1865).
+   */
+  makeAdder(delta: number): {
+    add: (amount: number) => Promise<number>;
+  } {
+    return {
+      add: async (amount: number) => {
+        'use step';
+        return this.value + amount + delta;
+      },
+    };
+  }
+}
+
+/**
+ * Step that takes a step-function reference and invokes it. Used by
+ * `instanceMethodStepWorkflow` to exercise the workflow→step→step
+ * round-trip serialization of a `bind(this)`-wrapped step proxy.
+ */
+async function invokeAdderFromStep(
+  add: (amount: number) => Promise<number>,
+  amount: number
+): Promise<number> {
+  'use step';
+  return add(amount);
+}
+
+/**
+ * Workflow that tests instance method steps.
+ * Creates Counter instances and calls their instance methods as steps.
+ * The `this` context (the Counter instance) should be serialized and
+ * correctly restored when the step executes.
+ */
+export async function instanceMethodStepWorkflow(initialValue: number) {
+  'use workflow';
+
+  // Create a Counter instance
+  const counter = new Counter(initialValue);
+
+  // Call instance method steps
+  const added = await counter.add(10);
+  const multiplied = await counter.multiply(3);
+  const description = await counter.describe('test counter');
+
+  // Create another counter to verify different instances work
+  const counter2 = new Counter(100);
+  const added2 = await counter2.add(50);
+
+  // Lexical-`this` capture in a nested arrow step:
+  //
+  // `counter.makeAdder(7).add` is a step proxy that the SWC plugin wraps
+  // with `.bind(this)` in workflow mode. Invoking it directly should
+  // capture the Counter instance as `thisVal` so the step body sees
+  // `this.value` correctly.
+  const adder = counter.makeAdder(7);
+  const adderResult = await adder.add(2); // initialValue + 2 + 7
+
+  // Round-trip the bound step proxy through another step boundary:
+  //
+  // Passing `adder.add` as a step argument forces the
+  // `getStepFunctionReducer` to capture the bound `this` (`__boundThis`)
+  // alongside the `stepId`, and the step bundle's reviver must re-bind
+  // the freshly created proxy so the inner step still sees the original
+  // Counter instance via `this`.
+  const adderViaStep = await invokeAdderFromStep(adder.add, 3); // initialValue + 3 + 7
+
+  return {
+    initialValue,
+    added, // initialValue + 10
+    multiplied, // initialValue * 3
+    description, // { label: 'test counter', value: initialValue }
+    added2, // 100 + 50 = 150
+    adderResult, // initialValue + 2 + 7
+    adderViaStep, // initialValue + 3 + 7
+  };
+}
+
+//////////////////////////////////////////////////////////
+// Step Function Reference as start() Argument E2E Test
+//////////////////////////////////////////////////////////
+
+/**
+ * A step function that invokes a step function reference passed to it.
+ * This is called from within the workflow to execute the passed step function.
+ */
+async function invokeStepFn(
+  stepFn: (a: number, b: number) => Promise<number>,
+  x: number,
+  y: number
+): Promise<number> {
+  'use step';
+  // Call the step function reference that was passed in
+  return await stepFn(x, y);
+}
+
+/**
+ * Workflow that receives a step function reference as an argument from start().
+ * This tests that:
+ * 1. Step function references can be serialized in the client bundle (via stepId property)
+ * 2. The serialized step function can be deserialized in the workflow bundle
+ * 3. The deserialized step function can be invoked DIRECTLY from workflow code
+ * 4. The deserialized step function can also be invoked from within another step
+ */
+export async function stepFunctionAsStartArgWorkflow(
+  stepFn: (a: number, b: number) => Promise<number>,
+  x: number,
+  y: number
+): Promise<{ directResult: number; viaStepResult: number; doubled: number }> {
+  'use workflow';
+
+  // CRITICAL TEST: Call the passed step function DIRECTLY from workflow code
+  // This tests that the deserialized step function has the useStep wrapper,
+  // allowing it to be scheduled as a proper step (not executed inline)
+  const directResult = await stepFn(x, y);
+
+  // Also test invoking via another step (this already worked before)
+  const viaStepResult = await invokeStepFn(stepFn, x, y);
+
+  // Do another operation to verify the workflow continues normally
+  const doubled = await stepFn(directResult, directResult);
+
+  return { directResult, viaStepResult, doubled };
+}
+
+//////////////////////////////////////////////////////////
+// AbortController / AbortSignal e2e tests
+//////////////////////////////////////////////////////////
+
+/**
+ * Step that performs a long-running operation respecting an AbortSignal.
+ * Loops with 500ms delays, checking signal.aborted each iteration.
+ */
+async function longStep(
+  signal: AbortSignal,
+  readyHookToken?: string
+): Promise<string> {
+  'use step';
+  if (readyHookToken) {
+    await resumeHook(readyHookToken, { ready: true });
+  }
+  for (let i = 0; i < 60; i++) {
+    if (signal.aborted) {
+      return 'aborted';
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return 'completed';
+}
+
+/**
+ * Step that returns immediately with the signal's current aborted state.
+ */
+async function checkSignalState(signal: AbortSignal): Promise<{
+  aborted: boolean;
+  reason: unknown;
+}> {
+  'use step';
+  return { aborted: signal.aborted, reason: signal.reason };
+}
+
+/**
+ * Step that (optionally) waits, then calls `abort()` on the controller.
+ * The delay lets a sibling step start running before the abort fires —
+ * used by `abortFromStepWorkflow` to verify the in-flight sibling actually
+ * receives the cancellation packet through the backing stream.
+ */
+async function abortFromStep(
+  controller: AbortController,
+  delayMs = 0
+): Promise<void> {
+  'use step';
+  if (delayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  controller.abort('aborted from step');
+}
+
+/**
+ * Step that uses fetch with an AbortSignal against a slow endpoint the step
+ * hosts itself: an in-process `node:http` server on a loopback ephemeral
+ * port that holds each response open for ~30s before answering 200.
+ *
+ * Earlier versions fetched external slow endpoints (postman-echo, httpbin
+ * `/delay/10`, with fallback from one to the other), and those upstreams'
+ * 5xxs and early returns from GH Actions runners were a recurring e2e flake
+ * — the abort-fetch tests were measuring the public internet instead of
+ * abort propagation. A loopback server keeps the subject (cancelling a real
+ * in-flight HTTP fetch) while removing the external dependency entirely; a
+ * per-workbench `/api/delay` route was rejected earlier because it would
+ * exist only on whichever workbench it was added to.
+ *
+ * The 30s hold is load-bearing for regression detection: if abort
+ * propagation breaks, fetch runs to natural completion (`ok: true`,
+ * `aborted: false`) within the tests' 60s budgets and the assertions fail
+ * for the right reason, rather than hanging the suite.
+ *
+ * Reports `status` and `elapsedMs` so that when the abort-fetch tests do
+ * fail, the assertion message shows how the request actually ended instead
+ * of leaving us guessing why the race winner was `fetch` instead of
+ * `timeout`.
+ */
+async function fetchWithSignal(signal: AbortSignal): Promise<{
+  ok: boolean;
+  aborted: boolean;
+  status?: number;
+  error?: string;
+  elapsedMs: number;
+}> {
+  'use step';
+  const { createServer } = await import('node:http');
+  const startedAt = Date.now();
+
+  const timers: NodeJS.Timeout[] = [];
+  const server = createServer((_req, res) => {
+    timers.push(
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ delayed: true }));
+      }, 30_000)
+    );
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address !== 'object') {
+    server.close();
+    throw new Error('Invariant: expected loopback server to have a port');
+  }
+
+  try {
+    const response = await globalThis.fetch(
+      `http://127.0.0.1:${address.port}/delay`,
+      { signal }
+    );
+    return {
+      ok: response.ok,
+      aborted: false,
+      status: response.status,
+      elapsedMs: Date.now() - startedAt,
+    };
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      return {
+        ok: false,
+        aborted: true,
+        elapsedMs: Date.now() - startedAt,
+      };
+    }
+    return {
+      ok: false,
+      aborted: false,
+      error: err?.message ?? String(err),
+      elapsedMs: Date.now() - startedAt,
+    };
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+    server.closeAllConnections();
+    server.close();
+  }
+}
+
+/**
+ * E2E: Basic timeout cancellation.
+ * Creates controller in workflow, races step vs sleep, aborts on timeout.
+ */
+export async function abortTimeoutWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+
+  const result = await Promise.race([
+    longStep(controller.signal),
+    sleep('3s').then(() => 'timeout' as const),
+  ]);
+
+  if (result === 'timeout') {
+    controller.abort();
+    return { status: 'timed out', aborted: controller.signal.aborted };
+  }
+
+  return { status: 'completed', result };
+}
+
+/**
+ * E2E: Signal passed to multiple parallel steps, abort cancels all.
+ */
+export async function abortParallelWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+  const parallelSteps = Promise.all([
+    longStep(controller.signal),
+    longStep(controller.signal),
+    longStep(controller.signal),
+  ]);
+
+  const result = await Promise.race([
+    parallelSteps,
+    sleep('3s').then(() => 'timeout' as const),
+  ]);
+
+  if (result === 'timeout') {
+    controller.abort();
+    // Wait for the in-flight steps to observe the abort before completing the
+    // workflow. Returning immediately leaves the parallel branch dangling and
+    // can keep the run open until the steps hit their natural 30s completion.
+    const results = await parallelSteps;
+    return { status: 'timed out', results };
+  }
+
+  return { status: 'completed', results: result };
+}
+
+/**
+ * E2E: One step aborts a controller; an in-flight sibling step is cancelled.
+ *
+ * Runs `longStep` (a 30s busy-wait that polls `signal.aborted` every 500ms)
+ * in parallel with `abortFromStep` (which sleeps 1s, then calls `abort()`).
+ * The cancellation has to propagate from the aborting step → workflow's
+ * backing stream → the polling step's local AbortController, so the polling
+ * step sees `signal.aborted` flip and exits via the abort branch instead of
+ * running to its 30s natural completion. After the parallel work, we also
+ * verify the workflow VM's signal sees the abort (round-trip via hook event).
+ */
+export async function abortFromStepWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+
+  // Run a long-polling step in parallel with a step that aborts after 1s.
+  // longStep returns 'aborted' if it saw signal.aborted=true mid-flight,
+  // 'completed' if it ran the full 30s without seeing the abort.
+  const [longStepResult] = await Promise.all([
+    longStep(controller.signal),
+    abortFromStep(controller, 1000),
+  ]);
+
+  // After both steps finish, check that the workflow's signal also reflects
+  // the abort (the hook event resumed the controller in the workflow VM).
+  const state = await checkSignalState(controller.signal);
+
+  return {
+    workflowAborted: controller.signal.aborted,
+    stepSawAborted: state.aborted,
+    longStepResult,
+  };
+}
+
+/**
+ * E2E: Already-aborted signal passed to step.
+ */
+export async function abortAlreadyAbortedWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+  controller.abort('pre-aborted');
+
+  const state = await checkSignalState(controller.signal);
+
+  return {
+    aborted: state.aborted,
+    reason: state.reason,
+  };
+}
+
+/**
+ * E2E: Abort reason is preserved.
+ */
+export async function abortReasonWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+
+  const raceResult = await Promise.race([
+    longStep(controller.signal),
+    sleep('2s').then(() => 'timeout' as const),
+  ]);
+
+  if (raceResult === 'timeout') {
+    controller.abort('custom timeout reason');
+  }
+
+  const state = await checkSignalState(controller.signal);
+  return {
+    aborted: state.aborted,
+    reason: state.reason,
+  };
+}
+
+/**
+ * E2E: Abort after all steps complete (no-op, no error).
+ */
+export async function abortAfterCompletionWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+  const state = await checkSignalState(controller.signal);
+
+  // Abort after the step already completed
+  controller.abort();
+
+  return {
+    stepSawAborted: state.aborted,
+    workflowAborted: controller.signal.aborted,
+  };
+}
+
+/**
+ * E2E: User-triggered cancellation via hook + abort controller.
+ */
+export async function abortViaHookWorkflow(hookToken: string) {
+  'use workflow';
+
+  using cancelHook = createHook<{ reason: string }>({
+    token: hookToken,
+  });
+
+  const controller = new AbortController();
+
+  const result = await Promise.race([
+    longStep(controller.signal).then((r) => ({
+      status: 'completed' as const,
+      result: r,
+    })),
+    cancelHook.then((payload) => {
+      controller.abort(payload.reason);
+      return { status: 'cancelled' as const, reason: payload.reason };
+    }),
+  ]);
+
+  return result;
+}
+
+/**
+ * E2E: AbortSignal passed as workflow input from external code.
+ */
+export async function abortExternalSignalWorkflow(signal: AbortSignal) {
+  'use workflow';
+
+  const state = await checkSignalState(signal);
+  return { aborted: state.aborted, reason: state.reason };
+}
+
+/**
+ * E2E: External signal NOT aborted at serialization time, aborted later
+ * while in-flight steps are consuming it.
+ *
+ * This is the harder external-signal path that abortExternalSignalWorkflow
+ * doesn't cover. The caller (test process) creates a fresh AbortController,
+ * passes its signal as workflow input, and aborts it after both step-side
+ * consumers report that they are ready. The serialization-time listener
+ * attached in `getExternalReducers` writes the cancellation packet to the
+ * backing stream when fired; the in-flight steps' deserialized signals — both
+ * a polling step and a listener-based step running in parallel — must see the
+ * abort propagate mid-flight.
+ *
+ * Failure mode if propagation breaks:
+ *   - pollResult: 'completed' (longStep ran the full 30s without seeing aborted=true)
+ *   - listenerResult.via: 'timeout' (addEventListener callback never fired)
+ */
+export async function abortExternalSignalInFlightWorkflow(signal: AbortSignal) {
+  'use workflow';
+
+  using pollReady = createHook<{ ready: true }>();
+  using listenerReady = createHook<{ ready: true }>();
+  await Promise.all([pollReady.getConflict(), listenerReady.getConflict()]);
+
+  // Start both consumers only after their readiness hooks are registered. The
+  // polling step resumes its hook before its loop; the listener step resumes
+  // only after addEventListener is armed. Waiting on both hook payloads keeps
+  // the workflow alive while exposing a durable barrier to the E2E driver.
+  const consumers = Promise.all([
+    longStep(signal, pollReady.token),
+    stepWaitingOnAbortListener(signal, listenerReady.token),
+  ]);
+  await Promise.all([pollReady, listenerReady]);
+
+  const [pollResult, listenerResult] = await consumers;
+  return { pollResult, listenerResult };
+}
+
+/**
+ * E2E: `AbortSignal.any` composing signals INSIDE the workflow VM.
+ *
+ * The workflow VM provides its own `AbortSignal.any` impl
+ * (workflow/abort-controller.ts) that produces a `WorkflowAbortSignal`
+ * composite which listens to each source `WorkflowAbortSignal` via
+ * `addEventListener`. When any source aborts, the composite fires
+ * synchronously through the VM's listener firing path — no stream packet,
+ * no replay round-trip, just in-VM signal composition.
+ */
+export async function abortAnyInWorkflowWorkflow() {
+  'use workflow';
+  const c1 = new AbortController();
+  const c2 = new AbortController();
+  const combined = AbortSignal.any([c1.signal, c2.signal]);
+
+  const beforeCombinedAborted = combined.aborted;
+
+  // Abort c2; the composite must reflect the abort synchronously
+  // (the WorkflowAbortSignal listener fires sync inside the VM).
+  c2.abort('via c2');
+
+  const afterCombinedAborted = combined.aborted;
+  const afterCombinedReason = combined.reason;
+  const c1Aborted = c1.signal.aborted;
+
+  return {
+    beforeCombinedAborted,
+    afterCombinedAborted,
+    afterCombinedReason,
+    c1Aborted,
+  };
+}
+
+/**
+ * E2E: `AbortSignal.any` INSIDE a step.
+ *
+ * The step receives two deserialized native `AbortSignal`s (revived via
+ * `reviveAbortSignal`) and composes them with the native `AbortSignal.any`.
+ * A sibling step aborts one of the source controllers ~1s in. The chain
+ * that has to work: source controller aborts → workflow VM signal flips →
+ * stream packet written → step's deserialized signal fires → composite from
+ * `AbortSignal.any` fires → user listener fires.
+ */
+export async function abortAnyInStepWorkflow() {
+  'use workflow';
+  const c1 = new AbortController();
+  const c2 = new AbortController();
+
+  const [stepResult] = await Promise.all([
+    stepCombiningSignals(c1.signal, c2.signal),
+    abortFromStep(c2, 1000),
+  ]);
+
+  // Step-initiated aborts update workflow-side signal state when replay
+  // processes hook_received at a suspension boundary.
+  await sleep('100ms');
+
+  return {
+    stepResult,
+    c1Aborted: c1.signal.aborted,
+    c2Aborted: c2.signal.aborted,
+  };
+}
+
+/**
+ * E2E: Controller survives workflow replay (sleep causes suspension/resumption).
+ */
+export async function abortSurvivesReplayWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+
+  // First step
+  const before = await checkSignalState(controller.signal);
+
+  // Sleep causes workflow to suspend and replay
+  await sleep('1s');
+
+  // Abort after replay
+  controller.abort('after-replay');
+
+  // Second step sees the abort
+  const after = await checkSignalState(controller.signal);
+
+  return {
+    beforeAborted: before.aborted,
+    afterAborted: after.aborted,
+    afterReason: after.reason,
+  };
+}
+
+/**
+ * E2E: throwIfAborted() causes FatalError (no retries).
+ * Step calls throwIfAborted() on an already-aborted signal.
+ * The DOMException should be wrapped in FatalError, skip retries,
+ * and propagate to the workflow.
+ */
+export async function abortThrowIfAbortedWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+  controller.abort('throw-test-reason');
+
+  try {
+    await stepThatThrowsIfAborted(controller.signal);
+    return { threw: false };
+  } catch (err: any) {
+    return {
+      threw: true,
+      message: err.message,
+      isFatal: err.name === 'FatalError' || err.fatal === true,
+    };
+  }
+}
+
+async function stepThatThrowsIfAborted(signal: AbortSignal) {
+  'use step';
+  signal.throwIfAborted();
+  return 'should not reach here';
+}
+
+/**
+ * Step that resolves via `signal.addEventListener('abort', ...)`. Tests the
+ * listener path on the deserialized signal — the path fetch's internal
+ * cancellation uses, but invoked directly. Resolves with `via: 'listener'`
+ * if the listener fired, or `via: 'timeout'` if propagation failed and the
+ * 30s safety timeout won.
+ *
+ * No `signal.aborted` short-circuit: we rely solely on the listener firing.
+ * The E2E workflow uses `readyHookToken` to ensure the listener is installed
+ * before its external controller aborts. If propagation then breaks, the
+ * safety timeout surfaces it instead of masking it with a synchronous path.
+ */
+async function stepWaitingOnAbortListener(
+  signal: AbortSignal,
+  readyHookToken?: string
+): Promise<{ saw: boolean; via: 'listener' | 'timeout' }> {
+  'use step';
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      resolve({ saw: true, via: 'listener' });
+    };
+    signal.addEventListener('abort', onAbort);
+    if (readyHookToken) {
+      resumeHook(readyHookToken, { ready: true }).catch(reject);
+    }
+    setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      resolve({ saw: signal.aborted, via: 'timeout' });
+    }, 30_000);
+  });
+}
+
+/**
+ * Step that polls `signal.throwIfAborted()` every 500ms. When the abort
+ * fires mid-flight, throwIfAborted throws a DOMException — which the step
+ * handler wraps as FatalError before it reaches the workflow. Returns the
+ * natural-completion value if propagation fails and the loop runs out.
+ */
+async function stepPollingThrowIfAborted(signal: AbortSignal): Promise<string> {
+  'use step';
+  for (let i = 0; i < 60; i++) {
+    signal.throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return 'completed';
+}
+
+/**
+ * Step that combines two abort signals with native `AbortSignal.any` and
+ * waits for the composite to fire via addEventListener. The composite is
+ * a real native AbortSignal (Node's `AbortSignal.any`); each input signal
+ * is the deserialized step-side native AbortSignal. Tests that the listener
+ * chain (source signal aborts → composite fires → user listener fires)
+ * works end-to-end through the deserialization layer.
+ */
+async function stepCombiningSignals(
+  s1: AbortSignal,
+  s2: AbortSignal
+): Promise<{ saw: boolean; via: 'listener' | 'timeout' }> {
+  'use step';
+  const combined = AbortSignal.any([s1, s2]);
+  return new Promise((resolve) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      resolve({ saw: true, via: 'listener' });
+    };
+    combined.addEventListener('abort', onAbort);
+    setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      combined.removeEventListener('abort', onAbort);
+      resolve({ saw: combined.aborted, via: 'timeout' });
+    }, 30_000);
+  });
+}
+
+/**
+ * E2E: Abort reason propagation with various types.
+ * Tests that string, object, and undefined reasons all propagate correctly.
+ */
+export async function abortReasonTypesWorkflow() {
+  'use workflow';
+
+  const c1 = new AbortController();
+  c1.abort('string-reason');
+  const s1 = await checkSignalState(c1.signal);
+
+  const c2 = new AbortController();
+  c2.abort({ code: 'CANCELLED', detail: 'by user' });
+  const s2 = await checkSignalState(c2.signal);
+
+  const c3 = new AbortController();
+  c3.abort();
+  const s3 = await checkSignalState(c3.signal);
+
+  return {
+    stringReason: s1,
+    objectReason: s2,
+    undefinedReason: s3,
+  };
+}
+
+/**
+ * E2E: Aborting an in-flight fetch.
+ *
+ * Exercises the deserialized signal's listener path that no other abort test
+ * covers: signal starts non-aborted, the step kicks off a fetch against a
+ * slow endpoint, the workflow's abort() fires while fetch is still awaiting
+ * the response, and fetch's internal abort listener (registered via
+ * addEventListener on the signal) cancels the in-flight HTTP request.
+ *
+ * If propagation is broken — e.g. listeners don't fire on the deserialized
+ * signal, or the cancellation stream packet isn't written — the fetch runs
+ * to natural completion and `aborted` is `false`.
+ */
+export async function abortFetchInFlightWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+  // The step hosts its own slow endpoint (see fetchWithSignal) that holds
+  // the response open for ~30s — a real in-flight fetch the abort can
+  // cancel mid-flight, with no external upstream to flake.
+  const fetchPromise = fetchWithSignal(controller.signal);
+
+  // Race the fetch against a 2s sleep. Sleep wins; abort fires.
+  const winner = await Promise.race([
+    fetchPromise.then(() => 'fetch' as const),
+    sleep('2s').then(() => 'timeout' as const),
+  ]);
+
+  if (winner === 'timeout') {
+    // Abort with no reason — defaults to a DOMException("AbortError") so
+    // fetch's rejection is an Error-shaped value the step can catch by
+    // `err.name === 'AbortError'`. (Per WHATWG fetch, `controller.abort(x)`
+    // with a non-Error `x` would cause fetch to reject with `x` directly,
+    // bypassing the AbortError check in `fetchWithSignal`.)
+    controller.abort();
+  }
+
+  // Always await the fetch to see how it ended. The step's catch path returns
+  // `{ ok: false, aborted: true }` if fetch saw the abort, or `{ ok: true,
+  // aborted: false }` if propagation failed and the request ran to completion.
+  const fetchResult = await fetchPromise;
+  return { winner, fetchResult };
+}
+
+/**
+ * E2E: The "simpler" timeout pattern documented on the
+ * `abort-signal-timeout-in-workflow` error page —
+ * `void sleep("Ns").then(() => controller.abort())` followed by a single
+ * awaited step that consumes `controller.signal`. Validates the doc's
+ * recommended replacement for `AbortSignal.timeout()` actually works
+ * end-to-end.
+ *
+ * If the in-flight fetch finishes within the timeout, the step returns
+ * normally. If the sleep wins, the .then fires `abort()`, the abort
+ * propagates to the in-flight step's signal via the backing stream, fetch
+ * cancels, and the step's catch path returns `{ ok: false, aborted: true }`.
+ */
+export async function abortVoidSleepTimeoutWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+  void sleep('2s').then(() => controller.abort());
+
+  return await fetchWithSignal(controller.signal);
+}
+
+/**
+ * E2E: Uncaught fetch AbortError propagates as FatalError (no retries).
+ * The step does NOT catch the AbortError from fetch — it should propagate
+ * as a FatalError to the workflow without the step being retried.
+ */
+export async function abortFetchUncaughtWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+
+  // Abort without a custom reason so fetch rejects with AbortError. Supplying
+  // a reason makes fetch reject with that value directly, which is retryable.
+  controller.abort();
+
+  try {
+    await stepThatFetchesWithSignal(controller.signal);
+    return { threw: false };
+  } catch (err: any) {
+    return {
+      threw: true,
+      message: err.message,
+      isFatal: err.name === 'FatalError' || err.fatal === true,
+    };
+  }
+}
+
+async function stepThatFetchesWithSignal(signal: AbortSignal) {
+  'use step';
+  // This will throw AbortError because the signal is already aborted.
+  // The error should NOT be caught here — it propagates to the workflow
+  // as a FatalError (wrapped by the step executor).
+  const response = await globalThis.fetch('https://example.com', { signal });
+  return response.status;
+}
+
+/**
+ * E2E: Deterministic branching — if-check on signal.aborted takes same path
+ * on first-run and replay.
+ *
+ * On first run: abort() hasn't been called yet, signal.aborted is false,
+ * takes the else branch. On replay: hook_received was processed but
+ * signal.aborted must STILL be false until abort() is called, so the
+ * else branch is taken again. This ensures deterministic code paths.
+ */
+export async function abortDeterministicBranchWorkflow() {
+  'use workflow';
+
+  const controller = new AbortController();
+
+  // This if-check MUST take the same branch on both first-run and replay.
+  // If signal.aborted were set during event replay (before this code runs),
+  // the if-branch would be taken on replay but not on first-run.
+  let result: string;
+  if (controller.signal.aborted) {
+    result = 'was aborted'; // Should NEVER happen
+  } else {
+    controller.abort('test');
+    result = 'just aborted'; // Should ALWAYS happen
+  }
+
+  // After abort(), signal.aborted should be true
+  const state = await checkSignalState(controller.signal);
+
+  return {
+    result,
+    aborted: state.aborted,
+    reason: state.reason,
+  };
+}
+
+/**
+ * E2E: Listener-based reaction to abort. Tests that
+ * `signal.addEventListener('abort', ...)` on the deserialized step-side
+ * signal actually fires when the cancellation packet arrives — the same
+ * path fetch's internal cancellation uses, but exercised directly so a
+ * regression here can't be papered over by fetch-specific behavior.
+ */
+export async function abortListenerWorkflow() {
+  'use workflow';
+  const controller = new AbortController();
+
+  // Listener step + delayed-abort step run in parallel. If listener
+  // propagation works, the listener resolves the step within ~1s.
+  const [stepResult] = await Promise.all([
+    stepWaitingOnAbortListener(controller.signal),
+    abortFromStep(controller, 1000),
+  ]);
+
+  return { stepResult };
+}
+
+/**
+ * E2E: `throwIfAborted()` mid-flight. Distinct from
+ * `abortThrowIfAbortedWorkflow` which only tests the synchronous-throw case
+ * on an already-aborted signal. Here the signal starts non-aborted, the step
+ * polls `signal.throwIfAborted()` in a loop, and a sibling step aborts after
+ * 1s. The DOMException thrown by `throwIfAborted` should bubble out of the
+ * step as a FatalError (no retries) and propagate to the workflow.
+ */
+export async function abortThrowIfAbortedMidFlightWorkflow() {
+  'use workflow';
+  const controller = new AbortController();
+
+  try {
+    const [result] = await Promise.all([
+      stepPollingThrowIfAborted(controller.signal),
+      abortFromStep(controller, 1000),
+    ]);
+    return { threw: false, result };
+  } catch (err: any) {
+    return {
+      threw: true,
+      message: err.message,
+      isFatal: err.name === 'FatalError' || err.fatal === true,
+    };
+  }
+}
+
+/**
+ * E2E: Deterministic branching when the abort comes from a STEP (not the
+ * workflow body itself). Counterpart to `abortDeterministicBranchWorkflow`,
+ * which tests the case where the workflow code calls `abort()` directly.
+ *
+ * The pair of `signal.aborted` reads must each take the same branch on the
+ * first run and on every replay — even though the abort is recorded as a
+ * `hook_received` event written by a step that runs on a different compute
+ * instance. If signal.aborted flipped at the wrong logical point during
+ * replay (e.g. immediately when the events consumer first sees the event,
+ * rather than chained through promiseQueue at the suspension boundary that
+ * matches the original flow), the branches would diverge across runs.
+ */
+export async function abortDeterministicBranchFromStepWorkflow() {
+  'use workflow';
+  const controller = new AbortController();
+
+  // Pre-abort read. MUST be false on first-run AND replay.
+  const beforeAborted = controller.signal.aborted;
+  let beforeBranch: string;
+  if (beforeAborted) {
+    beforeBranch = 'unexpected-aborted'; // Should NEVER happen
+  } else {
+    beforeBranch = 'pre-abort'; // Should ALWAYS happen
+  }
+
+  // Step that aborts the controller via the patched abort() path. Writes
+  // hook_received to the event log (and a stream cancellation packet) before
+  // returning.
+  await abortFromStep(controller);
+
+  // A suspension is required after the step before the workflow's signal
+  // reflects the abort. Step-initiated aborts go through the events consumer:
+  // when `hook_received` is processed during replay, `signal._setAborted` is
+  // chained on `promiseQueue.then(...)` in `workflow/abort-controller.ts`,
+  // which only runs at the next checkpoint that drains the promise queue —
+  // not synchronously after the step's await resolves. This mirrors how
+  // step return values become visible: only at a suspension boundary.
+  await sleep('1s');
+
+  // Post-abort read. MUST be true on first-run AND replay — the events
+  // consumer has now drained `_setAborted` for the hook_received event.
+  const afterAborted = controller.signal.aborted;
+  let afterBranch: string;
+  if (afterAborted) {
+    afterBranch = 'post-abort'; // Should ALWAYS happen
+  } else {
+    afterBranch = 'unexpected-not-aborted'; // Should NEVER happen
+  }
+
+  return {
+    beforeAborted,
+    beforeBranch,
+    afterAborted,
+    afterBranch,
+  };
+}
+
+/**
+ * Helper step that records its argument to a log array and returns it.
+ */
+async function logStep(entry: string): Promise<string> {
+  'use step';
+  return entry;
+}
+
+/**
+ * E2E: Abort + Hook ordering matrix.
+ *
+ * Tests all 4 combinations of:
+ * - Listener registration order (abort listener first vs hook.then first)
+ * - Event trigger order (abort first vs resumeHook first)
+ *
+ * Each combination must produce a deterministic log order on both
+ * first-run and replay.
+ *
+ * The `variant` parameter selects which combination to test:
+ * - "listener-first-abort-first": addEventListener → hook.then → abort() → resumeHook
+ * - "listener-first-hook-first":  addEventListener → hook.then → resumeHook → abort()
+ * - "hook-first-abort-first":     hook.then → addEventListener → abort() → resumeHook
+ * - "hook-first-hook-first":      hook.then → addEventListener → resumeHook → abort()
+ */
+export async function abortHookOrderingWorkflow(
+  hookToken: string,
+  variant: string
+) {
+  'use workflow';
+
+  const controller = new AbortController();
+  using hook = createHook<{ value: string }>({ token: hookToken });
+  const log: string[] = [];
+
+  if (variant === 'listener-first-abort-first') {
+    // Register abort listener first, then hook.then
+    controller.signal.addEventListener('abort', () => {
+      log.push('abort-listener');
+    });
+    void hook.then(async (payload) => {
+      log.push('hook-resolved:' + payload.value);
+    });
+    // Trigger abort first (hook resumed externally after)
+    controller.abort();
+    log.push('after-abort');
+  } else if (variant === 'listener-first-hook-first') {
+    // Register abort listener first, then hook.then
+    controller.signal.addEventListener('abort', () => {
+      log.push('abort-listener');
+    });
+    void hook.then(async (payload) => {
+      log.push('hook-resolved:' + payload.value);
+    });
+    // Hook is resumed externally first, then abort
+    // (we await a step to give the hook time to be resumed)
+    await logStep('waiting');
+    controller.abort();
+    log.push('after-abort');
+  } else if (variant === 'hook-first-abort-first') {
+    // Register hook.then first, then abort listener
+    void hook.then(async (payload) => {
+      log.push('hook-resolved:' + payload.value);
+    });
+    controller.signal.addEventListener('abort', () => {
+      log.push('abort-listener');
+    });
+    // Trigger abort first
+    controller.abort();
+    log.push('after-abort');
+  } else if (variant === 'hook-first-hook-first') {
+    // Register hook.then first, then abort listener
+    void hook.then(async (payload) => {
+      log.push('hook-resolved:' + payload.value);
+    });
+    controller.signal.addEventListener('abort', () => {
+      log.push('abort-listener');
+    });
+    // Hook resumed externally first, then abort
+    await logStep('waiting');
+    controller.abort();
+    log.push('after-abort');
+  }
+
+  // Wait long enough for the test harness to resume the hook (test sleeps
+  // a few seconds before resumeHook). The `void hook.then(...)` callback
+  // appends 'hook-resolved:hello' to the log on replay once the hook is
+  // received; this sleep keeps the workflow alive so that resumption lands
+  // before the workflow returns and `using hook` disposes it.
+  await sleep('10s');
+
+  return log;
+}
+
+//////////////////////////////////////////////////////////
+
+async function processPayload(payload: { type: string; id?: number }) {
+  'use step';
+  return { processed: true, type: payload.type, id: payload.id };
+}
+
+/**
+ * Workflow that uses a hook with concurrent sleep — tests that multiple
+ * hook payloads are delivered correctly even when a sleep has no wait_completed.
+ *
+ * This is a regression test for a bug where the sleep's WorkflowSuspension
+ * would terminate the workflow before all hook payloads were processed.
+ */
+export async function hookWithSleepWorkflow(token: string) {
+  'use workflow';
+
+  type Payload = { type: string; id?: number; done?: boolean };
+
+  using hook = createHook<Payload>({ token });
+
+  // Concurrent sleep that won't complete during the test
+  void sleep('1d');
+
+  const results: any[] = [];
+
+  for await (const payload of hook) {
+    // Process each payload through a step to prove we reached it
+    const result = await processPayload(payload);
+    results.push(result);
+
+    if (payload.done) {
+      break;
+    }
+  }
+
+  return results;
+}
+
+//////////////////////////////////////////////////////////
+
+/**
+ * https://github.com/vercel/workflow/pull/1528 Regression test for false-positive
+ * unconsumed event in for-await hook loops with steps: a hook iteration with
+ * an unawaited sleep where the step is only invoked on the final payload.
+ * The replay event log ends up with two `hook_received` events before a
+ * single `step_created`, which is the exact shape that triggered the
+ * false-positive "Corrupted event log" error in production.
+ */
+export async function hookWithSleepFinalStepWorkflow(token: string) {
+  'use workflow';
+
+  type Payload = { type: string; id?: number; done?: boolean };
+
+  using hook = createHook<Payload>({ token });
+
+  // Fire-and-forget timeout — the "concurrent pending entity" that interacts
+  // with the hook iteration during replay.
+  void sleep('1d');
+
+  const seen: number[] = [];
+  let finalResult: any;
+
+  for await (const payload of hook) {
+    if (typeof payload.id === 'number') {
+      seen.push(payload.id);
+    }
+    if (payload.done) {
+      finalResult = await processPayload(payload);
+      break;
+    }
+  }
+
+  return { seen, finalResult };
+}
+
+//////////////////////////////////////////////////////////
+
+/**
+ * https://github.com/vercel/workflow/issues/4264 A hook raced against sleep()
+ * and awaited again after losing the race. The next payload must reach the
+ * await that is still pending, not the awaiter enrolled by the lost race.
+ */
+export async function hookRaceAfterLostRaceWorkflow(token: string) {
+  'use workflow';
+
+  using hook = createHook<{ value: string }>({ token });
+
+  const first = await Promise.race([
+    hook.then(() => 'hook' as const),
+    sleep('1s').then(() => 'sleep' as const),
+  ]);
+
+  const second = await Promise.race([
+    hook.then((payload) => payload.value),
+    sleep('30s').then(() => 'timeout' as const),
+  ]);
+
+  return { first, second };
+}
+
+/**
+ * https://github.com/vercel/workflow/issues/4264 Several races lost in a row,
+ * each abandoning its own `hook.then()`, then a race the hook wins, then a
+ * sequential await. The delivery must reach the pending await, and the next
+ * await must receive the next payload, not the one just delivered.
+ */
+export async function hookRaceLoopAfterLostRacesWorkflow(token: string) {
+  'use workflow';
+
+  using hook = createHook<{ value: string }>({ token });
+
+  const lost: string[] = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    lost.push(
+      await Promise.race([
+        hook.then((payload) => payload.value),
+        sleep('1s').then(() => 'sleep' as const),
+      ])
+    );
+  }
+
+  const delivered = await Promise.race([
+    hook.then((payload) => payload.value),
+    sleep('30s').then(() => 'timeout' as const),
+  ]);
+
+  const next = await Promise.race([
+    hook.then((payload) => payload.value),
+    sleep('30s').then(() => 'timeout' as const),
+  ]);
+
+  return { lost, delivered, next };
+}
+
+async function hookRaceReminderStep() {
+  'use step';
+  // Long enough for the test to resume the hook while this step runs.
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+}
+
+/**
+ * The pattern the hooks docs recommend for waiting again after a timeout:
+ * create the hook promise once and race it on every attempt. A payload
+ * recorded while a step runs between the races must reach the second race.
+ */
+export async function hookRaceOncePromiseWorkflow(token: string) {
+  'use workflow';
+
+  using hook = createHook<{ value: string }>({ token });
+  const approval = hook.then((payload) => payload.value);
+
+  const first = await Promise.race([
+    approval,
+    sleep('1s').then(() => 'timeout' as const),
+  ]);
+
+  await hookRaceReminderStep();
+
+  const second = await Promise.race([
+    approval,
+    sleep('30s').then(() => 'timeout' as const),
+  ]);
+
+  return { first, second };
+}
+
+//////////////////////////////////////////////////////////
+
+async function addNumbers(a: number, b: number) {
+  'use step';
+  return a + b;
+}
+
+/**
+ * Validates that sleep() inside a loop with step calls actually delays
+ * execution on each iteration (i.e., sleeps are honored on replay, not skipped).
+ *
+ * Reproduces the scenario from a user report claiming that:
+ *   for (let i = 0; i < N; i++) {
+ *     await someStep();
+ *     await sleep(duration);
+ *   }
+ * ...fires all iterations instantly with zero delay.
+ */
+async function noopStep(iteration: number) {
+  'use step';
+  return { iteration, ts: Date.now() };
+}
+
+export async function sleepInLoopWorkflow() {
+  'use workflow';
+  const iterations = 3;
+  const sleepMs = 3_000; // 3s between iterations (2 sleeps total)
+  const timestamps: number[] = [];
+
+  for (let i = 0; i < iterations; i++) {
+    const result = await noopStep(i);
+    timestamps.push(result.ts);
+    if (i < iterations - 1) {
+      await sleep(sleepMs);
+    }
+  }
+
+  const totalElapsed = timestamps[timestamps.length - 1] - timestamps[0];
+  return { timestamps, totalElapsed };
+}
+
+//////////////////////////////////////////////////////////
+
+/**
+ * Control workflow: sleep + sequential steps (no hooks).
+ * Proves that void sleep().then() does NOT interfere with sequential steps
+ * whose events all exist in the log. This is a control test to show
+ * the promiseQueue regression is specific to hooks.
+ */
+export async function sleepWithSequentialStepsWorkflow() {
+  'use workflow';
+
+  // Fire-and-forget sleep (same pattern as agent-stop)
+  let shouldCancel = false;
+  void sleep('1d').then(() => {
+    shouldCancel = true;
+  });
+
+  const a = await addNumbers(1, 2);
+  const b = await addNumbers(a, 3);
+  const c = await addNumbers(b, 4);
+  return { a, b, c, shouldCancel };
+}
+
+//////////////////////////////////////////////////////////
+
+/**
+ * Validates that import.meta.url is correctly polyfilled in CJS step bundles
+ * and natively available in ESM step bundles.
+ */
+async function checkImportMetaUrl(): Promise<{
+  isDefined: boolean;
+  type: string;
+  isFileUrl: boolean;
+}> {
+  'use step';
+  const url = import.meta.url;
+  return {
+    isDefined: typeof url === 'string' && url.length > 0,
+    type: typeof url,
+    isFileUrl: typeof url === 'string' && url.startsWith('file://'),
+  };
+}
+
+export async function importMetaUrlWorkflow() {
+  'use workflow';
+  return await checkImportMetaUrl();
+}
+
+//////////////////////////////////////////////////////////
+// Regression test for #1577:
+// getWorkflowMetadata()/getStepMetadata() called from a module-level helper
+// function (not directly inside the step body) must still have access to the
+// AsyncLocalStorage context.
+
+const withStrictMetadataCheck = async <T>(fn: () => Promise<T>) => {
+  const workflowMetadata = getWorkflowMetadata();
+  const stepMetadata = getStepMetadata();
+
+  return await fn().then((result) => ({
+    result,
+    workflowMetadata,
+    stepMetadata,
+  }));
+};
+
+async function metadataHelperStep(label: string): Promise<{
+  label: string;
+  workflowRunId: string;
+  stepId: string;
+  attempt: number;
+}> {
+  'use step';
+
+  const { workflowMetadata, stepMetadata } = await withStrictMetadataCheck(
+    async () => label
+  );
+
+  return {
+    label,
+    workflowRunId: workflowMetadata.workflowRunId,
+    stepId: stepMetadata.stepId,
+    attempt: stepMetadata.attempt,
+  };
+}
+
+export async function metadataFromHelperWorkflow(label: string): Promise<{
+  label: string;
+  workflowRunId: string;
+  stepId: string;
+  attempt: number;
+}> {
+  'use workflow';
+
+  return await metadataHelperStep(label);
+}
+
+//////////////////////////////////////////////////////////
+// Getter Step Tests
+//////////////////////////////////////////////////////////
+
+/**
+ * A class with a getter method marked as a step.
+ * This tests the "use step" support for getter functions.
+ * The class uses custom serialization so the `this` value can be
+ * serialized across the workflow/step boundary.
+ */
+export class Sensor {
+  constructor(
+    public baseValue: number,
+    public multiplier: number
+  ) {}
+
+  static [Symbol.for('workflow-serialize')](instance: Sensor) {
+    return { baseValue: instance.baseValue, multiplier: instance.multiplier };
+  }
+
+  static [Symbol.for('workflow-deserialize')](data: {
+    baseValue: number;
+    multiplier: number;
+  }) {
+    return new Sensor(data.baseValue, data.multiplier);
+  }
+
+  /** Getter step: accessing this property triggers a step invocation */
+  get reading() {
+    'use step';
+    return this.baseValue * this.multiplier;
+  }
+
+  /** Regular instance method step for comparison */
+  async calibrate(offset: number): Promise<number> {
+    'use step';
+    return this.baseValue * this.multiplier + offset;
+  }
+}
+
+/**
+ * Workflow that tests getter steps on a class instance.
+ * Uses `await instance.prop` to trigger step invocations via getters.
+ */
+export async function getterStepWorkflow(
+  base: number,
+  multiplier: number,
+  offset: number
+) {
+  'use workflow';
+
+  const sensor = new Sensor(base, multiplier);
+
+  // Getter step: `await sensor.reading` triggers a step invocation
+  const reading = await sensor.reading;
+
+  // Regular instance method step for comparison
+  const calibrated = await sensor.calibrate(offset);
+
+  // Second sensor to verify different instances work
+  const sensor2 = new Sensor(100, 2);
+  const reading2 = await sensor2.reading;
+
+  return {
+    reading, // base * multiplier
+    calibrated, // base * multiplier + offset
+    reading2, // 100 * 2 = 200
+  };
+}
+
+//////////////////////////////////////////////////////////
+// start() inside workflow functions
+//////////////////////////////////////////////////////////
+
+/**
+ * Child workflow used by startFromWorkflow.
+ * Receives a hook token from its parent, processes a value,
+ * and signals the parent via resumeHook before completing.
+ */
+export async function childWorkflowWithHookSignal(
+  hookToken: string,
+  value: number
+) {
+  'use workflow';
+  const result = await processAndSignalParent(hookToken, value);
+  return result;
+}
+
+async function processAndSignalParent(hookToken: string, value: number) {
+  'use step';
+  const processed = value * 3;
+  await resumeHook(hookToken, { processed });
+  return { processed };
+}
+
+/**
+ * Parent workflow that calls start() directly to spawn a child workflow,
+ * then waits for a hook signal from the child.
+ */
+export async function startFromWorkflow(inputValue: number) {
+  'use workflow';
+  const hook = createHook<{ processed: number }>();
+  const childRun = await start(childWorkflowWithHookSignal, [
+    hook.token,
+    inputValue,
+  ]);
+  const signal = await hook;
+  return {
+    parentInput: inputValue,
+    childRunId: childRun.runId,
+    signalFromChild: signal,
+  };
+}
+
+/**
+ * Child for the child-run completion tests: sleeps first so the parent's
+ * first read finds it still running and the parent has to suspend on the
+ * completion hook, then doubles `value` or fails.
+ */
+export async function slowChildWorkflow(value: number, fail: boolean) {
+  'use workflow';
+  await sleep('2s');
+  if (fail) {
+    throw new FatalError(`slow child failed for ${value}`);
+  }
+  return await doubleValue(value);
+}
+
+/**
+ * Parent that awaits a child's `returnValue` directly from workflow code.
+ * The wait goes through the system completion hook rather than a polling
+ * step; the e2e test checks the parent's event log for it.
+ */
+export async function awaitChildReturnValueWorkflow(
+  value: number,
+  fail: boolean
+) {
+  'use workflow';
+  const childRun = await start(slowChildWorkflow, [value, fail]);
+  try {
+    const childResult = await childRun.returnValue;
+    return { childRunId: childRun.runId, childResult };
+  } catch (error) {
+    return {
+      childRunId: childRun.runId,
+      childError: (error as Error).name,
+      childErrorCause: ((error as Error).cause as Error | undefined)?.message,
+    };
+  }
+}
+
+/**
+ * Child for the fan-out completion test: finishes only once the test resumes
+ * its hook, then doubles `value`. The test resumes it after the parent is
+ * suspended on its completion hook, so the child's resume always lands on it
+ * (a child that finished before the parent registered would be answered by
+ * the parent's status read instead, with no `hook_received`).
+ */
+export async function gatedChildWorkflow(token: string, value: number) {
+  'use workflow';
+  using hook = createHook<Record<string, never>>({ token });
+  await hook;
+  return await doubleValue(value);
+}
+
+/**
+ * Parent that fans out to several children and awaits them all. Every child
+ * resumes the parent's one completion hook, so the parent's log holds a
+ * single system hook however many children it waits on. Child `i` waits on
+ * the hook `${tokenPrefix}:${i}`.
+ */
+export async function awaitChildrenFanOutWorkflow(
+  values: number[],
+  tokenPrefix: string
+) {
+  'use workflow';
+  const runs = await Promise.all(
+    values.map((value, i) =>
+      start(gatedChildWorkflow, [`${tokenPrefix}:${i}`, value])
+    )
+  );
+  const results = await Promise.all(runs.map((run) => run.returnValue));
+  return { childRunIds: runs.map((run) => run.runId), results };
+}
+
+/**
+ * Recursive Fibonacci workflow. start() is called directly to spawn
+ * child workflows for fib(n-1) and fib(n-2).
+ *
+ * Each `runA.returnValue` / `runB.returnValue` await suspends the parent on
+ * the child-run completion hook, which the child resumes when it finishes,
+ * so a waiting parent holds no worker slot. (Before that hook existed, each
+ * await polled inside a step that held a slot until the child completed, and
+ * a deep enough tree deadlocked worker-based worlds such as `world-postgres`
+ * once every slot was held by a waiting parent. With
+ * `WORKFLOW_CHILD_RUN_COMPLETION_HOOK=0` the awaits poll again, and that
+ * caveat applies: fib(6) needs ~24 slots, fib(10) hundreds.)
+ */
+export async function fibonacciWorkflow(n: number): Promise<number> {
+  'use workflow';
+  if (!Number.isFinite(n)) {
+    throw new FatalError(`fibonacciWorkflow requires a finite number for n`);
+  }
+  if (n <= 1) return n;
+
+  const [runA, runB] = await Promise.all([
+    start(fibonacciWorkflow, [n - 1]),
+    start(fibonacciWorkflow, [n - 2]),
+  ]);
+
+  const [a, b] = await Promise.all([runA.returnValue, runB.returnValue]);
+  return a + b;
+}
+
+//////////////////////////////////////////////////////////
+// Distributed Abort Controller
+//////////////////////////////////////////////////////////
+
+// Message type written to the stream when abort fires
+export type AbortMessage = {
+  type: 'abort';
+  reason?: string;
+  expired: boolean;
+};
+
+// Helper to derive abort hook token from user-provided ID
+function getAbortToken(id: string): string {
+  return `distributed-abort:${id}`;
+}
+
+// Step function that writes the abort message to the stream
+async function writeAbortSignal(reason?: string, expired = false) {
+  'use step';
+  const writable = getWritable<AbortMessage>();
+  const writer = writable.getWriter();
+  try {
+    await writer.write({ type: 'abort', reason, expired });
+  } finally {
+    writer.releaseLock();
+  }
+  await writable.close();
+}
+
+/**
+ * Workflow that backs the DistributedAbortController.
+ * Waits for either:
+ * 1. Manual abort via hook trigger
+ * 2. TTL expiration
+ *
+ * After abort, sleeps until TTL + grace period to keep hook alive
+ * for late subscribers.
+ */
+export async function distributedAbortControllerWorkflow(
+  id: string,
+  ttlMs: number,
+  graceMs: number
+) {
+  'use workflow';
+
+  const startTime = Date.now();
+  const hook = createHook<{ reason?: string }>({ token: getAbortToken(id) });
+
+  // Race: manual abort OR TTL expiration
+  const result = await Promise.race([
+    hook.then((payload) => ({
+      reason: payload.reason,
+      expired: false,
+    })),
+    sleep(ttlMs).then(() => ({
+      reason: 'Controller expired',
+      expired: true,
+    })),
+  ]);
+
+  // Write the abort signal to the stream
+  await writeAbortSignal(result.reason, result.expired);
+
+  // Only sleep through grace period on TTL expiration (keeps hook alive for late subscribers).
+  // Manual aborts complete immediately.
+  if (result.expired) {
+    const elapsed = Date.now() - startTime;
+    const remainingTime = graceMs - (elapsed - ttlMs);
+    if (remainingTime > 0) {
+      await sleep(remainingTime);
+    }
+  }
+
+  return { aborted: true, reason: result.reason, expired: result.expired };
+}
+
+/**
+ * DistributedAbortController - a cross-process abort controller backed by a durable workflow.
+ *
+ * Usage:
+ *   const controller = await DistributedAbortController.create('my-task-123');
+ *   // In any process:
+ *   controller.abort('User cancelled');
+ *   // In any other process:
+ *   const signal = await controller.signal;
+ *   signal.addEventListener('abort', () => console.log('Aborted!'));
+ */
+export class DistributedAbortController {
+  private constructor(
+    public readonly id: string,
+    public readonly runId: string
+  ) {}
+
+  /**
+   * Creates or reconnects to a distributed abort controller.
+   * If a controller with this ID already exists, reconnects to it.
+   * Otherwise, starts a new workflow.
+   */
+  static async create(
+    id: string,
+    options: { ttlMs?: number; graceMs?: number } = {}
+  ): Promise<DistributedAbortController> {
+    const { ttlMs = 24 * 60 * 60 * 1000, graceMs = 60 * 60 * 1000 } = options;
+    const token = getAbortToken(id);
+
+    // Try to find an existing run with this hook token
+    const existingHook = await getHookByToken(token).catch(() => null);
+
+    if (existingHook) {
+      // Reconnect to existing controller
+      return new DistributedAbortController(id, existingHook.runId);
+    }
+
+    // Create a new workflow
+    const run = await start(distributedAbortControllerWorkflow, [
+      id,
+      ttlMs,
+      graceMs,
+    ]);
+    return new DistributedAbortController(id, run.runId);
+  }
+
+  /**
+   * Triggers the abort signal across all processes.
+   */
+  async abort(reason?: string): Promise<void> {
+    const token = getAbortToken(this.id);
+    await resumeHook(token, { reason });
+  }
+
+  /**
+   * Returns an AbortSignal that fires when the controller is aborted.
+   * Listens to the workflow's output stream.
+   */
+  get signal(): Promise<AbortSignal> {
+    return (async () => {
+      const controller = new AbortController();
+      const run = getRun<AbortMessage>(this.runId);
+      const readable = await run.getReadable();
+      const reader = readable.getReader();
+
+      // Read from stream in background
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value && value.type === 'abort') {
+              controller.abort(value.reason);
+              break;
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      })();
+
+      return controller.signal;
+    })();
+  }
+}
+
+//////////////////////////////////////////////////////////
+// WritableStream passed as argument to start()
+//
+// A parent workflow gets a WritableStream from getWritable() (its own
+// output stream), and passes it through `start()` to a child
+// workflow. The child workflow receives the WritableStream as a
+// workflow argument and forwards it into a step, which writes raw
+// Uint8Array bytes to it.
+//
+// The external reader on `parentRun.getReadable()` should observe the
+// exact bytes the child step wrote.
+
+async function writeBytesToWritable(
+  writable: WritableStream<Uint8Array>,
+  payload: string
+) {
+  'use step';
+  const writer = writable.getWriter();
+  await writer.write(new TextEncoder().encode(payload));
+  writer.releaseLock();
+}
+
+export async function writableForwardedChildWorkflow(
+  parentWritable: WritableStream<Uint8Array>,
+  payload: string
+) {
+  'use workflow';
+  await writeBytesToWritable(parentWritable, payload);
+  return 'child-done';
+}
+
+// Variant 1: the parent calls `getWritable()` in the workflow body
+// (workflow-context handle), passes the resulting fake handle through
+// `start()`. The intermediary step that calls `start()` only exists
+// because `start()` cannot be invoked from workflow code directly.
+async function startChildWithWorkflowWritable(
+  parentWritable: WritableStream<Uint8Array>,
+  payload: string
+) {
+  'use step';
+  const childRun = await start(writableForwardedChildWorkflow, [
+    parentWritable,
+    payload,
+  ]);
+  // Wait for the child to finish writing before letting the parent
+  // close its own writable.
+  await childRun.returnValue;
+  return childRun.runId;
+}
+
+export async function writableForwardedFromWorkflowWorkflow(payload: string) {
+  'use workflow';
+  const writable = getWritable<Uint8Array>();
+  const childRunId = await startChildWithWorkflowWritable(writable, payload);
+  await stepCloseOutputStream(writable);
+  return { childRunId };
+}
+
+// Variant 2: the parent's `getWritable()` is called inside the step
+// that also calls `start()`, so the writable handed to the child is
+// the real step-context `serialize.writable` (not a workflow-context
+// fake handle that's later revived by a step). This exercises the
+// step-side `getWritable()` tagging path directly.
+async function startChildWithStepWritable(payload: string) {
+  'use step';
+  const writable = getWritable<Uint8Array>();
+  const childRun = await start(writableForwardedChildWorkflow, [
+    writable,
+    payload,
+  ]);
+  await childRun.returnValue;
+  await writable.close();
+  return childRun.runId;
+}
+
+export async function writableForwardedFromStepWorkflow(payload: string) {
+  'use workflow';
+  const childRunId = await startChildWithStepWritable(payload);
+  return { childRunId };
+}
+
+//////////////////////////////////////////////////////////
+// Workflow Attributes - native workflow and step events.
+
+/**
+ * Calls `setAttributes` directly from the workflow body.
+ * Each call appends a native `attr_set` event. The third call sets a key
+ * to `undefined` and the test verifies
+ * the key is absent from the final attribute map.
+ */
+export async function setAttributesWorkflow(input: number) {
+  'use workflow';
+  await setAttributes({ phase: 'init', source: 'workflow-body' });
+  const tripled = input * 3;
+  await setAttributes({ phase: 'done' });
+  await setAttributes({ source: undefined });
+  return tripled;
+}
+
+async function setAttributesFromStep(input: number) {
+  'use step';
+  await setAttributes({
+    phase: 'step-started',
+    source: 'step-body',
+    input: String(input),
+  });
+  await setAttributes({ phase: 'step-done' });
+  return input * 4;
+}
+
+/**
+ * Calls `setAttributes` from inside a normal user step. Step
+ * bodies already run in host context, so the helper appends an attributed
+ * `attr_set` event without creating a nested internal step.
+ */
+export async function setAttributesInsideStepWorkflow(input: number) {
+  'use workflow';
+  return setAttributesFromStep(input);
+}
+
+/**
+ * Fire-and-forget pattern: `void setAttributes(...)` lets
+ * the workflow body proceed without blocking on the attribute write.
+ * Each `void` call commits a native event on suspension or final drain,
+ * including the final write immediately before return.
+ */
+export async function setAttributesFireAndForgetWorkflow() {
+  'use workflow';
+  void setAttributes({ phase: 'init', mode: 'fire-and-forget' });
+  await sleep('100ms');
+  void setAttributes({ phase: 'mid' });
+  await sleep('100ms');
+  void setAttributes({ phase: 'done' });
+  return 'completed';
+}
+
+/**
+ * `Promise.all` of multiple `setAttributes` calls writing
+ * disjoint keys: every key must land. The world-side per-run mutex (or
+ * per-row atomic SQL update) serializes the writes; LWW-by-arrival only
+ * matters when two calls touch the same key.
+ */
+export async function setAttributesParallelWorkflow() {
+  'use workflow';
+  await Promise.all([
+    setAttributes({ a: '1' }),
+    setAttributes({ b: '2' }),
+    setAttributes({ c: '3' }),
+  ]);
+  return 'done';
+}
+
+/**
+ * Workflow throws after awaiting `setAttributes`. The
+ * attribute write completes before the throw, so the persisted run row
+ * should carry the attribute even though the run ends up `failed`.
+ */
+export async function setAttributesThrowsAfterWorkflow() {
+  'use workflow';
+  await setAttributes({
+    phase: 'about-to-fail',
+    reason: 'intentional',
+  });
+  throw new FatalError('intentional failure to test attribute persistence');
+}
+
+/**
+ * Validation DX: every invalid `setAttributes` call must
+ * throw a catchable `FatalError` in the workflow body — before any event
+ * is written — with a message that names the violated rule and the limit.
+ * The workflow records each error's name and message, then writes one
+ * valid attribute and completes, so the e2e test can assert on error
+ * quality without wedging the run.
+ */
+export async function setAttributesValidationWorkflow() {
+  'use workflow';
+  const outcomes: Record<string, string> = {};
+
+  const attempt = async (
+    label: string,
+    attrs: Record<string, string | undefined>
+  ) => {
+    try {
+      await setAttributes(attrs);
+      outcomes[label] = 'no-error';
+    } catch (err) {
+      const e = err as Error;
+      outcomes[label] = `${e.name}: ${e.message}`;
+    }
+  };
+
+  await attempt('reserved', { $system: 'nope' });
+  await attempt('emptyKey', { '': 'v' });
+  await attempt('keyTooLong', { ['k'.repeat(257)]: 'v' });
+  await attempt('valueTooLong', { note: 'v'.repeat(257) });
+  // Multibyte values: the cap is bytes, not characters.
+  await attempt('valueTooManyBytes', { note: 'é'.repeat(200) });
+  const overCap: Record<string, string> = {};
+  for (let i = 0; i <= 64; i++) overCap[`k${i}`] = 'v';
+  await attempt('overCap', overCap);
+  await attempt('nonObject', 'phase=init' as any);
+
+  // The run must remain healthy after every rejected call.
+  await setAttributes({ phase: 'validated' });
+  return outcomes;
+}
+
+//////////////////////////////////////////////////////////
+
+async function parallelHookRaceStep(label: string) {
+  'use step';
+  // A small matching delay makes both step_completed events more likely
+  // to land within the same suspension-flush tick, which is what
+  // triggers the same-body re-walk race.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  return label;
+}
+
+/**
+ * Regression test for https://github.com/vercel/workflow/issues/1665
+ * and https://github.com/vercel/workflow/issues/2283. This matches
+ * Paolo's exact minimal repro on #1665:
+ *
+ * ```ts
+ * await Promise.all([get_data(), get_settings()]);
+ * using webhook = createWebhook();
+ * await webhook;
+ * ```
+ *
+ * Two parallel steps complete close enough in time that both
+ * `step_completed` events trigger replay-and-suspend before either
+ * pass's `hook_created` has been observed by the events consumer
+ * (`hasCreatedEvent: false`). Both passes then call
+ * `world.events.create(runId, hook_created)` with the same
+ * deterministic `(correlationId, token)`.
+ *
+ * Before the world-side idempotency fix, the world accepted the first
+ * `hook_created` and wrote a `hook_conflict` event for the second —
+ * even though both events carried the same `(runId, hookId, token)`.
+ * On replay, the hook's awaitable saw the `hook_conflict` and
+ * rejected with `HookConflictError`, even though no other run
+ * actually owned the token.
+ *
+ * With the fix, the world rejects the duplicate with
+ * `EntityConflictError` (which the suspension handler already
+ * swallows at `suspension-handler.ts:142`), no `hook_conflict` event
+ * is written, and the webhook resolves normally.
+ *
+ * The race is timing-sensitive — a single
+ * "parallel-steps-then-webhook" sequence may not always reproduce it
+ * on faster runtimes. The workflow runs the sequence in a loop
+ * (`iterations` independent attempts in series, each with its own
+ * webhook). On the pre-fix code any single iteration that hits the
+ * race surfaces a `hook_conflict` event in the log (and on subsequent
+ * replay throws `HookConflictError`), so a large enough iteration
+ * count gives the race many independent opportunities to fire.
+ */
+export async function parallelStepsThenWebhookWorkflow(iterations: number) {
+  'use workflow';
+
+  const tokens: string[] = [];
+  for (let i = 0; i < iterations; i++) {
+    await Promise.all([
+      parallelHookRaceStep(`${i}-a`),
+      parallelHookRaceStep(`${i}-b`),
+    ]);
+
+    using webhook = createWebhook();
+    const token = webhook.token;
+    tokens.push(token);
+
+    const req = await webhook;
+    const body = await req.text();
+    if (body !== `body-${token}`) {
+      throw new FatalError(
+        `iteration ${i}: expected body-${token}, got ${body}`
+      );
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Multi-region e2e probe (see packages/core/e2e/e2e-region.test.ts).
+ *
+ * Returns the `VERCEL_REGION` observed by both the workflow (flow route)
+ * and a step invocation, so the suite can assert that a run started with
+ * `start(..., { region })` was actually EXECUTED in the intended region —
+ * not just tagged with it. Regional execution requires the workbench app
+ * to be deployed to the target regions (workbench/nextjs-turbopack
+ * vercel.json pins iad1+sfo1+fra1) and the world's queue to route the
+ * flow message by the run ID's region tag (@workflow/world-vercel).
+ */
+export async function regionProbeWorkflow(label: string) {
+  'use workflow';
+  const workflowRegion = process.env.VERCEL_REGION ?? null;
+  const stepRegion = await regionProbeStep();
+  return { label, workflowRegion, stepRegion };
+}
+
+async function regionProbeStep(): Promise<string | null> {
+  'use step';
+  return process.env.VERCEL_REGION ?? null;
+}
+
+async function writeCrossRegionStreamChunks(
+  writable: WritableStream,
+  chunkCount: number
+) {
+  'use step';
+  const writer = writable.getWriter();
+  for (let i = 0; i < chunkCount; i++) {
+    await writer.write(new TextEncoder().encode(`chunk-${i}`));
+  }
+  writer.releaseLock();
+}
+
+async function closeCrossRegionStream(writable: WritableStream) {
+  'use step';
+  await writable.close();
+}
+
+/**
+ * Cross-region stream visibility probe (see
+ * packages/core/e2e/e2e-region.test.ts).
+ *
+ * Writes `chunkCount` chunks to the default output stream, then holds the
+ * stream OPEN for 45 seconds before closing. The hold-open window is the
+ * point: completed streams are the easy case, so a cross-region reader
+ * must observe the chunks while the stream is still IN PROGRESS to
+ * actually exercise cross-region visibility.
+ */
+export async function crossRegionStreamWorkflow(chunkCount: number) {
+  'use workflow';
+  const writable = getWritable();
+  await writeCrossRegionStreamChunks(writable, chunkCount);
+  await sleep('45s');
+  await closeCrossRegionStream(writable);
+  return 'done';
+}
+
+// ============================================================
+// LIFECYCLE HOOK TESTS
+// Exercised only by the Next.js workbenches, whose
+// instrumentation.ts registers `registerLifecycleHooks` handlers
+// (see workbench/nextjs-*/instrumentation.ts). The handlers
+// observe these target runs' terminal transitions and report
+// them by resuming the observer workflow's hook, a durable
+// channel that works across serverless instances.
+// ============================================================
+
+/**
+ * Target: completes immediately. The `onRunCompleted` handler reads this
+ * run's return value (exercising the Run instance's lazy hydration) to
+ * discover the observer's hook token.
+ */
+export async function lifecycleHookTargetCompleted(token: string) {
+  'use workflow';
+  return { token, outcome: 'completed' };
+}
+
+/**
+ * Target: fails immediately. The token is embedded in the thrown error's
+ * message so the `onRunFailed` handler can find the observer without any
+ * backend reads (the hydrated cause is on the WorkflowRunFailedError it
+ * receives).
+ */
+export async function lifecycleHookTargetFailed(token: string) {
+  'use workflow';
+  throw new FatalError(`lifecycle-hook-target-failed:${token}`);
+}
+
+/**
+ * Observer: parks on a hook until a lifecycle handler reports the target
+ * run's terminal transition, then returns the reported payload verbatim.
+ */
+export async function lifecycleHookObserver(token: string) {
+  'use workflow';
+  using hook = createHook<Record<string, unknown>>({ token });
+  return await hook;
+}
+
+//////////////////////////////////////////////////////////
+// Dynamic workflows (source generated by the app at runtime)
+//////////////////////////////////////////////////////////
+
+/**
+ * Stands in for orchestration an app assembles at runtime from its own
+ * templates. Built here rather than inlined as a constant so the source
+ * really is assembled per call.
+ *
+ * Only `steps`, `sleep` and `createHook` are in scope inside it; `steps.add`
+ * resolves to the `add` step this file already exports and deploys.
+ */
+function generateDynamicSource(opts: { sleepFor?: string } = {}) {
+  const pause = opts.sleepFor
+    ? `  await sleep(${JSON.stringify(opts.sleepFor)});\n`
+    : '';
+  return `
+async function workflow(input) {
+  "use workflow";
+  const doubled = await steps.add(input.value, input.value);
+${pause}  const total = await steps.add(doubled, 1);
+  return { total };
+}
+`;
+}
+
+/**
+ * Starts a dynamic run from inside the deployment.
+ *
+ * This is the shape that matters for dynamic workflows and the reason it lives
+ * in the app rather than in the test runner: `experimental_dynamic.steps` is given the
+ * *imported* `add` function, so the `.stepId` the build-time transform stamped
+ * on it is what binds the source to a registered step. A caller outside the
+ * deployment cannot do that — it has no handle on the function — and would
+ * have to fall back to an explicit `{ stepId }` reference.
+ *
+ * In a step rather than in workflow code so the options object (which holds a
+ * function reference) is never serialized across a step boundary.
+ */
+async function startDynamicRun(value: number, sleepFor?: string) {
+  'use step';
+  const run = await start(generateDynamicSource({ sleepFor }), [{ value }], {
+    experimental_dynamic: { steps: { add } },
+  });
+  return { runId: run.runId };
+}
+
+/**
+ * Generates a workflow, starts it, and hands back the child's run ID.
+ *
+ * The child is deliberately NOT awaited here: `returnValue` polls from inside
+ * a step that holds a worker slot until the child finishes, which is the
+ * deadlock hazard documented on `fibonacciWorkflow`. The e2e runner awaits the
+ * child itself, which also lets it read the child's stored record.
+ */
+export async function dynamicWorkflowFromApp(value: number) {
+  'use workflow';
+  const child = await startDynamicRun(value);
+  return { parentInput: value, childRunId: child.runId };
+}
+
+/**
+ * Same, but the generated source suspends partway through.
+ *
+ * The suspension is the point: the delivery that resumes the child holds no
+ * in-memory copy of its code and no run input on the message, so it has to
+ * read the stored code back and decrypt it. That is the path a dynamic run
+ * dies on if the code is not durably stored (see the `world-local` fix in
+ * this PR).
+ */
+export async function dynamicWorkflowFromAppWithSleep(value: number) {
+  'use workflow';
+  const child = await startDynamicRun(value, '2s');
+  return { parentInput: value, childRunId: child.runId };
+}
+
+async function startDisallowedDynamicRun(value: number) {
+  'use step';
+  const run = await start(
+    `
+async function workflow(input) {
+  "use workflow";
+  return await steps.notAuthorized(input.value, 1);
+}
+`,
+    [{ value }],
+    { experimental_dynamic: { steps: { add } } }
+  );
+  return { runId: run.runId };
+}
+
+/**
+ * Generates source that reaches for a step it was never given.
+ *
+ * `steps` is frozen and holds only the aliases passed through
+ * `experimental_dynamic.steps`, so the child must fail rather than dispatch a step the app
+ * did not authorize. Returns the child's run ID for the runner to inspect —
+ * the *child* failing is the expected outcome, so the parent must not.
+ */
+export async function dynamicWorkflowDisallowedStep(value: number) {
+  'use workflow';
+  const child = await startDisallowedDynamicRun(value);
+  return { childRunId: child.runId };
+}
+
+//////////////////////////////////////////////////////////
+// Frozen values stored by reference
+//////////////////////////////////////////////////////////
+
+type StateRefsMessage = { readonly role: string; readonly content: string };
+type StateRefsChat = {
+  readonly history: readonly StateRefsMessage[];
+  readonly turns: number;
+};
+
+/** The next chat, frozen, reusing the unchanged (already frozen) messages. */
+const stateRefsNext = (
+  chat: StateRefsChat,
+  added: StateRefsMessage[]
+): StateRefsChat =>
+  Object.freeze({
+    history: Object.freeze([
+      ...chat.history,
+      ...added.map((m) => Object.freeze({ ...m })),
+    ]),
+    turns: chat.turns + 1,
+  });
+
+const stateRefsMessage = (i: number) =>
+  `Turn ${i}: please summarise the attached report and list its three biggest risks. `.repeat(
+    2
+  );
+
+async function stateRefsReply(
+  chat: StateRefsChat,
+  text: string,
+  failOnce: boolean
+) {
+  'use step';
+  // A failed first attempt makes the retry run in a new invocation, which
+  // rebuilds its input from the run's log.
+  if (failOnce && getStepMetadata().attempt < 2)
+    throw new Error('transient: retry in a new invocation');
+  return stateRefsNext(chat, [
+    { role: 'user', content: text },
+    { role: 'assistant', content: `re ${text.length}` },
+  ]);
+}
+
+async function stateRefsSummary(chat: StateRefsChat, i: number) {
+  'use step';
+  return `${i}:${chat.turns}:${chat.history.length}`;
+}
+
+/**
+ * Frozen state passed from step to step: step inputs are stored as references
+ * and outputs as changes. Covers a hook string referenced by later
+ * state, a retry that rebuilds cold, a replay after a sleep, and a fan-out
+ * wider than the inline limit (queued steps rebuild cold).
+ */
+export async function stateRefsWorkflow(
+  token: string,
+  turns: number,
+  width: number
+) {
+  'use workflow';
+  let chat: StateRefsChat = Object.freeze({
+    history: Object.freeze([]),
+    turns: 0,
+  });
+  using hook = createHook<{ text: string }>({ token });
+  const { text } = await hook;
+  chat = await stateRefsReply(chat, text, false);
+  for (let i = 1; i < turns; i++) {
+    chat = await stateRefsReply(
+      chat,
+      i === 2 ? text : stateRefsMessage(i),
+      i === 3
+    );
+    if (i === 4) await sleep('1s');
+  }
+  const fan = await Promise.all(
+    Array.from({ length: width }, (_, i) => stateRefsSummary(chat, i))
+  );
+  return {
+    turns: chat.turns,
+    first: chat.history[0]?.content,
+    last: chat.history.at(-2)?.content.slice(0, 7),
+    fan,
+  };
 }

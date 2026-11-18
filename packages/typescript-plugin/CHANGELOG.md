@@ -1,5 +1,93 @@
 # @workflow/typescript-plugin
 
+## 5.0.1
+
+### Patch Changes
+
+- [#5367](https://github.com/vercel/workflow/pull/5367) [`7404b8f`](https://github.com/vercel/workflow/commit/7404b8f4cae9c09887deb3bcb2bb1f646ee6db0f) Thanks [@pranaygp](https://github.com/pranaygp)! - Publish smaller packages: compiled tests and declaration maps are no longer included, `@workflow/world` no longer ships its TypeScript sources, and the inline source maps no longer embed the original sources. Stack traces still map to the original file, line and column, but since `src/` is not published, debuggers and dev-server error overlays no longer show source code for frames inside `@workflow/*` packages. `@workflow/web-shared` also stops publishing its tests.
+
+## 5.0.0
+
+### Major Changes
+
+- [#1217](https://github.com/vercel/workflow/pull/1217) [`e55c636`](https://github.com/vercel/workflow/commit/e55c63678b15b6687cc77efca705ee9fb40fabc3) Thanks [@pranaygp](https://github.com/pranaygp)! - Initial v5 beta release
+
+### Minor Changes
+
+- [#1633](https://github.com/vercel/workflow/pull/1633) [`d040182`](https://github.com/vercel/workflow/commit/d0401829320c2880a0a5c2404ed9dede94eb17a0) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Allow synchronous functions to use `"use step"` directive. This enables using `"use step"` as a mechanism to strip Node.js-dependent code from the workflow VM bundle without requiring the function to be async.
+
+### Patch Changes
+
+- [#1769](https://github.com/vercel/workflow/pull/1769) [`5a42964`](https://github.com/vercel/workflow/commit/5a4296412f151c255a8d08c8870e511222c7c472) Thanks [@tomdale](https://github.com/tomdale)! - Embed source content in published sourcemaps.
+
+- [#1830](https://github.com/vercel/workflow/pull/1830) [`a38f140`](https://github.com/vercel/workflow/commit/a38f140ce3aee3e25f821a702d70a1fd21598faf) Thanks [@ijjk](https://github.com/ijjk)! - Make the TypeScript peer dependency optional and show a clearer error
+  when TypeScript is unavailable.
+
+- [#2769](https://github.com/vercel/workflow/pull/2769) [`eb7f60c`](https://github.com/vercel/workflow/commit/eb7f60c7e950b21c8f927b538dc64ff877ce7bb9) Thanks [@NathanColosimo](https://github.com/NathanColosimo)! - Stop warning on direct workflow calls from workflow code, where direct-await composition is valid.
+
+- [#1759](https://github.com/vercel/workflow/pull/1759) [`173756d`](https://github.com/vercel/workflow/commit/173756dc4d097fd90432e2c38c91ce1b959a6352) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Rename `useworkflow.dev` URLs to `workflow-sdk.dev`
+
+- [#1799](https://github.com/vercel/workflow/pull/1799) [`503a929`](https://github.com/vercel/workflow/commit/503a929d347df46eb0ad63b068da7781762d0dc8) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Use inline sourcemaps for all workspace packages; published packages no longer ship external `.js.map` files.
+
+## 5.0.0-beta.5
+
+### Patch Changes
+
+- [#2769](https://github.com/vercel/workflow/pull/2769) [`eb7f60c`](https://github.com/vercel/workflow/commit/eb7f60c7e950b21c8f927b538dc64ff877ce7bb9) Thanks [@NathanColosimo](https://github.com/NathanColosimo)! - Stop warning on direct workflow calls from workflow code, where direct-await composition is valid.
+
+## 5.0.0-beta.4
+
+### Patch Changes
+
+- [#1799](https://github.com/vercel/workflow/pull/1799) [`503a929`](https://github.com/vercel/workflow/commit/503a929d347df46eb0ad63b068da7781762d0dc8) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Use inline sourcemaps for all workspace packages; published packages no longer ship external `.js.map` files.
+
+## 5.0.0-beta.3
+
+### Patch Changes
+
+- [#1830](https://github.com/vercel/workflow/pull/1830) [`a38f140`](https://github.com/vercel/workflow/commit/a38f140ce3aee3e25f821a702d70a1fd21598faf) Thanks [@ijjk](https://github.com/ijjk)! - Make the TypeScript peer dependency optional and show a clearer error
+  when TypeScript is unavailable.
+
+## 5.0.0-beta.2
+
+### Patch Changes
+
+- [#1769](https://github.com/vercel/workflow/pull/1769) [`5a42964`](https://github.com/vercel/workflow/commit/5a4296412f151c255a8d08c8870e511222c7c472) Thanks [@tomdale](https://github.com/tomdale)! - Embed source content in published sourcemaps.
+
+- [#1759](https://github.com/vercel/workflow/pull/1759) [`173756d`](https://github.com/vercel/workflow/commit/173756dc4d097fd90432e2c38c91ce1b959a6352) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Rename `useworkflow.dev` URLs to `workflow-sdk.dev`
+
+## 5.0.0-beta.1
+
+### Minor Changes
+
+- [#1633](https://github.com/vercel/workflow/pull/1633) [`d040182`](https://github.com/vercel/workflow/commit/d0401829320c2880a0a5c2404ed9dede94eb17a0) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Allow synchronous functions to use `"use step"` directive. This enables using `"use step"` as a mechanism to strip Node.js-dependent code from the workflow VM bundle without requiring the function to be async.
+
+## 5.0.0-beta.0
+
+### Major Changes
+
+- [#1642](https://github.com/vercel/workflow/pull/1642) [`c5cdfc0`](https://github.com/vercel/workflow/commit/c5cdfc00751c5bef36c4be748d819081b934fbcd) Thanks [@VaguelySerious](https://github.com/VaguelySerious)! - Initial v5 beta release
+
+## 4.0.1-beta.5
+
+### Patch Changes
+
+- [#1217](https://github.com/vercel/workflow/pull/1217) [`e55c636`](https://github.com/vercel/workflow/commit/e55c63678b15b6687cc77efca705ee9fb40fabc3) Thanks [@pranaygp](https://github.com/pranaygp)! - Upgrade dependencies across all packages
+
+## 4.0.1-beta.4
+
+### Patch Changes
+
+- 5078925: Add warning when invoking a workflow function without using `start()`
+- f973954: Update license to Apache 2.0
+- fcadd7b: Fix TypeScript LSP plugin for Node.js v20
+
+## 4.0.1-beta.3
+
+### Patch Changes
+
+- 99b4727: Convert docs link on directive from diagnostics to hover hint
+
 ## 4.0.1-beta.2
 
 ### Patch Changes

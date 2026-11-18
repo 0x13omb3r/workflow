@@ -25,15 +25,42 @@ export interface PaginationOptions {
   sortOrder?: 'asc' | 'desc';
 }
 
-// Shared schema for paginated responses
-export const PaginatedResponseSchema = <T extends z.ZodTypeAny>(
-  dataSchema: T
-) =>
-  z.object({
+export const PageInfoSchema = z.object({
+  currentLookbackDays: z.number(),
+  maxLookbackDays: z.number(),
+  currentWindowStart: z.coerce.date(),
+  maxWindowStart: z.coerce.date(),
+  upgradeAvailable: z.boolean(),
+});
+
+export type PageInfo = z.infer<typeof PageInfoSchema>;
+
+// per-copy-ok: callers reuse module-level data schemas across requests. Separate
+// bundler layers construct distinct schema objects, so an identity cache cannot
+// deduplicate those across copies. Stores schemas only, never page bodies.
+const paginatedResponseSchemas = new WeakMap<z.ZodTypeAny, z.ZodTypeAny>();
+
+function buildPaginatedResponse<T extends z.ZodTypeAny>(dataSchema: T) {
+  return z.object({
     data: z.array(dataSchema),
     cursor: z.string().nullable(),
     hasMore: z.boolean(),
+    pageInfo: PageInfoSchema.optional(),
   });
+}
+
+// Shared schema for paginated responses
+export const PaginatedResponseSchema = <T extends z.ZodTypeAny>(
+  dataSchema: T
+) => {
+  const cached = paginatedResponseSchemas.get(dataSchema) as
+    | ReturnType<typeof buildPaginatedResponse<T>>
+    | undefined;
+  if (cached) return cached;
+  const schema = buildPaginatedResponse(dataSchema);
+  paginatedResponseSchemas.set(dataSchema, schema);
+  return schema;
+};
 
 // Inferred type from schema
 export type PaginatedResponse<T> = z.infer<
@@ -46,3 +73,98 @@ export type PaginatedResponse<T> = z.infer<
  * - "all": Returns full data with complete input and output
  */
 export type ResolveData = 'none' | 'all';
+
+/**
+ * {@link ResolveData} for event-log reads, plus one mode for replay:
+ * - "skip-step-inputs": as "all", except that the World MAY leave `input` out
+ *   of `step_created` and `step_started` events. Workflow replay recomputes
+ *   step arguments by re-running workflow code and never reads the recorded
+ *   ones (a step takes its input from the `step_started` response or from
+ *   memory, never from the replay log), and for a workflow that passes
+ *   growing state into its steps those inputs are the part of the log that
+ *   grows quadratically.
+ *
+ * **A World MUST treat any value other than "none" as "all"** for everything
+ * it does not specifically implement. The runtime replays with
+ * "skip-step-inputs", so a World that tests `resolveData === 'all'` (reading
+ * the new value as "none") strips step results and breaks every replay, and
+ * one that validates against `['none', 'all']` rejects the read. Test
+ * `resolveData === 'none'`, or map with {@link entityResolveData}. The
+ * `@workflow/world-testing` suite checks this.
+ */
+export type EventsResolveData = ResolveData | 'skip-step-inputs';
+
+/**
+ * The {@link ResolveData} an {@link EventsResolveData} asks for on everything
+ * other than an event-log page's step inputs: `'skip-step-inputs'` is `'all'`.
+ */
+export function entityResolveData<T extends EventsResolveData | undefined>(
+  resolveData: T
+): Exclude<T, 'skip-step-inputs'> | 'all' {
+  return (resolveData === 'skip-step-inputs' ? 'all' : resolveData) as
+    | Exclude<T, 'skip-step-inputs'>
+    | 'all';
+}
+
+/**
+ * A standard error schema shape for propogating errors from runs and steps
+ */
+export const StructuredErrorSchema = z.object({
+  message: z.string(),
+  stack: z.string().optional(),
+  code: z.string().optional(), // Populated with RunErrorCode values (USER_ERROR, RUNTIME_ERROR, etc.) for run_failed events
+});
+
+export type StructuredError = z.infer<typeof StructuredErrorSchema>;
+
+/**
+ * A single chunk from a stream, with its 0-based index and raw binary data.
+ */
+export interface StreamChunk {
+  /** The 0-based position of this chunk in the stream */
+  index: number;
+  /** The raw chunk data */
+  data: Uint8Array;
+}
+
+/**
+ * Options for paginated chunk retrieval.
+ */
+export interface GetChunksOptions {
+  /** Maximum number of chunks to return per page (default: 100, max: 1000) */
+  limit?: number;
+  /** Opaque cursor from a previous response to fetch the next page */
+  cursor?: string;
+}
+
+/**
+ * Metadata about a stream, returned by {@link Streamer.getStreamInfo}.
+ */
+export interface StreamInfoResponse {
+  /**
+   * The index of the last known chunk (0-based).
+   * Returns `-1` when no chunks have been written yet.
+   */
+  tailIndex: number;
+  /** Whether the stream is fully complete (closed). */
+  done: boolean;
+}
+
+/**
+ * Paginated response for stream chunks.
+ *
+ * Extends the standard `PaginatedResponse` shape with a `done` field that
+ * indicates whether the stream has been fully written (closed). When `done`
+ * is `false`, additional chunks may appear in future requests even after
+ * `hasMore` returns `false` for the current set of available chunks.
+ */
+export interface StreamChunksResponse {
+  /** Array of stream chunks in index order */
+  data: StreamChunk[];
+  /** Cursor for the next page, or `null` when no more pages are available */
+  cursor: string | null;
+  /** Whether additional pages of already-written chunks exist */
+  hasMore: boolean;
+  /** Whether the stream is fully complete (all chunks have been written and the stream is closed) */
+  done: boolean;
+}

@@ -1,0 +1,37 @@
+---
+title: configureWorkflowController
+description: Point WorkflowController at the generated workflow bundles.
+type: reference
+summary: Configure the directory WorkflowController loads workflow bundles from.
+prerequisites:
+  - /docs/getting-started/nestjs
+---
+
+Configures the output directory that [`WorkflowController`](/docs/api-reference/workflow-nest/workflow-controller) loads the generated workflow bundles (`steps.mjs`, `workflows.mjs`, `webhook.mjs`, `manifest.json`) from.
+
+<Callout type="warn">
+Deprecated. [`WorkflowModule.forRoot()`](/docs/api-reference/workflow-nest/workflow-module) provides the output directory through dependency injection, which this function predates. It writes process-global state, so two applications in one process (the usual `Test.createTestingModule` setup) overwrite each other's configuration. It is kept only so existing callers keep working.
+</Callout>
+
+`WorkflowModule.forRoot()` still calls this for you, and injected options take precedence over it. Call it yourself only when registering `WorkflowController` without the module. A controller with no configuration at all answers `503` with an explanatory message.
+
+## Usage
+
+```typescript title="src/app.module.ts" lineNumbers
+import { join } from "node:path";
+import { configureWorkflowController } from "workflow/nest"; // [!code highlight]
+
+configureWorkflowController(join(process.cwd(), ".nestjs/workflow")); // [!code highlight]
+```
+
+## API signature
+
+### Parameters
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `outDir` | `string` | Directory containing the generated workflow bundles. Should match the `outDir` used by the builder (default: `.nestjs/workflow` in the working directory). |
+
+### Returns
+
+Returns `void`.

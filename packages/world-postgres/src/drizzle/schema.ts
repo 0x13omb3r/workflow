@@ -1,37 +1,76 @@
 import {
   type Event,
   type Hook,
+  type SerializedData,
+  type StartHook,
   type Step,
   StepStatusSchema,
+  type Wait,
+  WaitStatusSchema,
   type WorkflowRun,
   WorkflowRunStatusSchema,
 } from '@workflow/world';
+import { sql } from 'drizzle-orm';
 import {
+  bigint,
+  bigserial,
   boolean,
   customType,
   index,
   integer,
+  /** @deprecated: use Cbor instead */
   jsonb,
-  pgEnum,
-  pgTable,
+  pgSchema,
   primaryKey,
   text,
-  timestamp,
+  uniqueIndex,
   varchar,
 } from 'drizzle-orm/pg-core';
+import { Cbor, type Cborized } from './cbor.js';
+
+export const schema = pgSchema('workflow');
+
+/** A UTC offset (`+00`, `-07`, `+05:30`) or `Z` at the end of a timestamp. */
+const UTC_OFFSET = /(?:[+-]\d\d(?::?\d\d){0,2}|Z)$/;
+
+/**
+ * Every timestamp column is `timestamp with time zone`, so it stores an
+ * instant. With `timestamp without time zone`, `DEFAULT now()` stored the
+ * session's local wall time while drizzle read every value back as UTC, which
+ * put `createdAt` hours off on servers not running in UTC (migration 0027).
+ *
+ * Postgres prints `timestamptz` values with their offset. A value without one
+ * comes from a column migration 0027 has not converted yet, which held UTC
+ * wall times for everything written from JavaScript, so read it as UTC, as
+ * earlier versions did. Drizzle's own `withTimezone` reader would parse it in
+ * the Node process's local time zone instead.
+ */
+const timestamptz = customType<{ data: Date; driverData: string | Date }>({
+  dataType: () => 'timestamp with time zone',
+  toDriver: (value) => value.toISOString(),
+  fromDriver: (value) => {
+    if (value instanceof Date) return value;
+    return new Date(UTC_OFFSET.test(value) ? value : `${value}Z`);
+  },
+});
 
 function mustBeMoreThanOne<T>(t: T[]) {
   return t as [T, ...T[]];
 }
 
-export const workflowRunStatus = pgEnum(
+export const workflowRunStatus = schema.enum(
   'status',
   mustBeMoreThanOne(WorkflowRunStatusSchema.options)
 );
 
-export const stepStatus = pgEnum(
+export const stepStatus = schema.enum(
   'step_status',
   mustBeMoreThanOne(StepStatusSchema.options)
+);
+
+export const waitStatus = schema.enum(
+  'wait_status',
+  mustBeMoreThanOne(WaitStatusSchema.options)
 );
 
 /**
@@ -45,79 +84,257 @@ type DrizzlishOfType<T extends object> = {
 };
 
 /**
- * Sadly we do `any[]` right now
+ * Serialization currently uses `any[]`.
  */
 export type SerializedContent = any[];
 
-export const runs = pgTable(
+/** The start Hook a run row keeps: `run.startHook`, without its metadata. */
+export type RunStartHook = Omit<StartHook, 'metadata'> & { hookId: string };
+
+export const runs = schema.table(
   'workflow_runs',
   {
     runId: varchar('id').primaryKey(),
-    output: jsonb('output').$type<SerializedContent>(),
+    /** @deprecated */
+    outputJson: jsonb('output').$type<SerializedContent>(),
+    output: Cbor<SerializedContent>()('output_cbor'),
     deploymentId: varchar('deployment_id').notNull(),
     status: workflowRunStatus('status').notNull(),
     workflowName: varchar('name').notNull(),
-    executionContext: jsonb('execution_context').$type<Record<string, any>>(),
-    input: jsonb('input').$type<SerializedContent>().notNull(),
-    error: text('error'),
+    specVersion: integer('spec_version'),
+    /** @deprecated */
+    executionContextJson:
+      jsonb('execution_context').$type<Record<string, any>>(),
+    executionContext: Cbor<Record<string, any>>()('execution_context_cbor'),
+    /** @deprecated */
+    inputJson: jsonb('input').$type<SerializedContent>(),
+    input: Cbor<SerializedContent>()('input_cbor'),
+    /** @deprecated - use error instead (legacy JSON-stringified StructuredError) */
+    errorJson: text('error'),
+    /**
+     * The thrown value from a run_failed event, serialized via the workflow
+     * serialization pipeline (dehydrateRunError). Stored as a Uint8Array and
+     * wrapped in CBOR for transport.
+     */
+    error: Cbor<SerializedData>()('error_cbor'),
+    /**
+     * The high-level error category (USER_ERROR, RUNTIME_ERROR, etc.) from
+     * a run_failed event. Plaintext metadata for routing, so it does not
+     * require decryption or hydration.
+     */
     errorCode: varchar('error_code'),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
-    updatedAt: timestamp('updated_at')
-      .defaultNow()
+    /**
+     * Plaintext string-string metadata attached to the run via
+     * `setAttributes()`. EXPERIMENTAL MVP: stored as JSONB to allow
+     * SQL-side merge (`jsonb_set` / `jsonb_strip_nulls`) without a
+     * read-modify-write cycle. Defaults to `{}` so existing rows
+     * (pre-migration) read as the empty map.
+     */
+    attributes: jsonb('attributes')
+      .$type<Record<string, string>>()
+      .default({})
+      .notNull(),
+    /**
+     * The run's X25519 public key (base64), stamped at creation by SDKs that
+     * support sealed (`encp`) envelopes. Lets cross-run writers seal payloads
+     * to this run without holding its symmetric key. Not secret. The private
+     * scalar is re-derived on demand and never stored. Null on runs created by
+     * older SDKs, which fall back to the symmetric path.
+     */
+    encryptionPublicKey: varchar('encryption_public_key'),
+    /**
+     * A dynamic run's own workflow VM code, serialized through the same
+     * pipeline as the run's input (compressed, then encrypted with the run's
+     * key). Set only on runs started from source rather than from a workflow
+     * function in the deployment's build-time manifest — the code is nowhere
+     * else, so every replay reads it back from here.
+     *
+     * Write-once at `run_created`: replay must execute the same code the run
+     * started on. Null on every static run.
+     */
+    dynamicWorkflowCode: Cbor<SerializedData>()('dynamic_workflow_code_cbor'),
+    /**
+     * The `jobPrefix` of the World that created the run: the prefix of the
+     * Graphile task whose runner claims the run's jobs. Startup recovery
+     * re-enqueues only the active runs stamped with its own prefix, so apps
+     * sharing a database do not drive each other's runs. Internal routing
+     * metadata, stripped from the run returned to callers.
+     *
+     * Null on runs created before this column existed, and on runs written by
+     * storage constructed without a World. Every World recovers those, as
+     * before.
+     */
+    jobPrefix: varchar('job_prefix'),
+    /**
+     * The start Hook this run was admitted with through `start({ experimental_hook })`,
+     * without its metadata (which lives on the start Hook's own row in
+     * `workflow_hooks`). Echo only: the Hook row is what holds the token.
+     * Null on every other run.
+     */
+    startHook: Cbor<RunStartHook>()('start_hook_cbor'),
+    createdAt: timestamptz('created_at').default(sql`now()`).notNull(),
+    updatedAt: timestamptz('updated_at')
+      .default(sql`now()`)
       .$onUpdateFn(() => new Date())
       .notNull(),
-    completedAt: timestamp('completed_at'),
-    startedAt: timestamp('started_at'),
-  } satisfies DrizzlishOfType<WorkflowRun>,
-  (tb) => ({
-    workflowNameIdx: index().on(tb.workflowName),
-    statusIdx: index().on(tb.status),
-  })
+    completedAt: timestamptz('completed_at'),
+    startedAt: timestamptz('started_at'),
+    expiredAt: timestamptz('expired_at'),
+  } satisfies DrizzlishOfType<
+    Cborized<
+      Omit<WorkflowRun, 'input'> & { input?: unknown },
+      'input' | 'output' | 'executionContext' | 'error'
+    > & { dynamicWorkflowCode?: SerializedData; jobPrefix?: string }
+  >,
+  (tb) => [index().on(tb.workflowName), index().on(tb.status)]
 );
 
-export const events = pgTable(
+export const events = schema.table(
   'workflow_events',
   {
-    eventId: varchar('id').primaryKey(),
+    eventId: varchar('id').notNull(),
     eventType: varchar('type').$type<Event['eventType']>().notNull(),
     correlationId: varchar('correlation_id'),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
+    createdAt: timestamptz('created_at').default(sql`now()`).notNull(),
     runId: varchar('run_id').notNull(),
-    eventData: jsonb('payload'),
-  } satisfies DrizzlishOfType<Event & { eventData?: undefined }>,
-  (tb) => ({
-    runFk: index().on(tb.runId),
-    correlationIdFk: index().on(tb.correlationId),
-  })
+    /** @deprecated */
+    eventDataJson: jsonb('payload'),
+    eventData: Cbor<unknown>()('payload_cbor'),
+    specVersion: integer('spec_version'),
+    resumeId: varchar('resume_id'),
+    resumePayloadDigest: varchar('resume_payload_digest'),
+  } satisfies DrizzlishOfType<
+    Cborized<
+      Omit<Event, 'occurredAt'> & {
+        eventData?: undefined;
+        resumePayloadDigest?: string;
+      },
+      'eventData'
+    >
+  >,
+  (tb) => [
+    // Event ids are per-run slot positions, so `evnt_…0001` exists once per
+    // run and is only unique together with the run it belongs to. Runs
+    // created before slots keep globally-unique ULIDs, which this key also
+    // admits.
+    primaryKey({ columns: [tb.runId, tb.eventId] }),
+    // No standalone index on `runId`: the primary key leads with it, so every
+    // by-run lookup and range scan is served by that index already. Keeping one
+    // would cost a second write per event on the table's hottest path.
+    index().on(tb.correlationId),
+    uniqueIndex('workflow_events_hook_resume_unique')
+      .on(tb.runId, tb.resumeId)
+      .where(
+        sql`${tb.eventType} = 'hook_received' AND ${tb.resumeId} IS NOT NULL`
+      ),
+    // Runtime-correlated one-shot events must be unique per (run, correlation).
+    // Without
+    // this, two concurrent invocations producing identical correlationIds
+    // (e.g. the snapshot runtime's deterministic ULIDs across replays) can
+    // both insert events, causing duplicate operations in the log.
+    // The unique violation is caught in events.create and translated to
+    // EntityConflictError, matching the runtime's expected dedup contract.
+    uniqueIndex('workflow_events_entity_creation_unique')
+      .on(tb.runId, tb.correlationId, tb.eventType)
+      .where(
+        sql`${tb.eventType} IN ('step_created', 'hook_created', 'wait_created', 'attr_set')`
+      ),
+  ]
 );
 
-export const steps = pgTable(
+/**
+ * Which runs are slot-numbered. A row exists iff the run is, so its absence is
+ * exactly the "this run predates slots, keep minting ULIDs" signal, so no scan
+ * of the event log is needed to tell the two schemes apart.
+ *
+ * A marker, not a counter. Positions are allocated by the insert that occupies
+ * them (`MAX(slot) + 1` read from the log inside the INSERT), so nothing is
+ * handed out ahead of the write that uses it and a write that fails leaves the
+ * position free for the next one. A counter here would instead burn a position
+ * per failed write, and every such hole is permanent.
+ */
+export const eventSlots = schema.table('workflow_event_slots', {
+  runId: varchar('run_id').primaryKey(),
+  /**
+   * The in-band writer fence of a single-orchestrator run: positions
+   * accepted from in-band (orchestrator) writes, `run_created` included. An
+   * in-band insert advances it in the same statement that inserts the event,
+   * and only when it equals the writer's `expectedSeqInBand`. See
+   * `fencedInsert` in storage.ts.
+   */
+  seqInBand: integer('seq_in_band').notNull().default(1),
+});
+
+/**
+ * One immutable `start({ experimental_hook })` admission decision per candidate run (see
+ * `start-hook.ts` in @workflow/world, and `../start-hook.ts` here).
+ *
+ * - `accepted` rows are written in the same transaction as the run they
+ *   admit and its start Hook (an ordinary row in `workflow_hooks`).
+ * - `rejected` rows record the owner the candidate lost to, so a later
+ *   attempt for the same candidate answers the same `conflicting_run_id`
+ *   even after the owner has released the token.
+ *
+ * A decision only matters inside its candidate's 24h window: past it, every
+ * attempt for the candidate is refused regardless. Admissions delete rows
+ * older than that as they go (`created_at` index).
+ */
+export const startHookAdmissions = schema.table(
+  'workflow_start_hook_admissions',
+  {
+    runId: varchar('run_id').primaryKey(),
+    token: varchar('token').notNull(),
+    decision: varchar('decision').$type<'accepted' | 'rejected'>().notNull(),
+    conflictingRunId: varchar('conflicting_run_id'),
+    createdAt: timestamptz('created_at').default(sql`now()`).notNull(),
+  },
+  (tb) => [index().on(tb.createdAt)]
+);
+
+export const steps = schema.table(
   'workflow_steps',
   {
     runId: varchar('run_id').notNull(),
     stepId: varchar('step_id').primaryKey(),
     stepName: varchar('step_name').notNull(),
     status: stepStatus('status').notNull(),
-    input: jsonb('input').$type<SerializedContent>().notNull(),
-    output: jsonb('output').$type<SerializedContent>(),
-    error: text('error'),
-    errorCode: varchar('error_code'),
+    /** @deprecated */
+    inputJson: jsonb('input').$type<SerializedContent>(),
+    input: Cbor<SerializedContent>()('input_cbor'),
+    /** @deprecated we stream binary data */
+    outputJson: jsonb('output').$type<SerializedContent>(),
+    output: Cbor<SerializedContent>()('output_cbor'),
+    /** @deprecated - use error instead (legacy JSON-stringified StructuredError) */
+    errorJson: text('error'),
+    /**
+     * The thrown value from a step_failed / step_retrying event, serialized
+     * via the workflow serialization pipeline (dehydrateStepError). Stored
+     * as a Uint8Array and wrapped in CBOR for transport.
+     */
+    error: Cbor<SerializedData>()('error_cbor'),
     attempt: integer('attempt').notNull(),
-    startedAt: timestamp('started_at'),
-    completedAt: timestamp('completed_at'),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
-    updatedAt: timestamp('updated_at')
-      .defaultNow()
+    /** Maps to startedAt in Step interface */
+    startedAt: timestamptz('started_at'),
+    completedAt: timestamptz('completed_at'),
+    createdAt: timestamptz('created_at').default(sql`now()`).notNull(),
+    updatedAt: timestamptz('updated_at')
+      .default(sql`now()`)
       .$onUpdateFn(() => new Date())
       .notNull(),
-  } satisfies DrizzlishOfType<Step>,
-  (tb) => ({
-    runFk: index().on(tb.runId),
-    statusIdx: index().on(tb.status),
-  })
+    retryAfter: timestamptz('retry_after'),
+    specVersion: integer('spec_version'),
+  } satisfies DrizzlishOfType<
+    Cborized<
+      Omit<Step, 'input'> & {
+        input?: unknown;
+      },
+      'output' | 'input' | 'error'
+    >
+  >,
+  (tb) => [index().on(tb.runId), index().on(tb.status)]
 );
 
-export const hooks = pgTable(
+export const hooks = schema.table(
   'workflow_hooks',
   {
     runId: varchar('run_id').notNull(),
@@ -126,13 +343,63 @@ export const hooks = pgTable(
     ownerId: varchar('owner_id').notNull(),
     projectId: varchar('project_id').notNull(),
     environment: varchar('environment').notNull(),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
-    metadata: jsonb('metadata').$type<SerializedContent>(),
-  } satisfies DrizzlishOfType<Hook>,
-  (tb) => ({
-    runFk: index().on(tb.runId),
-    tokenIdx: index().on(tb.token),
-  })
+    createdAt: timestamptz('created_at').default(sql`now()`).notNull(),
+    tokenRetentionUntil: timestamptz('token_retention_until'),
+    /** @deprecated */
+    metadataJson: jsonb('metadata').$type<SerializedContent>(),
+    metadata: Cbor<SerializedContent>()('metadata_cbor'),
+    specVersion: integer('spec_version'),
+    isWebhook: boolean('is_webhook').default(true),
+    isSystem: boolean('is_system').default(false),
+    // Server-synthesized resume slice. Not carried by the hook_created event,
+    // so this backend leaves it null; reads fall back to runs.get.
+    resumeContext: Cbor<NonNullable<Hook['resumeContext']>>()('resume_context'),
+    // Set when this hook took its token from another run
+    // (`createHook({ experimental_force })`); see the hook_created branch of
+    // storage.ts. Carries the victim run's queue coordinates so the claimer's
+    // runtime can wake it.
+    claimedFrom: Cbor<NonNullable<Hook['claimedFrom']>>()('claimed_from'),
+    // `resumeCapabilities` is deliberately response-only (attested fresh on
+    // each by-token lookup, never persisted), so it must not become a column.
+    /**
+     * This row's claim on `token` is unique: at most one row per token has
+     * it (`workflow_hooks_token_claim_unique`), so two `start({ experimental_hook })`
+     * admissions racing for a token conflict on the insert instead of both
+     * winning, and an admission racing another run's `createHook` leaves
+     * one owner. Every Hook written since migration 0028 sets it; rows
+     * written before it do not, so the index cannot fail on existing data.
+     */
+    claimsToken: boolean('claims_token').notNull().default(false),
+  } satisfies DrizzlishOfType<
+    Cborized<Omit<Hook, 'resumeCapabilities'>, 'metadata'> & {
+      claimsToken?: boolean;
+    }
+  >,
+  (tb) => [
+    index().on(tb.runId),
+    index().on(tb.token),
+    uniqueIndex('workflow_hooks_token_claim_unique')
+      .on(tb.token)
+      .where(sql`${tb.claimsToken}`),
+  ]
+);
+
+export const waits = schema.table(
+  'workflow_waits',
+  {
+    waitId: varchar('wait_id').primaryKey(),
+    runId: varchar('run_id').notNull(),
+    status: waitStatus('status').notNull(),
+    resumeAt: timestamptz('resume_at'),
+    completedAt: timestamptz('completed_at'),
+    createdAt: timestamptz('created_at').default(sql`now()`).notNull(),
+    updatedAt: timestamptz('updated_at')
+      .default(sql`now()`)
+      .$onUpdateFn(() => new Date())
+      .notNull(),
+    specVersion: integer('spec_version'),
+  } satisfies DrizzlishOfType<Wait>,
+  (tb) => [index().on(tb.runId)]
 );
 
 const bytea = customType<{ data: Buffer; notNull: false; default: false }>({
@@ -141,16 +408,85 @@ const bytea = customType<{ data: Buffer; notNull: false; default: false }>({
   },
 });
 
-export const streams = pgTable(
+/** Store invocation inputs and outcomes separately from workflow events. */
+export const invocations = schema.table(
+  'workflow_invocations',
+  {
+    sequence: bigserial('sequence', { mode: 'number' }).notNull(),
+    runId: varchar('run_id').notNull(),
+    requestId: varchar('request_id').notNull(),
+    payload: bytea('payload'),
+    fingerprint: varchar('fingerprint'),
+    result: bytea('result'),
+    resultVersion: integer('result_version').notNull().default(0),
+    createdAt: timestamptz('created_at').default(sql`now()`).notNull(),
+    respondedAt: timestamptz('responded_at'),
+    expiredAt: timestamptz('expired_at'),
+  },
+  (tb) => [
+    primaryKey({ columns: [tb.runId, tb.requestId] }),
+    index('workflow_invocations_pending')
+      .on(tb.runId, tb.sequence)
+      .where(sql`${tb.respondedAt} IS NULL`),
+  ]
+);
+
+/**
+ * VM snapshots for VM-memory snapshotting.
+ *
+ * Each row is a 1-to-1 mapping with a workflow run — a snapshot captures
+ * the QuickJS VM state at a suspension point so execution can resume from
+ * there without replaying the full event log.
+ *
+ * The binary data is stored as opaque bytes in the `data` column (the SDK
+ * applies compression/encryption before handing bytes to the world).
+ * Metadata (`eventsCursor`, `createdAt`) lives alongside for cheap loads.
+ */
+export const snapshots = schema.table('workflow_snapshots', {
+  runId: varchar('run_id').primaryKey(),
+  data: bytea('data').notNull(),
+  eventsCursor: varchar('events_cursor'),
+  createdAt: timestamptz('created_at').default(sql`now()`).notNull(),
+});
+
+/**
+ * Graphile workers of processes that renew their job locks (`job-lease.ts`).
+ * The default stale-lock sweep releases a job that owns a run's delivery
+ * lease only when its holder is listed here, so a process on an earlier version, which
+ * neither renews nor fences its acknowledgement, is never released under.
+ * `renewed_at` only ages out the rows of workers that hold no job.
+ */
+export const jobLockHolders = schema.table('workflow_job_lock_holders', {
+  workerId: text('worker_id').primaryKey(),
+  renewedAt: timestamptz('renewed_at').default(sql`now()`).notNull(),
+});
+
+/**
+ * Per-run delivery leases (`run-lease.ts`): a run's row exists only while a
+ * delivery drives it. `ownerJobId` is the Graphile job that owns it; `wake`
+ * and `deferred` are the messages other deliveries left for that owner.
+ */
+export const runDeliveryLeases = schema.table('workflow_run_delivery_leases', {
+  runId: varchar('run_id').primaryKey(),
+  ownerJobId: bigint('owner_job_id', { mode: 'bigint' }).notNull(),
+  wake: jsonb('wake'),
+  wakeResume: boolean('wake_resume').default(false).notNull(),
+  deferred: jsonb('deferred').default(sql`'[]'::jsonb`).notNull(),
+  claimedAt: timestamptz('claimed_at').default(sql`now()`).notNull(),
+});
+
+export const streams = schema.table(
   'workflow_stream_chunks',
   {
     chunkId: varchar('id').$type<`chnk_${string}`>().notNull(),
     streamId: varchar('stream_id').notNull(),
+    runId: varchar('run_id'),
     chunkData: bytea('data').notNull(),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
+    createdAt: timestamptz('created_at').default(sql`now()`).notNull(),
     eof: boolean('eof').notNull(),
   },
-  (tb) => ({
-    primaryKey: primaryKey({ columns: [tb.streamId, tb.chunkId] }),
-  })
+  (tb) => [
+    primaryKey({ columns: [tb.streamId, tb.chunkId] }),
+    index().on(tb.runId),
+  ]
 );

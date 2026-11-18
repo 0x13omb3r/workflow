@@ -1,0 +1,46 @@
+import '../global.css';
+import { Footer } from '@vercel/geistdocs/footer';
+import { Navbar } from '@vercel/geistdocs/navbar';
+import type { Metadata } from 'next';
+import { GeistdocsProvider } from '@/components/geistdocs/provider';
+import { config } from '@/lib/geistdocs/config';
+import { mono, sans } from '@/lib/geistdocs/fonts';
+import { cn } from '@/lib/utils';
+
+const getMetadataBase = () => {
+  // Use VERCEL_URL for preview deployments, production URL for production
+  if (process.env.VERCEL_ENV === 'production') {
+    return new URL('https://workflow-sdk.dev');
+  }
+  if (process.env.VERCEL_URL) {
+    return new URL(`https://${process.env.VERCEL_URL}`);
+  }
+  // Fallback for local development
+  return new URL('http://localhost:3000');
+};
+
+export const metadata: Metadata = {
+  metadataBase: getMetadataBase(),
+};
+
+const Layout = async ({ children, params }: LayoutProps<'/[lang]'>) => {
+  const { lang } = await params;
+
+  return (
+    <html
+      className={cn(sans.variable, mono.variable, 'antialiased')}
+      lang={lang}
+      suppressHydrationWarning
+    >
+      <body>
+        <GeistdocsProvider basePath={config.basePath} lang={lang}>
+          <Navbar config={config} />
+          {children}
+          <Footer />
+        </GeistdocsProvider>
+      </body>
+    </html>
+  );
+};
+
+export default Layout;

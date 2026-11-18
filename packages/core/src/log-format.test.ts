@@ -1,0 +1,312 @@
+import { describe, expect, test } from 'vitest';
+import { composeLogLine } from './log-format.js';
+
+// chalk respects FORCE_COLOR=0 (which vitest doesn't set, but the runner
+// has no TTY so chalk's level is 0 → ANSI helpers pass-through). The
+// snapshots below match the plain-text structural form, which is what
+// log drains and CI logs see.
+
+const PREFIX = '[workflow-sdk]';
+
+describe('composeLogLine', () => {
+  test('returns just the prefixed framing when no metadata or stack', () => {
+    expect(composeLogLine(PREFIX, 'something happened', undefined)).toBe(
+      '[workflow-sdk] something happened'
+    );
+    expect(composeLogLine(PREFIX, 'something happened', {})).toBe(
+      '[workflow-sdk] something happened'
+    );
+  });
+
+  test('renders structured fields between framing and stack body', () => {
+    const out = composeLogLine(
+      PREFIX,
+      [
+        'Step add (./workflows/x) threw a FatalError — bubbling up to parent workflow',
+        'FatalError: User threw a FatalError',
+        '    at maybeFailingStep (./workflows/x.ts:15:11)',
+        '    at <unknown> (../../packages/core/src/runtime/step-executor.ts:535:32)',
+      ].join('\n'),
+      {
+        workflowRunId: 'wrun_01ABC',
+        stepId: 'step_01XYZ',
+        stepName: 'step//./workflows/x//add',
+        errorAttribution: 'user',
+        errorName: 'FatalError',
+        errorMessage: 'User threw a FatalError',
+      }
+    );
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Step add (./workflows/x) threw a FatalError — bubbling up to parent workflow
+        user error · FatalError
+        run    wrun_01ABC
+        step   step_01XYZ · add (./workflows/x)
+      FatalError: User threw a FatalError
+          at maybeFailingStep (./workflows/x.ts:15:11)
+          at <unknown> (../../packages/core/src/runtime/step-executor.ts:535:32)"
+    `);
+  });
+
+  test('collapses pnpm / next / opentelemetry frames with a summary line', () => {
+    const stack = [
+      'FatalError: boom',
+      '    at userStep (./workflows/x.ts:15:11)',
+      '    at <unknown> (../../packages/core/src/runtime/step-executor.ts:535:32)',
+      '    at <unknown> (.../node_modules/.pnpm/next@16.2.1/dist/server/base-server.js:1454:9)',
+      '    at <unknown> (.../node_modules/.pnpm/next@16.2.1/dist/server/dev/next-dev-server.js:394:20)',
+      '    at <unknown> (.../node_modules/.pnpm/@opentelemetry+api@1.9.1/build/src/api/trace.js:160:25)',
+      '    at <unknown> (../../packages/core/src/runtime/helpers.ts:414:12)',
+      '    at <unknown> (node:internal/process/task_queues:64:5)',
+      '    at <unknown> (.../node_modules/next/dist/server/lib/start-server.js:225:13)',
+    ].join('\n');
+    const out = composeLogLine(PREFIX, `Step blew up\n${stack}`, undefined);
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Step blew up
+      FatalError: boom
+          at userStep (./workflows/x.ts:15:11)
+          at <unknown> (../../packages/core/src/runtime/step-executor.ts:535:32)
+              … 3 more frames in framework internals
+          at <unknown> (../../packages/core/src/runtime/helpers.ts:414:12)
+              … 2 more frames in framework internals"
+    `);
+  });
+
+  test('renders sdk-attributed errors with the sdk badge', () => {
+    const out = composeLogLine(
+      PREFIX,
+      'Workflow myFlow failed due to an SDK runtime error\nCorruptedEventLogError: corrupted event log',
+      {
+        errorCode: 'CORRUPTED_EVENT_LOG',
+        errorAttribution: 'sdk',
+        errorName: 'CorruptedEventLogError',
+        errorMessage: 'corrupted event log',
+        hint: 'This is an internal workflow SDK error.',
+      }
+    );
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Workflow myFlow failed due to an SDK runtime error
+        sdk error · CorruptedEventLogError
+        code   CORRUPTED_EVENT_LOG
+        hint: This is an internal workflow SDK error.
+      CorruptedEventLogError: corrupted event log"
+    `);
+  });
+
+  test('drops errorMessage when the framing line already includes it', () => {
+    // The framing line of a workflow-level log embeds the error message
+    // directly. Avoid printing it again as a separate field.
+    const errorMessage = 'thing went wrong';
+    const out = composeLogLine(
+      PREFIX,
+      `Workflow simple threw: ${errorMessage}\nError: ${errorMessage}`,
+      {
+        errorAttribution: 'user',
+        errorName: 'Error',
+        errorMessage,
+      }
+    );
+    expect(out).not.toMatch(/^\s+message\s+/m);
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Workflow simple threw: thing went wrong
+        user error · Error
+      Error: thing went wrong"
+    `);
+  });
+
+  test('renders the errorStack field as the body when the message has none', () => {
+    // The run-failure log in runtime.ts logs a bare framing line and passes
+    // the source-map-remapped stack as metadata. Dropping `errorStack`
+    // unconditionally left that call site with no stack at all.
+    const out = composeLogLine(PREFIX, 'Error while running workflow', {
+      workflowRunId: 'wrun_01ABC',
+      errorCode: 'USER_ERROR',
+      errorName: 'Error',
+      errorMessage: 'thing went wrong',
+      errorStack: [
+        'Error: thing went wrong',
+        '    at workflow (./workflows/x.ts:3:15)',
+        '    at <unknown> (.../node_modules/.pnpm/next@16.2.1/dist/server/base-server.js:1454:9)',
+      ].join('\n'),
+    });
+    // The promoted stack header carries both the class and the message, so
+    // neither is restated as a row above it.
+    expect(out).not.toMatch(/^\s+error\s+/m);
+    expect(out).not.toMatch(/^\s+Error\s*$/m);
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Error while running workflow
+        run    wrun_01ABC
+        code   USER_ERROR
+      Error: thing went wrong
+          at workflow (./workflows/x.ts:3:15)
+              … 1 more frame in framework internals"
+    `);
+  });
+
+  test('renders the errorCause chain under the message it explains', () => {
+    // The failure this exists for: undici's wrapper has an empty message and
+    // a stack of frames the trimmer drops, so without the chain the log says
+    // "fetch failed" and nothing about what failed.
+    const out = composeLogLine(PREFIX, 'Error while running workflow', {
+      workflowRunId: 'wrun_01ABC',
+      errorCode: 'WORLD_CONTRACT_ERROR',
+      errorName: 'WorkflowWorldError',
+      errorMessage:
+        'POST /v4/runs/wrun_01ABC/events/step_completed transport failure after 2103ms (UND_ERR_SOCKET)',
+      errorCause: [
+        'TypeError: fetch failed',
+        'SocketError: other side closed (UND_ERR_SOCKET)',
+      ].join('\n'),
+      errorStack: [
+        'WorkflowWorldError: POST /v4/runs/wrun_01ABC/events/step_completed transport failure after 2103ms (UND_ERR_SOCKET)',
+        '    at makeRequest (../../packages/world-vercel/src/utils.ts:470:19)',
+      ].join('\n'),
+    });
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Error while running workflow
+        run    wrun_01ABC
+        code   WORLD_CONTRACT_ERROR
+        cause  TypeError: fetch failed
+               SocketError: other side closed (UND_ERR_SOCKET)
+      WorkflowWorldError: POST /v4/runs/wrun_01ABC/events/step_completed transport failure after 2103ms (UND_ERR_SOCKET)
+          at makeRequest (../../packages/world-vercel/src/utils.ts:470:19)"
+    `);
+  });
+
+  test('omits the cause row when the stack body already spells it out', () => {
+    const out = composeLogLine(PREFIX, 'Error while running workflow', {
+      errorCause: 'SocketError: other side closed',
+      errorStack: [
+        'TypeError: fetch failed',
+        '    at node:internal/deps/undici/undici:13502:13',
+        '  [cause]: SocketError: other side closed',
+      ].join('\n'),
+    });
+    expect(out).not.toMatch(/^\s+cause\s+/m);
+  });
+
+  test('does not duplicate a stack the message already embeds', () => {
+    const stack = [
+      'Error: boom',
+      '    at userStep (./workflows/x.ts:15:11)',
+    ].join('\n');
+    const out = composeLogLine(PREFIX, `Step blew up\n${stack}`, {
+      errorStack: stack,
+    });
+    expect(out).toBe(`[workflow-sdk] Step blew up\n${stack}`);
+  });
+
+  test('keeps the class on the header row when it carries an attribution badge', () => {
+    // The badge is something the stack cannot express, so the row still
+    // earns its line even though the stack header repeats the class.
+    const out = composeLogLine(PREFIX, 'Error while running workflow', {
+      errorAttribution: 'sdk',
+      errorName: 'CorruptedEventLogError',
+      errorStack: 'CorruptedEventLogError: corrupted event log',
+    });
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Error while running workflow
+        sdk error · CorruptedEventLogError
+      CorruptedEventLogError: corrupted event log"
+    `);
+  });
+
+  test('keeps the class row when the stack belongs to a different class', () => {
+    // A wrapped/replaced stack can name something other than `errorName`.
+    // Dropping the row there would lose the real class.
+    const out = composeLogLine(PREFIX, 'Error while running workflow', {
+      errorName: 'FatalError',
+      errorStack: 'TypeError: undefined is not a function',
+    });
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Error while running workflow
+        FatalError
+      TypeError: undefined is not a function"
+    `);
+  });
+
+  test('falls back gracefully on machine names it cannot parse', () => {
+    const out = composeLogLine(PREFIX, 'msg', {
+      workflowRunId: 'wrun_X',
+      workflowName: 'not-a-machine-name',
+    });
+    expect(out).toContain('wrun_X');
+  });
+
+  test('renders unknown fields as a sorted key/value tail', () => {
+    const out = composeLogLine(PREFIX, 'msg', {
+      zoo: 'last',
+      apple: 'first',
+      banana: 42,
+    });
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] msg
+        apple  first
+        banana 42
+        zoo    last"
+    `);
+  });
+
+  test('hit-max-retries: attempt + retryCount renders on its own row', () => {
+    const out = composeLogLine(
+      PREFIX,
+      'Step add (./workflows/x) hit max retries — bubbling error',
+      {
+        workflowRunId: 'wrun_01ABC',
+        workflowName: 'workflow//./workflows/x//myWorkflow',
+        stepId: 'step_01XYZ',
+        stepName: 'step//./workflows/x//add',
+        attempt: 4,
+        retryCount: 3,
+        errorAttribution: 'user',
+        errorName: 'Error',
+        errorMessage: 'Transient failure',
+      }
+    );
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Step add (./workflows/x) hit max retries — bubbling error
+        user error · Error
+        run    wrun_01ABC · myWorkflow (./workflows/x)
+        step   step_01XYZ · add (./workflows/x)
+        retry  4 attempts · 3 max retries
+        error  Transient failure"
+    `);
+  });
+
+  // A WARN whose framing is a fixed sentence and whose message has no stack
+  // body carries the underlying error's text only in `errorMessage`. It used
+  // to be dropped because the key was well-known but never rendered, which is
+  // how a production divergence WARN lost the text saying what diverged.
+  test('renders errorMessage when neither framing nor body carries it', () => {
+    const out = composeLogLine(
+      PREFIX,
+      'Workflow replay diverged; queueing a recovery replay before declaring the event log corrupted',
+      {
+        errorCode: 'REPLAY_DIVERGENCE',
+        divergenceEventId: 'evnt_3',
+        divergenceCount: 1,
+        loopIteration: 2,
+        servedByRetainedSession: false,
+        errorMessage:
+          'Replay could not consume event: eventType=wait_created, correlationId=wait_01K, eventId=evnt_3. pending at this id: step drainStep (step_01K).',
+      }
+    );
+    expect(out).toMatchInlineSnapshot(`
+      "[workflow-sdk] Workflow replay diverged; queueing a recovery replay before declaring the event log corrupted
+        code   REPLAY_DIVERGENCE
+        error  Replay could not consume event: eventType=wait_created, correlationId=wait_01K, eventId=evnt_3. pending at this id: step drainStep (step_01K).
+        divergenceCount 1
+        divergenceEventId evnt_3
+        loopIteration 2
+        servedByRetainedSession false"
+    `);
+  });
+
+  test('drops errorMessage when the stack body already carries it', () => {
+    const out = composeLogLine(
+      PREFIX,
+      'Workflow failed\nError: boom\n    at x (./workflows/x.ts:1:1)',
+      { errorName: 'Error', errorMessage: 'boom' }
+    );
+    expect(out).not.toMatch(/^\s+error\s+boom/m);
+  });
+});

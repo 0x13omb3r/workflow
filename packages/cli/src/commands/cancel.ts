@@ -1,18 +1,53 @@
-import { Args } from '@oclif/core';
+import readline from 'node:readline';
+import { Args, Flags } from '@oclif/core';
+import { cancelRun } from '@workflow/core/runtime';
+import { WorkflowRunStatusSchema } from '@workflow/world';
+import chalk from 'chalk';
 import { BaseCommand } from '../base.js';
-import { LOGGING_CONFIG } from '../lib/config/log.js';
+import {
+  BULK_CANCEL_MAX_LIMIT,
+  BULK_CANCEL_MIN_LIMIT,
+  CANCELLABLE_STATUSES,
+  CLI_CANCEL_REASON,
+  performBulkCancel,
+  validateBulkCancelLimit,
+} from '../lib/bulk-cancel.js';
+import { LOGGING_CONFIG, logger } from '../lib/config/log.js';
+import { reportActionableApiError } from '../lib/inspect/errors.js';
 import { cliFlags } from '../lib/inspect/flags.js';
-import { cancelRun } from '../lib/inspect/run.js';
 import { setupCliWorld } from '../lib/inspect/setup.js';
 
 export default class Cancel extends BaseCommand {
-  static description = 'Cancel a workflow';
+  static description =
+    'Cancel a workflow run, or bulk-cancel runs by status/name';
 
   static aliases = ['c'];
 
-  static examples = ['$ workflow cancel <run-id>', '$ wf cancel <run-id>'];
+  static examples = [
+    '$ workflow cancel <run-id>',
+    '$ workflow cancel --status=running',
+    '$ workflow cancel --status=running --workflowName=myWorkflow',
+    '$ workflow cancel --status=running -y',
+  ];
+
+  /**
+   * Recorded in `run()` so `catch()` can tell a Vercel 403 from any other
+   * one. oclif hands `catch` the error alone, with no parsed flags.
+   *
+   * Assigned after `this.parse()`, so a `catch` reached by a parse failure
+   * sees `undefined`. That costs nothing: a parse failure is not an API
+   * error, so there is no 403 to classify.
+   */
+  private backend?: string;
 
   async catch(error: any) {
+    // Print the errors that name something the caller can fix. Only the plan
+    // gate was handled before, so an argument the World rejected locally —
+    // `--limit` above the listing cap, say — reached oclif's default handler
+    // and exited 1 with nothing on screen unless -v was set.
+    if (reportActionableApiError(error, this.backend)) {
+      process.exit(1);
+    }
     if (LOGGING_CONFIG.VERBOSE_MODE) {
       console.error(error);
     }
@@ -21,18 +56,122 @@ export default class Cancel extends BaseCommand {
 
   static args = {
     runId: Args.string({
-      description: 'ID of the run to cancel.',
-      required: true,
+      description: 'ID of the run to cancel (omit for bulk mode with filters)',
+      required: false,
     }),
   } as const;
 
-  static flags = cliFlags;
+  static flags = {
+    ...cliFlags,
+    status: Flags.string({
+      // Only cancellable statuses are offered: cancelling a terminal run
+      // (completed / failed / cancelled) is a no-op, so pinning one would list
+      // the same page on every rerun and never advance.
+      description: 'Filter runs by status for bulk cancel (pending or running)',
+      required: false,
+      options: [...CANCELLABLE_STATUSES],
+      helpGroup: 'Bulk Cancel',
+      helpLabel: '--status',
+    }),
+    workflowName: Flags.string({
+      description: 'Filter runs by workflow name for bulk cancel',
+      required: false,
+      char: 'n',
+      helpGroup: 'Bulk Cancel',
+      helpLabel: '-n, --workflowName',
+    }),
+    limit: Flags.integer({
+      description: `Max runs to cancel in bulk mode (${BULK_CANCEL_MIN_LIMIT}-${BULK_CANCEL_MAX_LIMIT})`,
+      required: false,
+      default: 50,
+      helpGroup: 'Bulk Cancel',
+      helpLabel: '--limit',
+      helpValue: 'NUMBER',
+    }),
+    confirm: Flags.boolean({
+      description: 'Skip interactive confirmation prompt',
+      required: false,
+      char: 'y',
+      default: false,
+      helpGroup: 'Bulk Cancel',
+      helpLabel: '-y, --confirm',
+    }),
+  };
 
   public async run(): Promise<void> {
     const { flags, args } = await this.parse(Cancel);
+    this.backend = flags.backend;
 
     const world = await setupCliWorld(flags, this.config.version);
+    if (!world) {
+      throw new Error(
+        'Failed to connect to backend. Check your configuration.'
+      );
+    }
 
-    await cancelRun(world, args.runId);
+    // Single-run cancel (existing behavior)
+    if (args.runId) {
+      await cancelRun(world, args.runId, {
+        cancelReason: CLI_CANCEL_REASON,
+      });
+      logger.log(chalk.green(`Cancelled run ${args.runId}`));
+      return;
+    }
+
+    // Bulk mode requires at least one filter
+    if (!flags.status && !flags.workflowName) {
+      logger.error(
+        'Provide a run ID or use --status/--workflowName to bulk cancel.\n' +
+          'Examples:\n' +
+          '  workflow cancel <run-id>\n' +
+          '  workflow cancel --status=running\n' +
+          '  workflow cancel --status=running --workflowName=myWorkflow'
+      );
+      process.exit(1);
+    }
+
+    const limit = flags.limit ?? 50;
+    const limitError = validateBulkCancelLimit(limit);
+    if (limitError) {
+      logger.error(limitError);
+      process.exit(1);
+    }
+
+    const status = flags.status
+      ? WorkflowRunStatusSchema.parse(flags.status)
+      : undefined;
+
+    const { exitCode } = await performBulkCancel({
+      world,
+      status,
+      workflowName: flags.workflowName,
+      limit,
+      confirm: flags.confirm,
+      logger,
+      promptConfirm,
+    });
+
+    if (exitCode !== 0) {
+      process.exit(exitCode);
+    }
   }
+}
+
+async function promptConfirm(message: string): Promise<boolean> {
+  // Non-TTY: abort since user cannot confirm interactively (use -y/--confirm to skip prompt)
+  if (!process.stdin.isTTY) {
+    return false;
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  return new Promise<boolean>((resolve) => {
+    rl.question(`${message} [y/N] `, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'y');
+    });
+  });
 }

@@ -1,76 +1,215 @@
-import * as vm from 'node:vm';
+import { runInNewContext } from 'node:vm';
+import { FatalError } from '@workflow/errors';
 import { describe, expect, it } from 'vitest';
-import { getConstructorName, getConstructorNames, isInstanceOf } from './types';
+import {
+  formatErrorCauseChain,
+  getErrorMessage,
+  isAbortError,
+  promoteAbortErrorToFatal,
+} from './types.js';
 
-describe('getConstructorName', () => {
-  it('should return the constructor name of an Error', () => {
-    expect(getConstructorName(new Error('test'))).toBe('Error');
+describe('getErrorMessage', () => {
+  it('reads a native error message across realms without adding its name', () => {
+    expect(
+      getErrorMessage(runInNewContext('new TypeError("remote error")'))
+    ).toBe('remote error');
   });
 
-  it('should return the constructor name of a custom error', () => {
-    class CustomError extends Error {}
-    expect(getConstructorName(new CustomError('test'))).toBe('CustomError');
-  });
-
-  it('should return null if the object has no constructor', () => {
-    expect(getConstructorName(Object.create(null))).toBeNull();
-  });
-
-  it('should return null if the object is null or undefined', () => {
-    expect(getConstructorName(null)).toBeNull();
-    expect(getConstructorName(undefined)).toBeNull();
-  });
-
-  it('should return "String" if the object is a string', () => {
-    expect(getConstructorName('test')).toBe('String');
-  });
-
-  it('should return "Number" if the object is a number', () => {
-    expect(getConstructorName(123)).toBe('Number');
-  });
-
-  it('should return "Error" from an Error object from a different context', () => {
-    const error = vm.runInNewContext('new Error("test")');
-    expect(getConstructorName(error)).toBe('Error');
-  });
-
-  it('should return "TypeError" from an Error object from a different context', () => {
-    const error = vm.runInNewContext('new TypeError("test")');
-    expect(getConstructorName(error)).toBe('TypeError');
+  it.each([
+    null,
+    undefined,
+    'plain failure',
+    42,
+  ])('stringifies non-error values (%s)', (value) => {
+    expect(getErrorMessage(value)).toBe(String(value));
   });
 });
 
-describe('getConstructorNames', () => {
-  it('should return the constructor names of an Error', () => {
-    expect(getConstructorNames(new Error('test'))).toEqual(['Error']);
-  });
-
-  it('should return the constructor names of a custom error', () => {
-    class CustomError extends Error {}
-    expect(getConstructorNames(new CustomError('test'))).toEqual([
-      'CustomError',
-      'Error',
-    ]);
-  });
-
-  it('should return the constructor names of a custom error from a different context', () => {
-    const error = vm.runInNewContext(
-      'class CustomError extends Error {} new CustomError("test")'
+describe('isAbortError', () => {
+  it('recognizes an AbortError from another realm', () => {
+    const error = runInNewContext(
+      'Object.assign(new Error("cancelled"), { name: "AbortError" })'
     );
-    expect(getConstructorNames(error)).toEqual(['CustomError', 'Error']);
+
+    expect(error).not.toBeInstanceOf(Error);
+    expect(isAbortError(error)).toBe(true);
+  });
+
+  it.each([
+    { name: 'AbortError', message: 'serialized abort' },
+    new DOMException('dom abort', 'AbortError'),
+  ])('recognizes abort-shaped values', (error) => {
+    expect(isAbortError(error)).toBe(true);
+  });
+
+  it.each([
+    null,
+    undefined,
+    { name: 'TypeError', message: 'not an abort' },
+    { name: 'AbortError' },
+    { name: 'AbortError', message: 42 },
+    { name: 'AbortError', message: 'bad stack', stack: 42 },
+  ])('rejects non-abort values', (value) => {
+    expect(isAbortError(value)).toBe(false);
   });
 });
 
-describe('isInstanceOf', () => {
-  it('should return true if the error is an instance of the given constructor', () => {
-    expect(isInstanceOf(new Error('test'), Error)).toBe(true);
+describe('promoteAbortErrorToFatal', () => {
+  it('promotes an abort-shaped value to FatalError and preserves its stack', () => {
+    const error = {
+      name: 'AbortError',
+      message: 'cancelled',
+      stack: 'AbortError: cancelled',
+    };
+
+    const promoted = promoteAbortErrorToFatal(error);
+
+    expect(FatalError.is(promoted)).toBe(true);
+    expect(promoted).toMatchObject({
+      name: 'FatalError',
+      message: 'Aborted: cancelled',
+      stack: error.stack,
+    });
   });
 
-  it('should return true if the error is a instance of a subclass of the given constructor', () => {
-    expect(isInstanceOf(new TypeError('test'), Error)).toBe(true);
+  it('preserves an already fatal abort error', () => {
+    const error = Object.assign(new FatalError('already fatal'), {
+      name: 'AbortError',
+    });
+
+    expect(promoteAbortErrorToFatal(error)).toBe(error);
+  });
+});
+
+describe('formatErrorCauseChain', () => {
+  it.each([
+    'cause',
+    'name',
+    'message',
+    'code',
+    'errors',
+  ])('tolerates a throwing %s getter in the cause chain', (property) => {
+    const cause = new Error('inner');
+    Object.defineProperty(cause, property, {
+      get() {
+        throw new Error('getter failed');
+      },
+    });
+
+    expect(formatErrorCauseChain(new Error('outer', { cause }))).toContain(
+      '[unavailable cause]'
+    );
   });
 
-  it('should return false if the error is not an instance of the given constructor', () => {
-    expect(isInstanceOf(new Error('test'), TypeError)).toBe(false);
+  it('preserves readable links before an inaccessible cause', () => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const middle = new Error('middle', { cause: proxy });
+
+    expect(formatErrorCauseChain(new Error('outer', { cause: middle }))).toBe(
+      'Error: middle\n[unavailable cause]'
+    );
+  });
+
+  it('tolerates a throwing getter on the outer cause', () => {
+    const error = new Error('outer');
+    Object.defineProperty(error, 'cause', {
+      get() {
+        throw new Error('getter failed');
+      },
+    });
+
+    expect(formatErrorCauseChain(error)).toBe('[unavailable cause]');
+  });
+
+  it('returns an empty string when there is no cause', () => {
+    expect(formatErrorCauseChain(new Error('boom'))).toBe('');
+    expect(formatErrorCauseChain('not an error')).toBe('');
+    expect(formatErrorCauseChain(undefined)).toBe('');
+  });
+
+  it('renders the wrapped reason a `fetch failed` hides', () => {
+    // The whole point: the outer error says nothing, the cause says
+    // everything. The outer link is skipped — the log already prints it.
+    const cause = Object.assign(new Error('other side closed'), {
+      name: 'SocketError',
+      code: 'UND_ERR_SOCKET',
+    });
+    const wrapper = new TypeError('fetch failed', { cause });
+
+    expect(formatErrorCauseChain(wrapper)).toBe(
+      'SocketError: other side closed (UND_ERR_SOCKET)'
+    );
+  });
+
+  it('renders each link of a multi-level chain, outermost first', () => {
+    const inner = Object.assign(
+      new Error('getaddrinfo ENOTFOUND ai-gateway.vercel.sh'),
+      { code: 'ENOTFOUND' }
+    );
+    const wrapper = new Error('POST /v4/… transport failure (ENOTFOUND)', {
+      cause: new TypeError('fetch failed', { cause: inner }),
+    });
+
+    expect(formatErrorCauseChain(wrapper)).toBe(
+      [
+        'TypeError: fetch failed',
+        // The code is already in the message, so it is not repeated.
+        'Error: getaddrinfo ENOTFOUND ai-gateway.vercel.sh',
+      ].join('\n')
+    );
+  });
+
+  it('summarizes the attempts an AggregateError collects', () => {
+    // A happy-eyeballs connect reports every address it tried on `errors`
+    // and leaves the AggregateError itself blank.
+    const aggregate = new AggregateError(
+      [
+        Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), {
+          code: 'ECONNREFUSED',
+        }),
+        Object.assign(new Error('connect ECONNREFUSED [::1]:443'), {
+          code: 'ECONNREFUSED',
+        }),
+      ],
+      ''
+    );
+
+    expect(
+      formatErrorCauseChain(new TypeError('fetch failed', { cause: aggregate }))
+    ).toBe(
+      [
+        'AggregateError',
+        'Error: connect ECONNREFUSED 10.0.0.1:443',
+        'Error: connect ECONNREFUSED [::1]:443',
+      ].join('\n')
+    );
+  });
+
+  it('caps a long chain', () => {
+    let error = new Error('innermost');
+    for (let i = 0; i < 8; i++) {
+      error = new Error(`level ${i}`, { cause: error });
+    }
+
+    const lines = formatErrorCauseChain(error).split('\n');
+    expect(lines).toHaveLength(5);
+    expect(lines.at(-1)).toBe('…');
+  });
+
+  it('stops on a cyclic chain', () => {
+    const inner = new Error('inner') as Error & { cause?: unknown };
+    const outer = new Error('outer', { cause: inner });
+    inner.cause = outer;
+
+    expect(formatErrorCauseChain(outer)).toBe(
+      ['Error: inner', 'Error: outer'].join('\n')
+    );
+  });
+
+  it('renders a non-error cause', () => {
+    expect(
+      formatErrorCauseChain(new Error('boom', { cause: 'a string' }))
+    ).toBe('a string');
   });
 });

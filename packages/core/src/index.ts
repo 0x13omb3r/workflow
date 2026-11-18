@@ -1,5 +1,5 @@
 /**
- * Just the core utilities that are meant to be imported by user
+ * Core utilities intended for import by user
  * steps/workflows. This allows the bundler to tree-shake and limit what goes
  * into the final user bundles. Logic for running/handling steps/workflows
  * should live in runtime. Eventually these might be separate packages
@@ -24,7 +24,13 @@ export {
   type Webhook,
   type WebhookOptions,
 } from './create-hook.js';
-export { defineHook } from './define-hook.js';
+export { defineHook, type TypedHook } from './define-hook.js';
+export type { Serializable } from './schemas.js';
+export {
+  type SetAttributesOptions,
+  setAttributes,
+} from './set-attributes.js';
+export { sleep } from './sleep.js';
 export {
   getStepMetadata,
   type StepMetadata,
@@ -33,4 +39,7 @@ export {
   getWorkflowMetadata,
   type WorkflowMetadata,
 } from './step/get-workflow-metadata.js';
-export { getWritable } from './writable-stream.js';
+export {
+  getWritable,
+  type WorkflowWritableStreamOptions,
+} from './step/writable-stream.js';

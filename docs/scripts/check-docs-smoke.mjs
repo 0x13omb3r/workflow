@@ -1,0 +1,491 @@
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { fetchWithTrustedSources } from '../../scripts/trusted-sources-headers.mjs';
+
+/**
+ * Docs smoke checks.
+ *
+ * This script is intentionally small and dependency-free so it can run in CI.
+ * It validates critical public endpoints (OG images and sitemap) and can be
+ * extended with more lightweight checks over time.
+ *
+ * When DEPLOYMENT_URL or OG_BASE_URL is set, it targets a remote deployment.
+ * Otherwise it starts the local docs server and tests against localhost.
+ */
+
+const PORT = process.env.OG_TEST_PORT || '3100';
+const HOST = '127.0.0.1';
+const rawBaseUrl = process.env.DEPLOYMENT_URL || process.env.OG_BASE_URL || '';
+const BASE_URL = rawBaseUrl
+  ? rawBaseUrl.startsWith('http')
+    ? rawBaseUrl
+    : `https://${rawBaseUrl}`
+  : `http://${HOST}:${PORT}`;
+const USE_REMOTE = Boolean(rawBaseUrl);
+const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10];
+const DOCS_DIR = fileURLToPath(new URL('..', import.meta.url));
+const NEXT_CLI = fileURLToPath(
+  new URL('../node_modules/next/dist/bin/next', import.meta.url)
+);
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const assertNoProtection = async (path) => {
+  const res = await fetchWithTrustedSources(`${BASE_URL}${path}`, {
+    redirect: 'manual',
+  });
+  const location = res.headers.get('location') || '';
+  if (
+    res.status === 307 &&
+    (location.includes('vercel.com/login') ||
+      location.includes('/_vercel/login'))
+  ) {
+    throw new Error(
+      `${path} redirected to Vercel login; check deployment protection/bypass`
+    );
+  }
+};
+
+const waitForServer = async (url, timeoutMs = 30_000) => {
+  const startedAt = Date.now();
+  let lastStatus = null;
+  let lastBody = null;
+  // x-vercel-id identifies the Vercel edge node that served the response.
+  // While the proxy-side trusted-sources changes are rolling out gradually,
+  // a failing request may be hitting an edge node that hasn't received the
+  // fix yet — surfacing the id in the timeout error makes that visible.
+  let lastVercelId = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const res = await fetchWithTrustedSources(url);
+      if (res.ok) return;
+      lastStatus = res.status;
+      lastVercelId = res.headers.get('x-vercel-id');
+      // Capture the first ~500 chars of the body to help diagnose
+      // protection/auth failures (e.g. SSO login redirects).
+      try {
+        lastBody = (await res.text()).slice(0, 500);
+      } catch {
+        lastBody = '<unable to read body>';
+      }
+    } catch (err) {
+      lastStatus = `network error: ${(err && err.message) || err}`;
+    }
+    await wait(500);
+  }
+  throw new Error(
+    `Timed out waiting for server at ${url} (last status: ${lastStatus}; x-vercel-id: ${lastVercelId}; body: ${lastBody})`
+  );
+};
+
+const assertPngResponse = async (path) => {
+  const res = await fetchWithTrustedSources(`${BASE_URL}${path}`);
+  if (!res.ok) {
+    throw new Error(`${path} returned ${res.status}`);
+  }
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('image/png')) {
+    throw new Error(`${path} content-type was ${contentType}`);
+  }
+  const buf = new Uint8Array(await res.arrayBuffer());
+  for (let i = 0; i < PNG_SIGNATURE.length; i += 1) {
+    if (buf[i] !== PNG_SIGNATURE[i]) {
+      throw new Error(`${path} did not start with PNG signature bytes`);
+    }
+  }
+};
+
+const assertHtmlMeta = async (path, expectedOgImagePath) => {
+  const res = await fetchWithTrustedSources(`${BASE_URL}${path}`);
+  if (!res.ok) {
+    throw new Error(`${path} returned ${res.status}`);
+  }
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('text/html')) {
+    throw new Error(`${path} content-type was ${contentType}`);
+  }
+  const html = await res.text();
+  const ogImage = html.match(
+    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["'][^>]*>/i
+  )?.[1];
+  if (!ogImage) {
+    throw new Error(`${path} missing og:image meta tag`);
+  }
+  if (expectedOgImagePath) {
+    const normalized = ogImage.startsWith('http')
+      ? new URL(ogImage).pathname
+      : ogImage;
+    if (normalized !== expectedOgImagePath) {
+      throw new Error(
+        `${path} og:image was ${ogImage}, expected ${expectedOgImagePath}`
+      );
+    }
+  }
+  const twitterImage = html.match(
+    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["'][^>]*>/i
+  )?.[1];
+  if (!twitterImage) {
+    throw new Error(`${path} missing twitter:image meta tag`);
+  }
+  if (expectedOgImagePath) {
+    const normalized = twitterImage.startsWith('http')
+      ? new URL(twitterImage).pathname
+      : twitterImage;
+    if (normalized !== expectedOgImagePath) {
+      throw new Error(
+        `${path} twitter:image was ${twitterImage}, expected ${expectedOgImagePath}`
+      );
+    }
+  }
+  const ogTitle = html.match(
+    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i
+  )?.[1];
+  if (!ogTitle) {
+    throw new Error(`${path} missing og:title meta tag`);
+  }
+  const ogDescription = html.match(
+    /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["'][^>]*>/i
+  )?.[1];
+  if (!ogDescription) {
+    throw new Error(`${path} missing og:description meta tag`);
+  }
+};
+
+/**
+ * The unprefixed world routes must serve the current version (no " · v4"
+ * title marker, indexable) and the /v4 routes the maintenance version
+ * (" · v4" marker, noindex). Guards against the version passed by the route
+ * files drifting out of sync with the version semantics in
+ * components/worlds/world-detail-page.tsx.
+ */
+const assertWorldVersionMarkers = async (path, { maintenance }) => {
+  const res = await fetchWithTrustedSources(`${BASE_URL}${path}`);
+  if (!res.ok) {
+    throw new Error(`${path} returned ${res.status}`);
+  }
+  const html = await res.text();
+  const title = html.match(/<title>([^<]*)<\/title>/i)?.[1] ?? '';
+  const hasV4Marker = title.includes('· v4');
+  if (maintenance && !hasV4Marker) {
+    throw new Error(`${path} title was "${title}", expected a " · v4" marker`);
+  }
+  if (!maintenance && hasV4Marker) {
+    throw new Error(
+      `${path} title was "${title}", expected the current version (no " · v4" marker)`
+    );
+  }
+  const hasNoindex =
+    /<meta[^>]+name=["']robots["'][^>]+content=["'][^"']*noindex/i.test(html);
+  if (maintenance && !hasNoindex) {
+    throw new Error(`${path} is missing the robots noindex meta tag`);
+  }
+  if (!maintenance && hasNoindex) {
+    throw new Error(`${path} is unexpectedly noindexed`);
+  }
+};
+
+/**
+ * Community worlds have no versioned content; their canonical page must serve
+ * directly. A version mismatch in the world routes turns them into
+ * self-redirect loops, so assert a plain 200 with no redirect.
+ */
+const assertServesDirectly = async (path) => {
+  const res = await fetchWithTrustedSources(`${BASE_URL}${path}`, {
+    redirect: 'manual',
+  });
+  if (res.status !== 200) {
+    const location = res.headers.get('location');
+    throw new Error(
+      `${path} returned ${res.status}${location ? ` -> ${location}` : ''}`
+    );
+  }
+};
+
+const assertTextResponse = async (
+  path,
+  contentType,
+  expectedText,
+  headers = {}
+) => {
+  const res = await fetchWithTrustedSources(`${BASE_URL}${path}`, { headers });
+  if (!res.ok) {
+    throw new Error(`${path} returned ${res.status}`);
+  }
+  const actualContentType = res.headers.get('content-type') || '';
+  if (!actualContentType.includes(contentType)) {
+    throw new Error(`${path} content-type was ${actualContentType}`);
+  }
+  const text = await res.text();
+  if (!text.includes(expectedText)) {
+    throw new Error(`${path} did not contain ${JSON.stringify(expectedText)}`);
+  }
+};
+
+const assertChangelogData = async () => {
+  const path = '/changelog/data/2';
+  const res = await fetchWithTrustedSources(`${BASE_URL}${path}`);
+  if (!res.ok) {
+    throw new Error(`${path} returned ${res.status}`);
+  }
+  const result = await res.json();
+  if (!Array.isArray(result.entries) || result.entries.length === 0) {
+    throw new Error(`${path} did not return changelog entries`);
+  }
+  if (
+    !Number.isInteger(result.total) ||
+    result.total <= result.entries.length
+  ) {
+    throw new Error(`${path} returned an invalid changelog total`);
+  }
+};
+
+const checks = [
+  {
+    name: 'Deployment protection',
+    run: () => assertNoProtection('/og'),
+  },
+  {
+    name: 'OG default image',
+    run: () => assertPngResponse('/og'),
+  },
+  {
+    name: 'HTML meta - docs root',
+    run: () => assertHtmlMeta('/docs', '/og/getting-started/image.png'),
+  },
+  {
+    name: 'HTML meta - docs idempotency',
+    run: () =>
+      assertHtmlMeta(
+        '/docs/foundations/idempotency',
+        '/og/foundations/idempotency/image.png'
+      ),
+  },
+  {
+    name: 'HTML meta - cookbook sequential & parallel',
+    run: () =>
+      assertHtmlMeta(
+        '/cookbook/common-patterns/sequential-and-parallel',
+        '/og/cookbook/common-patterns/sequential-and-parallel/image.png'
+      ),
+  },
+  {
+    name: 'HTML meta - docs get-writable',
+    run: () =>
+      assertHtmlMeta(
+        '/docs/api-reference/workflow/get-writable',
+        '/og/api-reference/workflow/get-writable/image.png'
+      ),
+  },
+  {
+    name: 'HTML meta - worlds index',
+    run: () => assertHtmlMeta('/worlds', '/og/worlds'),
+  },
+  {
+    name: 'HTML meta - world local',
+    run: () => assertHtmlMeta('/worlds/local', '/og/worlds/local'),
+  },
+  {
+    name: 'HTML meta - world postgres',
+    run: () => assertHtmlMeta('/worlds/postgres', '/og/worlds/postgres'),
+  },
+  {
+    name: 'HTML meta - world vercel',
+    run: () => assertHtmlMeta('/worlds/vercel', '/og/worlds/vercel'),
+  },
+  {
+    name: 'HTML meta - worlds building-a-world',
+    run: () => assertHtmlMeta('/worlds/building-a-world', '/og/worlds'),
+  },
+  {
+    name: 'HTML meta - worlds upgrading-to-v5',
+    run: () => assertHtmlMeta('/worlds/upgrading-to-v5', '/og/worlds'),
+  },
+  {
+    name: 'HTML meta - world vercel (v4)',
+    run: () => assertHtmlMeta('/v4/worlds/vercel', '/og/worlds/vercel'),
+  },
+  {
+    name: 'World version markers - vercel (current)',
+    run: () =>
+      assertWorldVersionMarkers('/worlds/vercel', { maintenance: false }),
+  },
+  {
+    name: 'World version markers - vercel (v4)',
+    run: () =>
+      assertWorldVersionMarkers('/v4/worlds/vercel', { maintenance: true }),
+  },
+  {
+    name: 'Community world serves directly - turso',
+    run: () => assertServesDirectly('/worlds/turso'),
+  },
+  {
+    name: 'Changelog HTML',
+    run: () =>
+      assertTextResponse('/changelog', 'text/html', 'Workflow SDK Changelog'),
+  },
+  {
+    name: 'Changelog Markdown',
+    run: () =>
+      assertTextResponse(
+        '/changelog.md',
+        'text/markdown',
+        '# Workflow SDK Changelog'
+      ),
+  },
+  {
+    name: 'Changelog paginated HTML',
+    run: () => assertTextResponse('/changelog/page/2', 'text/html', 'Page 2'),
+  },
+  {
+    name: 'Changelog paginated Markdown negotiation',
+    run: () =>
+      assertTextResponse(
+        '/changelog/page/2',
+        'text/markdown',
+        '# Workflow SDK Changelog - Page 2',
+        { Accept: 'text/markdown' }
+      ),
+  },
+  {
+    name: 'Changelog pagination data',
+    run: assertChangelogData,
+  },
+  {
+    name: 'WebMCP discovery',
+    run: () =>
+      assertTextResponse(
+        '/api/mcp?webmcp-script',
+        'text/javascript',
+        'search_docs'
+      ),
+  },
+  {
+    name: 'OG docs page image',
+    run: () => assertPngResponse('/og/foundations/idempotency/image.png'),
+  },
+  {
+    name: 'OG docs root image',
+    run: () => assertPngResponse('/og/getting-started/image.png'),
+  },
+  {
+    name: 'OG cookbook common-patterns image',
+    run: () =>
+      assertPngResponse(
+        '/og/cookbook/common-patterns/sequential-and-parallel/image.png'
+      ),
+  },
+  {
+    name: 'OG docs reference image',
+    run: () =>
+      assertPngResponse('/og/api-reference/workflow/get-writable/image.png'),
+  },
+  {
+    name: 'OG worlds index image',
+    run: () => assertPngResponse('/og/worlds'),
+  },
+  {
+    name: 'OG world image (local)',
+    run: () => assertPngResponse('/og/worlds/local'),
+  },
+  {
+    name: 'OG world image (postgres)',
+    run: () => assertPngResponse('/og/worlds/postgres'),
+  },
+  {
+    name: 'OG world image (vercel)',
+    run: () => assertPngResponse('/og/worlds/vercel'),
+  },
+  {
+    name: 'Sitemap',
+    run: () => assertXmlResponse('/sitemap.xml'),
+  },
+];
+
+const assertXmlResponse = async (path) => {
+  const res = await fetchWithTrustedSources(`${BASE_URL}${path}`);
+  if (!res.ok) {
+    throw new Error(`${path} returned ${res.status}`);
+  }
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('xml') && !contentType.includes('text/plain')) {
+    throw new Error(`${path} content-type was ${contentType}`);
+  }
+  const text = await res.text();
+  if (!text.includes('<?xml')) {
+    throw new Error(`${path} did not contain xml declaration`);
+  }
+};
+
+const run = async () => {
+  let child = null;
+  let stopServer = async () => {};
+  let cleanup = async () => {};
+
+  if (!USE_REMOTE) {
+    child = spawn(process.execPath, [NEXT_CLI, 'start'], {
+      cwd: DOCS_DIR,
+      detached: process.platform !== 'win32',
+      env: {
+        ...process.env,
+        PORT,
+        HOSTNAME: HOST,
+      },
+      stdio: 'inherit',
+    });
+
+    let shuttingDown = false;
+    stopServer = async () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      const hasExited = () =>
+        child.exitCode !== null || child.signalCode !== null;
+      const kill = (signal) => {
+        if (hasExited()) return;
+        try {
+          if (process.platform === 'win32') {
+            child.kill(signal);
+          } else {
+            process.kill(-child.pid, signal);
+          }
+        } catch (error) {
+          // The process group already exited; nothing left to stop.
+          if (error?.code !== 'ESRCH') throw error;
+        }
+      };
+      if (hasExited()) return;
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      kill('SIGTERM');
+      await Promise.race([exited, wait(5_000)]);
+      kill('SIGKILL');
+    };
+
+    cleanup = async () => {
+      try {
+        await stopServer();
+      } catch {
+        // ignore cleanup errors
+      }
+    };
+
+    process.on('SIGINT', cleanup);
+    process.on('SIGTERM', cleanup);
+    process.on('exit', cleanup);
+  }
+
+  try {
+    await waitForServer(`${BASE_URL}/og`);
+    for (const check of checks) {
+      console.log(`Running docs smoke check: ${check.name}`);
+      await check.run();
+    }
+    await stopServer();
+  } catch (error) {
+    await stopServer();
+    throw error;
+  }
+};
+
+run().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

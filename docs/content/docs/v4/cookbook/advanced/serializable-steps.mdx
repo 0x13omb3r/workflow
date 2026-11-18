@@ -1,0 +1,126 @@
+---
+title: Serializable Steps
+description: Wrap non-serializable third-party objects, including AI provider models and cloud clients, inside step factory functions.
+type: guide
+summary: Defer construction of non-owned AI provider models and cloud SDK clients until step execution so they remain usable in durable workflows.
+related:
+  - /docs/foundations/serialization
+  - /docs/foundations/serialization#custom-class-serialization
+  - /docs/foundations/workflows-and-steps#step-functions
+---
+
+<CopyPrompt
+  text="Make this non-serializable dependency usable inside a durable workflow with the step-as-factory pattern. Instead of passing an AI provider model, cloud SDK client, or other class instance into the workflow, export a factory that returns an async callback marked with &quot;use step&quot;. Capture only serializable constructor options, construct the provider or client inside the step, and keep the instance inside that step's execution. Verify the workflow builds, replays deterministically, and never serializes the live dependency."
+/>
+
+<Callout>
+This is an advanced guide. It dives into workflow internals and is not required reading to use workflow.
+</Callout>
+
+## When to use this pattern
+
+Workflow functions run inside a sandboxed VM where every value that crosses a function boundary must be serializable. There are two ways to get a non-serializable object across that boundary, depending on whether you own the class:
+
+- **You own the class**: implement the [`WORKFLOW_SERIALIZE` / `WORKFLOW_DESERIALIZE` protocol](/docs/foundations/serialization#custom-class-serialization). The instance becomes a first-class serializable value: you can pass it as a workflow input, return it from a step, and call `"use step"` instance methods on it directly. This is the right tool when the class is yours to modify.
+- **You don't own the class**: you can't add serialization methods to `openai("gpt-5.6-sol")` from `@ai-sdk/openai` or `new S3Client({...})` from `@aws-sdk/client-s3`. Instead, wrap construction and use in a `"use step"` factory function. That's what this page covers.
+
+## The problem
+
+AI SDK provider models and cloud SDK clients often contain methods, closures, sockets, and internal state. Passing one across a workflow boundary causes a serialization error, and you can't add `WORKFLOW_SERIALIZE` to a class you don't own.
+
+```typescript lineNumbers
+import { S3Client } from "@aws-sdk/client-s3";
+
+async function uploadFile(client: S3Client, key: string) {
+  "use step";
+  // ... upload with client ...
+}
+
+export async function brokenUpload(region: string, key: string) {
+  "use workflow";
+
+  const client = new S3Client({ region });
+  await uploadFile(client, key); // Fails: S3Client is not serializable
+}
+```
+
+## The solution: step-as-factory
+
+Apply the same pattern to any non-serializable dependency. The key rule: **the outer function captures serializable arguments, and the inner `"use step"` function constructs the real object at runtime**.
+
+<Callout type="info">
+A plain Vercel AI Gateway model string such as `"spacexai/grok-4.6"` is already serializable and does not need a factory.
+</Callout>
+
+### AI provider example
+
+When using an AI SDK provider package, construct and use its model inside the step. The outer factory captures only the serializable model ID:
+
+```typescript lineNumbers
+import { openai } from "@ai-sdk/openai";
+import { generateText } from "ai";
+
+export function createOpenAIGenerator(modelId: string) {
+  return async (prompt: string) => {
+    "use step";
+    const { text } = await generateText({ model: openai(modelId), prompt });
+    return text;
+  };
+}
+
+export async function summarize(prompt: string) {
+  "use workflow";
+
+  const generate = createOpenAIGenerator("gpt-5.6-sol");
+  return generate(prompt);
+}
+```
+
+The same structure works with provider packages such as `@ai-sdk/anthropic` and `@ai-sdk/google`: capture serializable configuration in the outer function and keep the provider object inside the step.
+
+### Cloud client example
+
+```typescript lineNumbers
+import type { S3Client as S3ClientType } from "@aws-sdk/client-s3";
+
+// The region is a plain string, which is serializable
+export function createS3Client(region: string) {
+  return async (): Promise<S3ClientType> => {
+    "use step";
+    const { S3Client } = await import("@aws-sdk/client-s3");
+    return new S3Client({ region });
+  };
+}
+
+// Usage in a workflow
+export async function processUpload(region: string, key: string) {
+  "use workflow";
+
+  const getClient = createS3Client(region); // [!code highlight]
+  // getClient is a serializable step reference, not an S3Client
+  await uploadFile(getClient, key);
+}
+
+async function uploadFile(
+  getClient: () => Promise<S3ClientType>,
+  key: string
+) {
+  "use step";
+  const client = await getClient(); // [!code highlight]
+  // Now you have a real S3Client with full Node.js access
+  await client.send(/* ... */);
+}
+```
+
+## Why this works
+
+1. **Compiler transformation**: `"use step"` tells the SWC plugin to extract the function into a separate bundle. The workflow VM only sees a serializable reference (function ID and captured arguments).
+2. **Closure tracking**: The compiler tracks which variables the step function closes over. The function can capture only serializable values, such as strings, numbers, and plain objects.
+3. **Deferred construction**: The step constructs the provider or client only when it executes in the Node.js runtime, never in the sandboxed workflow VM.
+
+## Key APIs
+
+- [`"use step"`](/docs/foundations/workflows-and-steps#step-functions): Marks a function for extraction and serialization.
+- [`"use workflow"`](/docs/foundations/workflows-and-steps#workflow-functions): Declares the orchestrator function.
+- [AI SDK providers](https://ai-sdk.dev/providers/ai-sdk-providers): Lists direct provider packages and configuration.
+- [Custom class serialization](/docs/foundations/serialization#custom-class-serialization): Provides the companion pattern for classes you own (`WORKFLOW_SERIALIZE` and `WORKFLOW_DESERIALIZE`).

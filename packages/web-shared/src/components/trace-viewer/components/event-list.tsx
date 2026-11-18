@@ -1,0 +1,174 @@
+import { Circle } from 'lucide-react';
+import { useRef } from 'react';
+import { cn } from '../../../lib/cn';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../../ui/tooltip';
+import {
+  SleepIcon,
+  StepForwardIcon,
+  WebhookIcon,
+  WorkflowIcon,
+} from '../icons';
+import { isSpanDimmedBySearch, type SpanSearchResult } from '../search';
+import type { Span } from '../types';
+import { formatDurationPrecise } from '../util/timing';
+import { getSpanDurationMs, isSpanCancelled, isSpanErrored } from '../utils';
+import { MiddleTruncate } from './middle-truncate/middle-truncate';
+import { ROW_HEIGHT_PX, useRowWindow } from './use-row-window';
+
+interface EventStyle {
+  icon: React.ComponentType<{ className?: string }>;
+  className: string;
+  label: string;
+}
+
+const eventStyles: Record<string, EventStyle> = {
+  run: { icon: WorkflowIcon, className: 'text-blue-900', label: 'Workflow' },
+  step: { icon: StepForwardIcon, className: 'text-green-900', label: 'Step' },
+  hook: { icon: WebhookIcon, className: 'text-gray-900', label: 'Hook' },
+  sleep: { icon: SleepIcon, className: 'text-gray-900', label: 'Sleep' },
+};
+
+const defaultStyle: EventStyle = {
+  icon: Circle,
+  className: 'text-gray-900',
+  label: 'Event',
+};
+
+const ROW_HEIGHT_CLASS = 'h-10';
+
+function getEventStyle(
+  resource: string,
+  isErrored: boolean,
+  isCancelled: boolean
+): EventStyle {
+  const style = eventStyles[resource] ?? defaultStyle;
+  return {
+    icon: style.icon,
+    className: cn(
+      isErrored
+        ? 'text-red-900'
+        : isCancelled
+          ? 'text-gray-900'
+          : style.className
+    ),
+    label: style.label,
+  };
+}
+
+/**
+ * The colored type icon (workflow, step, hook, sleep) with its tooltip. Shared
+ * by the Trace span list and the Events tab so both mark entities the same way.
+ */
+export function ResourceIcon({
+  resource,
+  isErrored = false,
+  isCancelled = false,
+}: {
+  resource: string;
+  isErrored?: boolean;
+  isCancelled?: boolean;
+}) {
+  const {
+    icon: Icon,
+    className,
+    label,
+  } = getEventStyle(resource, isErrored, isCancelled);
+  return (
+    <Tooltip delayDuration={500}>
+      <TooltipTrigger asChild>
+        <span className={cn('shrink-0', className)}>
+          <Icon className="w-4 h-4" />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+const EventRow = ({
+  span,
+  isSelected,
+  isDimmed,
+  onSelectSpan,
+}: {
+  span: Span;
+  isSelected: boolean;
+  isDimmed?: boolean;
+  onSelectSpan: (spanId: string) => void;
+}) => {
+  const durationMs = getSpanDurationMs(span);
+  const isErrored = isSpanErrored(span);
+  const isCancelled = isSpanCancelled(span);
+  return (
+    <li
+      className={cn(
+        'relative overflow-clip transition-opacity hover:bg-gray-100 aria-selected:bg-gray-100 aria-selected:hover:bg-gray-200',
+        ROW_HEIGHT_CLASS,
+        isDimmed && 'opacity-35'
+      )}
+      role="treeitem"
+      aria-selected={isSelected}
+      aria-expanded={isSelected}
+      aria-level={1}
+      onClick={() => onSelectSpan(span.spanId)}
+    >
+      <div className="flex h-full min-w-0 items-center pl-4 pr-2">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <ResourceIcon
+            resource={span.resource}
+            isErrored={isErrored}
+            isCancelled={isCancelled}
+          />
+          <span className="min-w-0 text-label-14">
+            <MiddleTruncate value={span.name} />
+          </span>
+        </div>
+        <div className="ml-2 shrink-0">
+          <span className="text-label-14 text-gray-900 tabular-nums">
+            {formatDurationPrecise(durationMs)}
+          </span>
+        </div>
+      </div>
+    </li>
+  );
+};
+
+const EventList = ({
+  spans,
+  activeSpanId,
+  searchResult,
+  onSelectSpan,
+}: {
+  spans: Span[];
+  activeSpanId: string | null;
+  searchResult: SpanSearchResult;
+  onSelectSpan: (spanId: string) => void;
+}) => {
+  const listRef = useRef<HTMLUListElement>(null);
+  const { start, end } = useRowWindow(listRef, spans.length, ROW_HEIGHT_PX);
+
+  return (
+    <ul
+      ref={listRef}
+      id="event-list"
+      role="tree"
+      className="block min-h-0 overflow-visible divide-y divide-gray-400 border-b border-gray-400"
+      style={{
+        paddingTop: start * ROW_HEIGHT_PX,
+        paddingBottom: (spans.length - end) * ROW_HEIGHT_PX,
+      }}
+    >
+      {spans.slice(start, end).map((span) => (
+        <EventRow
+          key={span.spanId}
+          span={span}
+          isSelected={span.spanId === activeSpanId}
+          isDimmed={isSpanDimmedBySearch(span.spanId, searchResult)}
+          onSelectSpan={onSelectSpan}
+        />
+      ))}
+    </ul>
+  );
+};
+
+export default EventList;

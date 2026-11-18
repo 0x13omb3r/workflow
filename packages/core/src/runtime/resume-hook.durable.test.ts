@@ -1,0 +1,894 @@
+import {
+  EntityConflictError,
+  HookNotFoundError,
+  RunExpiredError,
+  WorkflowRuntimeError,
+  WorkflowWorldError,
+} from '@workflow/errors';
+import {
+  HOOK_RESUME_DEDUP_VERSION,
+  type Hook,
+  SPEC_VERSION_SINGLE_ORCHESTRATOR,
+  type World,
+} from '@workflow/world';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { resumeHook, resumeWebhook } from './resume-hook.js';
+import { setWorld } from './world.js';
+
+vi.mock('@vercel/functions', () => ({ waitUntil: vi.fn() }));
+const telemetrySpan = vi.hoisted(() => ({
+  setAttributes: vi.fn(),
+  addLink: vi.fn(),
+}));
+vi.mock('../telemetry.js', () => ({
+  linkToTraceCarrier: vi.fn(),
+  trace: vi.fn((_name, fn) => fn(telemetrySpan)),
+}));
+
+const PAYLOAD_BYTES = new Uint8Array([1, 2, 3, 4]);
+vi.mock('../serialization.js', async (importActual) => {
+  const actual = await importActual<typeof import('../serialization.js')>();
+  return {
+    ...actual,
+    dehydrateStepReturnValue: vi.fn(
+      async (
+        value: unknown,
+        _runId: string,
+        _key: unknown,
+        ops: Promise<unknown>[] = [],
+        _global?: unknown,
+        _v1Compat?: boolean,
+        _framedByteStreams?: boolean,
+        _compression?: boolean,
+        _runReadyBarrier?: Promise<unknown>,
+        readbackOps: Promise<unknown>[] = ops
+      ) => {
+        if (
+          typeof value === 'object' &&
+          value !== null &&
+          'payloadOpRejection' in value
+        ) {
+          ops.push(
+            Promise.reject(
+              (value as { payloadOpRejection: unknown }).payloadOpRejection
+            )
+          );
+        }
+        // A producer-push upload op: the durability flush must await it
+        // before the hook_received write commits.
+        if (
+          typeof value === 'object' &&
+          value !== null &&
+          'payloadOp' in value
+        ) {
+          ops.push((value as { payloadOp: Promise<unknown> }).payloadOp);
+        }
+        // A workflow readback pipe (e.g. a manual webhook's response
+        // writable): it only settles once the woken workflow writes into it,
+        // so the flush must background it, never await it.
+        if (
+          typeof value === 'object' &&
+          value !== null &&
+          'payloadReadbackOp' in value
+        ) {
+          readbackOps.push(
+            (value as { payloadReadbackOp: Promise<unknown> }).payloadReadbackOp
+          );
+        }
+        return PAYLOAD_BYTES;
+      }
+    ),
+    hydrateStepArguments: vi.fn(async (value: unknown) => value),
+  };
+});
+
+describe('resumeHook durable resume', () => {
+  afterEach(() => {
+    setWorld(undefined);
+    vi.clearAllMocks();
+  });
+
+  const baseHook = {
+    runId: 'wrun_resume',
+    hookId: 'hook_resume',
+    token: 'order:resume',
+    ownerId: 'owner_1',
+    projectId: 'project_1',
+    environment: 'production',
+    createdAt: new Date(),
+    specVersion: SPEC_VERSION_SINGLE_ORCHESTRATOR,
+  } satisfies Hook;
+
+  const currentContext = {
+    deploymentId: 'deployment_resume',
+    workflowName: 'processOrder',
+    runSpecVersion: SPEC_VERSION_SINGLE_ORCHESTRATOR,
+    workflowCoreVersion: '5.0.0',
+  };
+
+  const makeWorld = (
+    hook: Hook,
+    overrides: {
+      createEvent?: ReturnType<typeof vi.fn>;
+      queue?: ReturnType<typeof vi.fn>;
+      getByToken?: ReturnType<typeof vi.fn>;
+      invoke?: ReturnType<typeof vi.fn>;
+    } = {},
+    capabilities: World['capabilities'] = { hookResumeDedup: true }
+  ) => {
+    const createEvent = overrides.createEvent ?? vi.fn();
+    const queue = overrides.queue ?? vi.fn();
+    const getByToken = overrides.getByToken ?? vi.fn().mockResolvedValue(hook);
+    setWorld({
+      specVersion: SPEC_VERSION_SINGLE_ORCHESTRATOR,
+      capabilities,
+      hooks: { getByToken },
+      runs: { get: vi.fn() },
+      events: { create: createEvent },
+      getEncryptionKeyForRun: vi.fn().mockResolvedValue(undefined),
+      queue,
+      invoke: overrides.invoke,
+    } as unknown as World);
+    return { createEvent, queue, getByToken };
+  };
+
+  it('durably writes hook_received, then publishes a payload-less wake', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const { createEvent, queue } = makeWorld(hook);
+
+    await expect(resumeHook(hook.token, { foo: 'bar' })).resolves.toMatchObject(
+      {
+        hookId: hook.hookId,
+      }
+    );
+
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [, event, params] = createEvent.mock.calls[0];
+    expect(event).toMatchObject({
+      eventType: 'hook_received',
+      correlationId: hook.hookId,
+      eventData: { token: hook.token, payload: PAYLOAD_BYTES },
+    });
+    expect(params).toMatchObject({
+      resumeId: expect.any(String),
+      resumePayloadDigest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+
+    expect(queue).toHaveBeenCalledTimes(1);
+    const [, wake, wakeOptions] = queue.mock.calls[0];
+    // The wake is a plain trigger: the payload lives in the event log, so
+    // nothing rides on the queue message but the runId (+ timing metadata).
+    expect(wake.runId).toBe(hook.runId);
+    expect(wake.hookInput).toBeUndefined();
+    expect(wake.hookResume).toBeUndefined();
+    expect(wake.hookResumeTiming.strategy).toBe('sequential');
+    // A wake carries no idempotency key: a duplicate costs a cheap
+    // delivery, a key could be absorbed and lose the wakeup.
+    expect(wakeOptions.idempotencyKey).toBeUndefined();
+
+    const attributes = Object.assign(
+      {},
+      ...telemetrySpan.setAttributes.mock.calls.map(([value]) => value)
+    );
+    expect(attributes['workflow.hook.resume_strategy']).toBe('sequential');
+  });
+
+  it("stamps hook_received with the run's spec version when it is older", async () => {
+    // The runtime executing the run reads this event; one built against a
+    // lower spec version (an older deployment, or another SDK) rejects an
+    // event stamped above what it supports.
+    const hook = {
+      ...baseHook,
+      resumeContext: { ...currentContext, runSpecVersion: 2 },
+    } satisfies Hook;
+    const { createEvent } = makeWorld(hook);
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    expect(createEvent.mock.calls[0][1]).toMatchObject({
+      eventType: 'hook_received',
+      specVersion: 2,
+    });
+  });
+
+  it("stamps hook_received with this SDK's spec version for a current run", async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const { createEvent } = makeWorld(hook);
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    expect(createEvent.mock.calls[0][1]).toMatchObject({
+      specVersion: SPEC_VERSION_SINGLE_ORCHESTRATOR,
+    });
+  });
+
+  it("names a spec 9 run's workflow on hook_received, on the ordinary route", async () => {
+    // The backend keys the payload ref by workflow name; without it, it reads
+    // the run stamp for the name before the write path reads it again.
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const { createEvent } = makeWorld(hook);
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    const [runId, event, params] = createEvent.mock.calls[0];
+    expect(runId).toBe(hook.runId);
+    expect(event).toEqual({
+      eventType: 'hook_received',
+      specVersion: SPEC_VERSION_SINGLE_ORCHESTRATOR,
+      correlationId: hook.hookId,
+      eventData: {
+        token: hook.token,
+        workflowName: currentContext.workflowName,
+        payload: PAYLOAD_BYTES,
+      },
+    });
+    // Same route as before: a by-token resume is not a resolved delivery.
+    expect(params.requireHookResumeDedup).toBeUndefined();
+    expect(params).toMatchObject({ inBand: false, v1Compat: false });
+  });
+
+  it('names the workflow on a cached-handle resolved delivery too', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const { createEvent, getByToken } = makeWorld(hook, undefined, {
+      resolvedHookResume: true,
+    });
+
+    await resumeHook(hook, { foo: 'bar' });
+
+    expect(getByToken).not.toHaveBeenCalled();
+    const [, event, params] = createEvent.mock.calls[0];
+    expect(params.requireHookResumeDedup).toBe(true);
+    expect(event.eventData.workflowName).toBe(currentContext.workflowName);
+  });
+
+  it.each([
+    ['spec 8', 8],
+    ['spec 2', 2],
+  ])('leaves the workflow name off a %s run', async (_label, runSpecVersion) => {
+    const hook = {
+      ...baseHook,
+      specVersion: runSpecVersion,
+      resumeContext: { ...currentContext, runSpecVersion },
+    } satisfies Hook;
+    const { createEvent } = makeWorld(hook);
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    const [, event] = createEvent.mock.calls[0];
+    expect(event.eventData).toEqual({
+      token: hook.token,
+      payload: PAYLOAD_BYTES,
+    });
+  });
+
+  it('uses invoke only when advertised and leaves event persistence to the executor', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext };
+    const invoke = vi.fn().mockResolvedValue({ status: 'accepted' });
+    const { createEvent, queue } = makeWorld(
+      hook,
+      { invoke },
+      { invoke: true }
+    );
+    await expect(resumeHook(hook.token, { value: 1 })).resolves.toMatchObject({
+      hookId: hook.hookId,
+    });
+    expect(invoke).toHaveBeenCalledWith(
+      hook.runId,
+      {
+        type: 'hook_resume',
+        version: 1,
+        hookId: hook.hookId,
+        token: hook.token,
+        payload: PAYLOAD_BYTES,
+      },
+      { idempotencyKey: expect.any(String) }
+    );
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('keeps the old path when invoke exists but the capability is false', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext };
+    const invoke = vi.fn();
+    const { createEvent, queue } = makeWorld(
+      hook,
+      { invoke },
+      { invoke: false }
+    );
+    await resumeHook(hook.token, {});
+    expect(invoke).not.toHaveBeenCalled();
+    expect(createEvent).toHaveBeenCalledOnce();
+    expect(queue).toHaveBeenCalledOnce();
+  });
+
+  it('does not bypass executor rejection or an ambiguous invoke failure', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext };
+    const invoke = vi
+      .fn()
+      .mockResolvedValue({ status: 'rejected', code: 'HOOK_NOT_FOUND' });
+    const { createEvent, queue } = makeWorld(
+      hook,
+      { invoke },
+      { invoke: true }
+    );
+    await expect(resumeHook(hook.token, {})).rejects.toSatisfy(
+      HookNotFoundError.is
+    );
+    const failure = new Error('response lost');
+    invoke.mockRejectedValueOnce(failure);
+    await expect(resumeHook(hook.token, {})).rejects.toBe(failure);
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('awaits payload uploads before invoke without awaiting response readback', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext };
+    const invoke = vi.fn().mockResolvedValue({ status: 'accepted' });
+    makeWorld(hook, { invoke }, { invoke: true });
+    let finishUpload!: () => void;
+    let finishReadback!: () => void;
+    const sent = resumeHook(hook.token, {
+      payloadOp: new Promise<void>((resolve) => {
+        finishUpload = resolve;
+      }),
+      payloadReadbackOp: new Promise<void>((resolve) => {
+        finishReadback = resolve;
+      }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(invoke).not.toHaveBeenCalled();
+    finishUpload();
+    await sent;
+    expect(invoke).toHaveBeenCalledOnce();
+    finishReadback();
+  });
+
+  it('rejects an inconsistent invoke capability instead of falling back', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext };
+    const { createEvent, queue } = makeWorld(hook, {}, { invoke: true });
+    await expect(resumeHook(hook.token, {})).rejects.toThrow(
+      'without implementing'
+    );
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('opens the resumeHook timing window at public entry', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const { queue } = makeWorld(hook);
+    const before = Date.now();
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    const after = Date.now();
+    const timing = queue.mock.calls[0][1].hookResumeTiming;
+    expect(timing.resumeRequestedAtMs).toBeGreaterThanOrEqual(before);
+    expect(timing.queuePublishRequestedAtMs).toBeGreaterThanOrEqual(
+      timing.resumeRequestedAtMs
+    );
+    expect(timing.queuePublishRequestedAtMs).toBeLessThanOrEqual(after);
+  });
+
+  it('publishes the wake only after the durable write has resolved', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    let finishWrite!: () => void;
+    const createEvent = vi.fn(
+      () => new Promise<void>((resolve) => (finishWrite = resolve))
+    );
+    const queue = vi.fn();
+    makeWorld(hook, { createEvent, queue });
+
+    let resolved = false;
+    const resume = resumeHook(hook.token, { foo: 'bar' }).then(() => {
+      resolved = true;
+    });
+    await vi.waitFor(() => {
+      expect(createEvent).toHaveBeenCalledTimes(1);
+    });
+    // Write still pending: no wake, no resolution.
+    expect(queue).not.toHaveBeenCalled();
+    expect(resolved).toBe(false);
+
+    finishWrite();
+    await resume;
+    expect(queue).toHaveBeenCalledTimes(1);
+    expect(resolved).toBe(true);
+  });
+
+  it('mints a distinct claim for each resume of a reusable hook', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const { createEvent } = makeWorld(hook);
+
+    await resumeHook(hook.token, { foo: 'one' });
+    await resumeHook(hook.token, { foo: 'two' });
+
+    expect(createEvent.mock.calls[0][2].resumeId).not.toBe(
+      createEvent.mock.calls[1][2].resumeId
+    );
+  });
+
+  it('awaits producer uploads before writing or waking', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const upload = Promise.withResolvers<void>();
+    const { createEvent, queue } = makeWorld(hook);
+
+    const resume = resumeHook(hook.token, { payloadOp: upload.promise });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(queue).not.toHaveBeenCalled();
+
+    upload.resolve();
+    await resume;
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(queue).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not await workflow readback pipes before writing and waking', async () => {
+    // The regression this pins: a manual webhook's `responseWritable`
+    // dehydrates into a server-stream reader that only settles once the woken
+    // workflow writes the response. Awaiting it ahead of the wake deadlocks
+    // the resume against its own wake.
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const readback = new Promise<void>(() => {});
+    const { createEvent, queue } = makeWorld(hook);
+
+    await expect(
+      resumeHook(hook.token, { payloadReadbackOp: readback })
+    ).resolves.toBeDefined();
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(queue).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves the webhook bundle tolerance for undefined payload-op rejections', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const { createEvent, queue } = makeWorld(hook);
+
+    await expect(
+      resumeHook(hook.token, { payloadOpRejection: undefined })
+    ).resolves.toBeDefined();
+
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(queue).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces non-undefined payload-op rejections before writing or waking', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const payloadError = new Error('payload upload failed');
+    const { createEvent, queue } = makeWorld(hook);
+
+    await expect(
+      resumeHook(hook.token, { payloadOpRejection: payloadError })
+    ).rejects.toBe(payloadError);
+
+    expect(createEvent).not.toHaveBeenCalled();
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('does not publish a wake when the durable write rejects a disposed or ended hook', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const createEvent = vi
+      .fn()
+      .mockRejectedValue(new RunExpiredError('run has expired'));
+    const { queue } = makeWorld(hook, { createEvent });
+
+    await expect(resumeHook(hook.token, { foo: 'bar' })).rejects.toSatisfy(
+      (error: unknown) =>
+        HookNotFoundError.is(error) &&
+        (error as HookNotFoundError).token === hook.token
+    );
+    // Nothing was committed, so nothing may be dispatched.
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('passes a transient write conflict (409) through as retryable, not HookNotFound', async () => {
+    // Every 409 the backend emits on this write today is transient (an
+    // event-slot conflict past the server's internal retry budget, or a
+    // resume-claim race mid-resolution) and its transaction committed
+    // nothing. Re-keying it to HookNotFoundError told the caller a retryable
+    // failure was permanent — a webhook route would answer 404 and the
+    // sender would drop the resume.
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const conflict = new EntityConflictError('event slot is already taken');
+    const createEvent = vi.fn().mockRejectedValue(conflict);
+    const { queue } = makeWorld(hook, { createEvent });
+
+    await expect(resumeHook(hook.token, { foo: 'bar' })).rejects.toBe(conflict);
+    expect(HookNotFoundError.is(conflict)).toBe(false);
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('passes a resumeId-reuse rejection through unmapped', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const reuseError = Object.assign(
+      new Error('resumeId reused with a different payload'),
+      { status: 422, code: 'hook-resume-id-reuse' }
+    );
+    const createEvent = vi.fn().mockRejectedValue(reuseError);
+    const { queue } = makeWorld(hook, { createEvent });
+
+    await expect(resumeHook(hook.token, { foo: 'bar' })).rejects.toBe(
+      reuseError
+    );
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('retries the wake and resolves only after it is accepted', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const queue = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('first failure'))
+      .mockRejectedValueOnce(new Error('second failure'))
+      .mockResolvedValueOnce(undefined);
+    const { createEvent } = makeWorld(hook, { queue });
+
+    await expect(resumeHook(hook.token, { foo: 'bar' })).resolves.toBeDefined();
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(queue).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    // @vercel/queue errors carry no status field; they classify by name.
+    [
+      'a named queue 4xx',
+      Object.assign(new Error('bad request'), { name: 'BadRequestError' }),
+    ],
+    [
+      'a numeric-status 4xx',
+      Object.assign(new Error('bad request'), { status: 400 }),
+    ],
+  ])('does not spend the wake retry budget on %s', async (_name, badRequest) => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const queue = vi.fn().mockRejectedValue(badRequest);
+    makeWorld(hook, { queue });
+
+    await expect(resumeHook(hook.token, { foo: 'bar' })).rejects.toBe(
+      badRequest
+    );
+    expect(queue).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry the wake against an unavailable deployment', async () => {
+    // A deployment the queue cannot discover will not come back within the
+    // ~125ms retry budget; the World's own classifier decides.
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const discovery = Object.assign(new Error('no consumer'), {
+      name: 'ConsumerDiscoveryError',
+    });
+    const queue = vi.fn().mockRejectedValue(discovery);
+    const { getByToken } = makeWorld(hook, { queue });
+    setWorld({
+      specVersion: SPEC_VERSION_SINGLE_ORCHESTRATOR,
+      capabilities: { hookResumeDedup: true },
+      hooks: { getByToken },
+      runs: { get: vi.fn() },
+      events: { create: vi.fn() },
+      getEncryptionKeyForRun: vi.fn().mockResolvedValue(undefined),
+      queue,
+      isDeploymentUnavailableError: (error: unknown) =>
+        (error as Error)?.name === 'ConsumerDiscoveryError',
+    } as unknown as World);
+
+    await expect(resumeHook(hook.token, { foo: 'bar' })).rejects.toBe(
+      discovery
+    );
+    expect(queue).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a wake failure after the event has been made durable', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const queueError = new Error('queue unavailable');
+    const queue = vi.fn().mockRejectedValue(queueError);
+    const { createEvent } = makeWorld(hook, { queue });
+
+    await expect(resumeHook(hook.token, { foo: 'bar' })).rejects.toBe(
+      queueError
+    );
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(queue).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not report HookNotFound when only the wake failed', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const queue = vi.fn().mockRejectedValue(new HookNotFoundError('queue'));
+    const { createEvent } = makeWorld(hook, { queue });
+
+    const error = await resumeHook(hook.token, { foo: 'bar' }).catch(
+      (caught) => caught
+    );
+
+    expect(error).toBeInstanceOf(WorkflowRuntimeError);
+    expect(HookNotFoundError.is(error)).toBe(false);
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(queue).toHaveBeenCalledTimes(3);
+  });
+
+  it('attaches no idempotency claim when the backend does not attest dedup', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const { createEvent, queue } = makeWorld(
+      hook,
+      {},
+      { hookResumeDedup: false }
+    );
+
+    await resumeHook(hook.token, { foo: 'bar' });
+
+    const [, , params] = createEvent.mock.calls[0];
+    expect(params.resumeId).toBeUndefined();
+    expect(params.resumePayloadDigest).toBeUndefined();
+    expect(queue).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires a deduplicated endpoint when reusing a resolved hook', async () => {
+    const hook = {
+      ...baseHook,
+      resumeContext: currentContext,
+      resumeCapabilities: {
+        hookResumeDedupVersion: HOOK_RESUME_DEDUP_VERSION,
+      },
+    } satisfies Hook;
+    const first = makeWorld(hook, {}, {});
+
+    // Token string: the lookup is fresh, so the response-only attestation is
+    // trusted and the write carries the idempotency claim.
+    await resumeHook(hook.token, { foo: 'fresh' });
+    expect(first.createEvent.mock.calls[0][2].resumeId).toBeDefined();
+
+    for (const snapshot of [
+      hook,
+      { ...hook },
+      structuredClone(hook),
+      JSON.parse(JSON.stringify(hook)),
+    ]) {
+      const second = makeWorld(hook, {}, { resolvedHookResume: true });
+      await resumeHook(snapshot, { foo: 'cached' });
+      expect(second.getByToken).not.toHaveBeenCalled();
+      expect(second.createEvent.mock.calls[0][2]).toMatchObject({
+        inBand: false,
+        requireHookResumeDedup: true,
+        resumeId: expect.any(String),
+        resumePayloadDigest: expect.any(String),
+      });
+    }
+
+    // Custom Worlds that do not implement the guarded contract must never
+    // receive a retryable write based on cached capabilities alone.
+    const unsupported = makeWorld(hook, {}, { hookResumeDedup: false });
+    await resumeHook(hook, { foo: 'unsupported' });
+    expect(unsupported.createEvent.mock.calls[0][2].resumeId).toBeUndefined();
+    expect(
+      unsupported.createEvent.mock.calls[0][2].resumePayloadDigest
+    ).toBeUndefined();
+    expect(
+      unsupported.createEvent.mock.calls[0][2].requireHookResumeDedup
+    ).toBeUndefined();
+  });
+
+  it.each([
+    400, 404,
+  ])('falls back after a definite %s for the same live hook', async (status) => {
+    const hook = {
+      ...baseHook,
+      resumeContext: currentContext,
+      resumeCapabilities: { hookResumeDedupVersion: HOOK_RESUME_DEDUP_VERSION },
+    } satisfies Hook;
+    const createEvent = vi.fn(async (_run, _event, params) => {
+      if (params.requireHookResumeDedup)
+        throw new WorkflowWorldError('refused', { status });
+      return {};
+    });
+    const { getByToken, queue } = makeWorld(
+      hook,
+      { createEvent },
+      { resolvedHookResume: true }
+    );
+    await resumeHook(JSON.parse(JSON.stringify(hook)), { foo: 'fallback' });
+    expect(getByToken).toHaveBeenCalledTimes(1);
+    expect(createEvent).toHaveBeenCalledTimes(2);
+    const [resolved, fallback] = createEvent.mock.calls;
+    expect(fallback[2].requireHookResumeDedup).toBeUndefined();
+    expect(fallback[2].resumeId).toBe(resolved[2].resumeId);
+    expect(queue).toHaveBeenCalledTimes(1);
+    expect(telemetrySpan.setAttributes).toHaveBeenCalledWith({
+      'workflow.hook.resume_route': 'resolved_fallback',
+      'workflow.hook.resolved_refusal_status': status,
+    });
+  });
+
+  it('uses fresh capabilities when the kill switch refuses the resolved route', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const createEvent = vi.fn(async (_run, _event, params) => {
+      if (params.requireHookResumeDedup)
+        throw new HookNotFoundError(hook.hookId);
+      return {};
+    });
+    const { getByToken, queue } = makeWorld(
+      hook,
+      { createEvent },
+      { resolvedHookResume: true }
+    );
+    await resumeHook(
+      hook,
+      new Request('https://example.test', { method: 'POST', body: 'body' })
+    );
+    expect(getByToken).toHaveBeenCalledTimes(1);
+    expect(createEvent.mock.calls[1][2].resumeId).toBeUndefined();
+    expect(queue).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not deliver to an unrelated new owner after refusal', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const createEvent = vi.fn(async () => {
+      throw new WorkflowWorldError('refused', { status: 404 });
+    });
+    const getByToken = vi.fn(async () => ({
+      ...hook,
+      hookId: 'hook_unrelated',
+      runId: 'wrun_unrelated',
+    }));
+    const { queue } = makeWorld(
+      hook,
+      { createEvent, getByToken },
+      { resolvedHookResume: true }
+    );
+    await expect(resumeHook(hook, {})).rejects.toSatisfy(HookNotFoundError.is);
+    expect(getByToken).toHaveBeenCalledTimes(1);
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    400, 404,
+  ])('does not fall back after a %s refusal following an earlier send', async (status) => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const error = new WorkflowWorldError('refusal after retry', {
+      status,
+      code: 'HOOK_RESUME_RETRY_REFUSED',
+      cause: new HookNotFoundError(hook.hookId),
+    });
+    const createEvent = vi.fn().mockRejectedValue(error);
+    const { getByToken, queue } = makeWorld(
+      hook,
+      { createEvent },
+      { resolvedHookResume: true }
+    );
+    await expect(resumeHook(hook, {})).rejects.toBe(error);
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(getByToken).not.toHaveBeenCalled();
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('re-keys a fallback write not-found to the caller token', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const createEvent = vi
+      .fn()
+      .mockRejectedValue(new HookNotFoundError(hook.hookId));
+    const { queue } = makeWorld(
+      hook,
+      { createEvent },
+      { resolvedHookResume: true }
+    );
+    await expect(resumeHook(hook, {})).rejects.toMatchObject({
+      name: 'HookNotFoundError',
+      token: hook.token,
+    });
+    expect(createEvent).toHaveBeenCalledTimes(2);
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('follows a force-claim successor after a definite resolved refusal', async () => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const successor = {
+      ...hook,
+      hookId: 'hook_successor',
+      runId: 'wrun_successor',
+      claimedFrom: { hookId: hook.hookId, runId: hook.runId },
+      resumeCapabilities: { hookResumeDedupVersion: HOOK_RESUME_DEDUP_VERSION },
+    };
+    const createEvent = vi.fn(async (_run, _event, params) => {
+      if (params.requireHookResumeDedup)
+        throw new WorkflowWorldError('refused', { status: 404 });
+      return {};
+    });
+    const getByToken = vi.fn(async () => successor);
+    const { queue } = makeWorld(
+      hook,
+      { createEvent, getByToken },
+      { resolvedHookResume: true }
+    );
+    await expect(resumeHook(hook, {})).resolves.toMatchObject({
+      runId: successor.runId,
+    });
+    expect(createEvent).toHaveBeenCalledTimes(2);
+    expect(createEvent.mock.calls[1][0]).toBe(successor.runId);
+    expect(createEvent.mock.calls[1][2].resumeId).toBe(
+      createEvent.mock.calls[0][2].resumeId
+    );
+    expect(queue).toHaveBeenCalledTimes(1);
+    const routeUpdates = telemetrySpan.setAttributes.mock.calls
+      .map(([attrs]) => attrs['workflow.hook.resume_route'])
+      .filter(Boolean);
+    expect(routeUpdates.at(-1)).toBe('resolved_fallback');
+  });
+
+  it.each([
+    'reset',
+    'timeout',
+  ])('never falls back after an uncertain %s', async (kind) => {
+    const hook = { ...baseHook, resumeContext: currentContext } satisfies Hook;
+    const error = new WorkflowWorldError(kind, {
+      code: 'STREAM_ERROR',
+      cause: new Error(kind),
+    });
+    const createEvent = vi.fn(async () => {
+      throw error;
+    });
+    const { getByToken, queue } = makeWorld(
+      hook,
+      { createEvent },
+      { resolvedHookResume: true }
+    );
+    await expect(resumeHook(hook, {})).rejects.toBe(error);
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    expect(getByToken).not.toHaveBeenCalled();
+    expect(queue).not.toHaveBeenCalled();
+  });
+
+  it('uses the same durable path for webhooks', async () => {
+    const hook = {
+      ...baseHook,
+      isWebhook: true,
+      resumeContext: currentContext,
+      resumeCapabilities: {
+        hookResumeDedupVersion: HOOK_RESUME_DEDUP_VERSION,
+      },
+    } satisfies Hook;
+    const { createEvent, queue } = makeWorld(hook, {}, {});
+
+    const response = await resumeWebhook(hook.token, new Request('http://x'));
+
+    expect(response.status).toBe(202);
+    expect(createEvent).toHaveBeenCalledTimes(1);
+    // resumeWebhook's in-line lookup is fresh, so the claim rides the write.
+    expect(createEvent.mock.calls[0][2].resumeId).toBeDefined();
+    const [, wake] = queue.mock.calls[0];
+    expect(wake.hookResume).toBeUndefined();
+    expect(wake.hookResumeTiming.strategy).toBe('sequential');
+  });
+
+  it('opens the resumeWebhook timing window before its hook lookup', async () => {
+    let clock = 1_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      const hook = {
+        ...baseHook,
+        isWebhook: true,
+        resumeContext: currentContext,
+        resumeCapabilities: {
+          hookResumeDedupVersion: HOOK_RESUME_DEDUP_VERSION,
+        },
+      } satisfies Hook;
+      const { queue } = makeWorld(
+        hook,
+        {
+          getByToken: vi.fn(async () => {
+            clock += 500;
+            return hook;
+          }),
+        },
+        {}
+      );
+
+      await resumeWebhook(hook.token, new Request('http://x'));
+
+      const timing = queue.mock.calls[0][1].hookResumeTiming;
+      expect(timing.resumeRequestedAtMs).toBe(1_000);
+      expect(
+        timing.queuePublishRequestedAtMs - timing.resumeRequestedAtMs
+      ).toBeGreaterThanOrEqual(500);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+});

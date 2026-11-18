@@ -1,0 +1,216 @@
+/**
+ * Length-prefixed binary frame codec for the v4 list-events response.
+ *
+ * Mirrors the server-side encoder in the world-vercel backend. Wire format:
+ *
+ *   list-response := frame*  end-frame
+ *   frame         := u32_be(meta_len) || cbor_meta || u32_be(body_len) || body_bytes
+ *   end-frame     := u32_be(meta_len) || cbor_meta {_end: 1, next?: string, hasMore: boolean} || u32_be(0)
+ */
+
+import { decode, encode } from 'cbor-x';
+import { z } from 'zod';
+
+export const V4_FRAME_CONTENT_TYPE = 'application/vnd.workflow.v4-frames';
+
+export interface DecodedFrame {
+  meta: Record<string, unknown>;
+  body: Uint8Array;
+}
+
+/** The response body stopped before the next complete frame was available. */
+export class IncompleteFrameError extends Error {}
+
+// The protocol consumer validates the event or control-frame shape after the
+// body is available. The byte codec only requires a CBOR object here.
+const CborObjectSchema = z.record(z.string(), z.unknown());
+
+/** Test/utility: encode a complete frame. Production server uses prefix
+ *  + streaming body. */
+export function encodeFrame(
+  meta: Record<string, unknown>,
+  body: Uint8Array
+): Uint8Array {
+  const metaBytes = new Uint8Array(encode(meta));
+  const out = new Uint8Array(4 + metaBytes.byteLength + 4 + body.byteLength);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, metaBytes.byteLength, false);
+  out.set(metaBytes, 4);
+  view.setUint32(4 + metaBytes.byteLength, body.byteLength, false);
+  out.set(body, 4 + metaBytes.byteLength + 4);
+  return out;
+}
+
+/**
+ * Decode exactly one frame from one buffer, synchronously: the counterpart of
+ * {@link encodeFrame} for a transport that delivers whole frames, such as one
+ * WebSocket message. Trailing bytes are an error. Throws on a truncated or
+ * malformed frame.
+ */
+export function decodeFrame(raw: Uint8Array): DecodedFrame {
+  const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  if (raw.byteLength < 4) {
+    throw new Error('ws frame shorter than the meta length prefix');
+  }
+  const metaEnd = 4 + view.getUint32(0, false);
+  if (raw.byteLength < metaEnd + 4) {
+    throw new Error('ws frame too short for meta + body length prefix');
+  }
+  const meta: unknown = decode(raw.subarray(4, metaEnd));
+  if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) {
+    throw new Error('ws frame meta must be a CBOR map');
+  }
+  const bodyStart = metaEnd + 4;
+  const bodyEnd = bodyStart + view.getUint32(metaEnd, false);
+  if (raw.byteLength !== bodyEnd) {
+    throw new Error(
+      raw.byteLength < bodyEnd
+        ? 'ws frame shorter than its declared body length'
+        : `ws frame has ${raw.byteLength - bodyEnd} trailing bytes`
+    );
+  }
+  return {
+    meta: meta as Record<string, unknown>,
+    body: raw.subarray(bodyStart, bodyEnd),
+  };
+}
+
+/**
+ * Async-iterable parser for a frame stream. Yields one `DecodedFrame`
+ * per frame in source order, terminating at the sentinel frame whose
+ * meta contains `_end: 1`. The sentinel frame itself IS yielded: the
+ * caller inspects `meta._end` to detect end-of-stream and reads
+ * `meta.next` for the pagination cursor.
+ *
+ * Accepts any async iterable of byte chunks (undici response bodies,
+ * Node Readables) as well as a Web ReadableStream. Notably it must NOT
+ * require a `node:stream` conversion: `Readable.toWeb` via dynamic
+ * `import('node:stream')` resolves to an empty namespace in Next.js
+ * webpack server bundles and crashes at runtime.
+ *
+ * Survives arbitrary chunk boundaries from the source stream, including
+ * splits that fall in the middle of a u32 length prefix or in the
+ * middle of the CBOR meta block.
+ */
+export async function* decodeFrames(
+  source: AsyncIterable<Uint8Array> | ReadableStream<Uint8Array>
+): AsyncGenerator<DecodedFrame> {
+  const chunks =
+    Symbol.asyncIterator in source
+      ? (source as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
+      : readerToIterator((source as ReadableStream<Uint8Array>).getReader());
+  // Accumulating buffer of bytes we've read but not yet consumed.
+  let buffer = new Uint8Array(0);
+
+  const refill = async (needed: number): Promise<boolean> => {
+    if (buffer.byteLength >= needed) return true;
+
+    const parts: Uint8Array[] = [buffer];
+    let byteLength = buffer.byteLength;
+    while (byteLength < needed) {
+      let chunk: IteratorResult<Uint8Array>;
+      try {
+        chunk = await chunks.next();
+      } catch (cause) {
+        throw new IncompleteFrameError('decodeFrames: source stream failed', {
+          cause,
+        });
+      }
+      if (chunk.done) return false;
+      if (chunk.value.byteLength === 0) continue;
+      parts.push(chunk.value);
+      byteLength += chunk.value.byteLength;
+    }
+
+    buffer = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const part of parts) {
+      buffer.set(part, offset);
+      offset += part.byteLength;
+    }
+    return true;
+  };
+
+  const take = (n: number): Uint8Array => {
+    const out = buffer.subarray(0, n);
+    buffer = buffer.subarray(n);
+    return out;
+  };
+
+  try {
+    while (true) {
+      if (!(await refill(4))) return;
+      const metaLen = new DataView(
+        buffer.buffer,
+        buffer.byteOffset,
+        4
+      ).getUint32(0, false);
+      take(4);
+
+      if (!(await refill(metaLen))) {
+        throw new IncompleteFrameError('decodeFrames: truncated meta block');
+      }
+      const meta = CborObjectSchema.parse(decode(take(metaLen)));
+
+      if (!(await refill(4))) {
+        throw new IncompleteFrameError('decodeFrames: truncated body length');
+      }
+      const bodyLen = new DataView(
+        buffer.buffer,
+        buffer.byteOffset,
+        4
+      ).getUint32(0, false);
+      take(4);
+
+      if (bodyLen > 0 && !(await refill(bodyLen))) {
+        throw new IncompleteFrameError('decodeFrames: truncated body bytes');
+      }
+      // Slice (not subarray) so the yielded body owns its bytes, so later
+      // reads into the buffer won't overwrite it; bodyLen 0 yields empty.
+      yield { meta, body: buffer.slice(0, bodyLen) };
+      take(bodyLen);
+
+      if (meta._end === 1) return;
+    }
+  } finally {
+    // Release the source when the consumer stops before EOF (early
+    // break/return): an unconsumed body pins its undici socket out of the
+    // connection pool. No-op once the stream is already drained.
+    //
+    // Fire-and-forget, NOT awaited: on a service-backed World this cancel
+    // can hit the network (an H2 stream reset, or an H1 socket teardown),
+    // and awaiting it here would block every early-exit caller (getEventV4,
+    // every replay's list read) on that round-trip. Awaiting it previously
+    // hung indefinitely on the Next.js Vercel Function lanes specifically,
+    // same class of bug as the abort-stream reader in #2807.
+    closeQuietly(() => chunks.return?.());
+  }
+}
+
+/** Best-effort source cleanup, safe to run detached from a `finally`:
+ *  swallows errors so cleanup can't mask the original outcome. */
+function closeQuietly(close: () => unknown): void {
+  try {
+    void Promise.resolve(close()).catch(() => {});
+  } catch {
+    // best-effort
+  }
+}
+
+/** Adapt a Web ReadableStream reader to the async-iterator protocol for
+ *  runtimes where ReadableStream itself is not async-iterable. */
+async function* readerToIterator(
+  reader: ReadableStreamDefaultReader<Uint8Array>
+): AsyncGenerator<Uint8Array> {
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      if (value) yield value;
+    }
+  } finally {
+    // Cancel on early exit so the socket is released, not just unlocked.
+    // Fire-and-forget; see closeQuietly's call site above.
+    closeQuietly(() => reader.cancel());
+  }
+}

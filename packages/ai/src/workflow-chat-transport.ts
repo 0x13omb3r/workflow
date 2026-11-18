@@ -8,8 +8,94 @@ import {
   type UIMessageChunk,
   uiMessageChunkSchema,
 } from 'ai';
+import { getErrorMessage } from './get-error-message.js';
+import { normalizeUIMessageStreamParts } from './normalize-ui-message-stream.js';
 import { iteratorToStream, streamToIterator } from './stream-iterator.js';
 
+/**
+ * Tracks `*-start` chunks the client has accepted so we can drop deltas/ends
+ * that refer to a part whose start was emitted before the resume cursor.
+ *
+ * AI SDK's UI stream processor throws on `text-delta`/`reasoning-delta`/
+ * `tool-input-delta` (and the matching `*-end`) when the start chunk for that
+ * id was never observed, and on tool output/approval chunks when no tool part
+ * exists for the call id. A negative `startIndex` on a flat chunk stream can
+ * can land mid-part, so without this guard the client crashes on resume.
+ *
+ * A tool part is established by `tool-input-start` OR by a self-contained
+ * `tool-input-available`/`tool-input-error` chunk (the AI SDK creates the
+ * part from those directly), so all three mark the call id as seen.
+ *
+ * This is a best-effort safety net: it preserves only the parts that the
+ * resumed window includes a `*-start` for. Server-side rewinding to a step
+ * boundary is the proper fix when you want the full message preserved.
+ */
+type OrphanFilter = {
+  shouldDrop: (chunk: UIMessageChunk) => boolean;
+};
+
+function createOrphanFilter(): OrphanFilter {
+  const seenStartedIds = new Set<string>();
+  const seenStartedToolCallIds = new Set<string>();
+  let warnedOnce = false;
+
+  function warnOnce(orphanKind: string, orphanRef: string) {
+    if (warnedOnce) return;
+    warnedOnce = true;
+    console.warn(
+      '[WorkflowChatTransport] Dropping orphan UI chunk ' +
+        `(${orphanKind} for id "${orphanRef}") on resume — ` +
+        'the resume position landed mid-part. The dropped chunk(s) ' +
+        "reference a part whose start chunk wasn't in the resumed " +
+        'window. To preserve the full message, configure your ' +
+        'stream endpoint to rewind to a step boundary before ' +
+        'returning the readable. See: ' +
+        'https://workflow.dev/docs/ai/resumable-streams#mid-part-resumes'
+    );
+  }
+
+  function shouldDrop(chunk: UIMessageChunk): boolean {
+    switch (chunk.type) {
+      case 'text-start':
+      case 'reasoning-start':
+        seenStartedIds.add(chunk.id);
+        return false;
+      case 'tool-input-start':
+      // `tool-input-available` / `tool-input-error` are self-contained: the
+      // AI SDK creates the tool part from them directly (non-streamed tool
+      // calls are emitted as a bare `tool-input-available`), so they must
+      // never be dropped. They also carry the full input, so they recover a
+      // tool call whose `tool-input-start` fell outside the resumed window.
+      case 'tool-input-available':
+      case 'tool-input-error':
+        seenStartedToolCallIds.add(chunk.toolCallId);
+        return false;
+      case 'text-delta':
+      case 'text-end':
+      case 'reasoning-delta':
+      case 'reasoning-end':
+        if (seenStartedIds.has(chunk.id)) return false;
+        warnOnce(chunk.type, chunk.id);
+        return true;
+      case 'tool-input-delta':
+      case 'tool-approval-request':
+      case 'tool-output-available':
+      case 'tool-output-error':
+      case 'tool-output-denied':
+        if (seenStartedToolCallIds.has(chunk.toolCallId)) return false;
+        warnOnce(chunk.type, chunk.toolCallId);
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  return { shouldDrop };
+}
+
+/**
+ * @deprecated Use the `WorkflowChatTransport` types from `@ai-sdk/workflow`.
+ */
 export interface SendMessagesOptions<UI_MESSAGE extends UIMessage> {
   trigger: 'submit-message' | 'regenerate-message';
   chatId: string;
@@ -18,8 +104,28 @@ export interface SendMessagesOptions<UI_MESSAGE extends UIMessage> {
   abortSignal?: AbortSignal;
 }
 
+/**
+ * @deprecated Use the `WorkflowChatTransport` types from `@ai-sdk/workflow`.
+ */
 export interface ReconnectToStreamOptions {
   chatId: string;
+  abortSignal?: AbortSignal;
+  /**
+   * Override the `startIndex` for this reconnection.
+   * Negative values read from the end of the stream.
+   * When omitted, falls back to the constructor's `initialStartIndex`.
+   */
+  startIndex?: number;
+}
+
+function isAbortError(error: unknown, abortSignal?: AbortSignal): boolean {
+  return (
+    abortSignal?.aborted === true ||
+    (typeof error === 'object' &&
+      error !== null &&
+      'name' in error &&
+      error.name === 'AbortError')
+  );
 }
 
 type OnChatSendMessage<UI_MESSAGE extends UIMessage> = (
@@ -40,8 +146,15 @@ type OnChatEnd = ({
  *
  * @template UI_MESSAGE - The type of UI messages being sent and received,
  *                        must extend the UIMessage interface from the AI SDK.
+ * @deprecated Use `WorkflowChatTransportOptions` from `@ai-sdk/workflow` for Workflow 5 applications.
  */
 export interface WorkflowChatTransportOptions<UI_MESSAGE extends UIMessage> {
+  /**
+   * API endpoint for chat requests
+   * Defaults to /api/chat if not provided
+   */
+  api?: string;
+
   /**
    * Custom fetch implementation to use for HTTP requests.
    * Defaults to the global fetch function if not provided.
@@ -73,6 +186,19 @@ export interface WorkflowChatTransportOptions<UI_MESSAGE extends UIMessage> {
   maxConsecutiveErrors?: number;
 
   /**
+   * Default `startIndex` to use when reconnecting to a stream without a known
+   * chunk position (i.e. the initial reconnection, not a retry).
+   * Negative values read from the end of the stream (e.g. `-10` fetches the
+   * last 10 chunks), which is useful for resuming a chat UI after a page
+   * refresh without replaying the full conversation.
+   *
+   * Can be overridden per-call via `ReconnectToStreamOptions.startIndex`.
+   *
+   * Defaults to `0` (replay from the beginning).
+   */
+  initialStartIndex?: number;
+
+  /**
    * Function to prepare the request for sending messages.
    * Allows customizing the API endpoint, headers, credentials, and body.
    */
@@ -97,14 +223,17 @@ export interface WorkflowChatTransportOptions<UI_MESSAGE extends UIMessage> {
  *                        must extend the UIMessage interface from the AI SDK.
  *
  * @implements {ChatTransport<UI_MESSAGE>}
+ * @deprecated Use `WorkflowChatTransport` from `@ai-sdk/workflow` for Workflow 5 applications. This transport remains supported for Workflow 4 maintenance applications.
  */
 export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
   implements ChatTransport<UI_MESSAGE>
 {
+  private readonly api: string;
   private readonly fetch: typeof fetch;
   private readonly onChatSendMessage?: OnChatSendMessage<UI_MESSAGE>;
   private readonly onChatEnd?: OnChatEnd;
   private readonly maxConsecutiveErrors: number;
+  private readonly initialStartIndex: number;
   private readonly prepareSendMessagesRequest?: PrepareSendMessagesRequest<UI_MESSAGE>;
   private readonly prepareReconnectToStreamRequest?: PrepareReconnectToStreamRequest;
 
@@ -112,6 +241,7 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
    * Creates a new WorkflowChatTransport instance.
    *
    * @param options - Configuration options for the transport
+   * @param options.api - API endpoint for chat requests (defaults to '/api/chat')
    * @param options.fetch - Custom fetch implementation (defaults to global fetch)
    * @param options.onChatSendMessage - Callback after sending messages
    * @param options.onChatEnd - Callback when chat stream ends
@@ -120,10 +250,12 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
    * @param options.prepareReconnectToStreamRequest - Function to prepare reconnect request
    */
   constructor(options: WorkflowChatTransportOptions<UI_MESSAGE> = {}) {
+    this.api = options.api ?? '/api/chat';
     this.fetch = options.fetch ?? fetch.bind(globalThis);
     this.onChatSendMessage = options.onChatSendMessage;
     this.onChatEnd = options.onChatEnd;
     this.maxConsecutiveErrors = options.maxConsecutiveErrors ?? 3;
+    this.initialStartIndex = options.initialStartIndex ?? 0;
     this.prepareSendMessagesRequest = options.prepareSendMessagesRequest;
     this.prepareReconnectToStreamRequest =
       options.prepareReconnectToStreamRequest;
@@ -150,13 +282,16 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
   async sendMessages(
     options: SendMessagesOptions<UI_MESSAGE> & ChatRequestOptions
   ): Promise<ReadableStream<UIMessageChunk>> {
-    return iteratorToStream(this.sendMessagesIterator(options), {
-      signal: options.abortSignal,
-    });
+    return iteratorToStream(
+      normalizeUIMessageStreamParts(this.sendMessagesIterator(options)),
+      {
+        signal: options.abortSignal,
+      }
+    );
   }
 
   private async *sendMessagesIterator(
-    options: SendMessagesOptions<UI_MESSAGE>
+    options: SendMessagesOptions<UI_MESSAGE> & ChatRequestOptions
   ): AsyncGenerator<UIMessageChunk> {
     const { chatId, messages, abortSignal, trigger, messageId } = options;
 
@@ -170,20 +305,22 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
       ? await this.prepareSendMessagesRequest({
           id: chatId,
           messages,
-          requestMetadata: undefined,
-          body: undefined,
+          requestMetadata: options.metadata,
+          body: options.body,
           credentials: undefined,
-          headers: undefined,
-          api: '/api/chat',
+          headers: options.headers,
+          api: this.api,
           trigger,
           messageId,
         })
       : undefined;
 
-    const url = requestConfig?.api ?? '/api/chat';
+    const url = requestConfig?.api ?? this.api;
     const res = await this.fetch(url, {
       method: 'POST',
-      body: JSON.stringify(requestConfig?.body ?? { messages }),
+      body: JSON.stringify(
+        requestConfig?.body ?? { messages, ...options.body }
+      ),
       headers: requestConfig?.headers,
       credentials: requestConfig?.credentials,
       signal: abortSignal,
@@ -227,6 +364,9 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
         }
       }
     } catch (error) {
+      if (isAbortError(error, abortSignal)) {
+        return;
+      }
       console.error('Error in chat POST stream', error);
     }
 
@@ -255,8 +395,10 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
   async reconnectToStream(
     options: ReconnectToStreamOptions & ChatRequestOptions
   ): Promise<ReadableStream<UIMessageChunk> | null> {
-    const it = this.reconnectToStreamIterator(options);
-    return iteratorToStream(it);
+    const it = normalizeUIMessageStreamParts(
+      this.reconnectToStreamIterator(options)
+    );
+    return iteratorToStream(it, { signal: options.abortSignal });
   }
 
   private async *reconnectToStreamIterator(
@@ -266,13 +408,23 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
   ): AsyncGenerator<UIMessageChunk> {
     let chunkIndex = initialChunkIndex;
 
-    const defaultApi = `/api/chat/${encodeURIComponent(workflowRunId ?? options.chatId)}/stream`;
+    // When called from the public reconnectToStream (initialChunkIndex === 0),
+    // honour the caller's startIndex (or the constructor default) for the
+    // first request. This enables negative values so the client can read only
+    // the tail of the stream (e.g. the last 10 chunks) instead of replaying
+    // everything. After the first request, fall back to the running chunkIndex
+    // so that retries resume from the correct position.
+    const explicitStartIndex = options.startIndex ?? this.initialStartIndex;
+    let useExplicitStartIndex =
+      initialChunkIndex === 0 && explicitStartIndex !== 0;
+
+    const defaultApi = `${this.api}/${encodeURIComponent(workflowRunId ?? options.chatId)}/stream`;
 
     // Prepare the request using the configurator if provided
     const requestConfig = this.prepareReconnectToStreamRequest
       ? await this.prepareReconnectToStreamRequest({
           id: options.chatId,
-          requestMetadata: undefined,
+          requestMetadata: options.metadata,
           body: undefined,
           credentials: undefined,
           headers: undefined,
@@ -284,12 +436,34 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
 
     let gotFinish = false;
     let consecutiveErrors = 0;
+    // When a negative startIndex is used but the tail-index header is absent,
+    // retries fall back to startIndex 0 (replay everything) instead of using
+    // the incremental chunkIndex which would be wrong.
+    let replayFromStart = false;
+
+    // When resuming with a negative startIndex, the resolved chunk can land in
+    // the middle of a `*-start` / `*-delta` / `*-end` sequence, which crashes
+    // the AI SDK UI stream processor. The orphan filter drops chunks whose
+    // start chunk was emitted before the resume window. Only activated for
+    // negative resumes, since non-negative startIndex is the caller's explicit
+    // choice and we trust them. See: https://github.com/vercel/workflow/issues/1835
+    const orphanFilter =
+      useExplicitStartIndex && explicitStartIndex < 0
+        ? createOrphanFilter()
+        : null;
 
     while (!gotFinish) {
-      const url = `${baseUrl}?startIndex=${chunkIndex}`;
+      const startIndex = useExplicitStartIndex
+        ? explicitStartIndex
+        : replayFromStart
+          ? 0
+          : chunkIndex;
+
+      const url = `${baseUrl}?startIndex=${startIndex}`;
       const res = await this.fetch(url, {
         headers: requestConfig?.headers,
         credentials: requestConfig?.credentials,
+        signal: options.abortSignal,
       });
 
       if (!res.ok || !res.body) {
@@ -297,6 +471,32 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
           `Failed to fetch chat: ${res.status} ${await res.text()}`
         );
       }
+
+      // When using a negative startIndex, the server resolves it to an
+      // absolute position. The reconnection endpoint should return the tail
+      // index so we can compute the resolved position for subsequent retries.
+      if (useExplicitStartIndex && explicitStartIndex < 0) {
+        const tailIndexHeader = res.headers.get('x-workflow-stream-tail-index');
+        const tailIndex =
+          tailIndexHeader !== null ? parseInt(tailIndexHeader, 10) : NaN;
+
+        if (!Number.isNaN(tailIndex)) {
+          // Resolve: e.g. tailIndex=499, startIndex=-20 → 500 + (-20) = 480
+          chunkIndex = Math.max(0, tailIndex + 1 + explicitStartIndex);
+        } else {
+          // Header missing or unparseable, so fall back to replaying from the
+          // beginning so retries don't resume from a wrong position.
+          console.warn(
+            '[WorkflowChatTransport] Negative initialStartIndex is configured ' +
+              `(${explicitStartIndex}) but the reconnection endpoint did not ` +
+              'return a valid "x-workflow-stream-tail-index" header. Retries ' +
+              'will replay the stream from the beginning. See: ' +
+              'https://workflow.dev/docs/ai/resumable-streams#resuming-from-the-end-of-the-stream'
+          );
+          replayFromStart = true;
+        }
+      }
+      useExplicitStartIndex = false;
 
       try {
         const chunkStream = parseJsonEventStream({
@@ -310,6 +510,8 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
 
           chunkIndex++;
 
+          if (orphanFilter?.shouldDrop(chunk.value)) continue;
+
           yield chunk.value;
 
           if (chunk.value.type === 'finish') {
@@ -319,12 +521,15 @@ export class WorkflowChatTransport<UI_MESSAGE extends UIMessage>
         // Reset consecutive error count only after successful stream parsing
         consecutiveErrors = 0;
       } catch (error) {
+        if (isAbortError(error, options.abortSignal)) {
+          return;
+        }
         console.error('Error in chat GET reconnectToStream', error);
         consecutiveErrors++;
 
         if (consecutiveErrors >= this.maxConsecutiveErrors) {
           throw new Error(
-            `Failed to reconnect after ${this.maxConsecutiveErrors} consecutive errors. Last error: ${error instanceof Error ? error.message : String(error)}`
+            `Failed to reconnect after ${this.maxConsecutiveErrors} consecutive errors. Last error: ${getErrorMessage(error)}`
           );
         }
       }

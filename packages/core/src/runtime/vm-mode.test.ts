@@ -1,0 +1,253 @@
+import { WorkflowRuntimeError } from '@workflow/errors';
+import type { WorkflowRun } from '@workflow/world';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  DEFAULT_QUICKJS_SNAPSHOT_THRESHOLD,
+  getSnapshotThreshold,
+  getSnapshotThresholdForHandler,
+  getSnapshotThresholdForStart,
+  getSnapshotThresholdFromEnv,
+  getWorkflowVmFromEnv,
+  useQuickJSVm,
+  WORKFLOW_VMS,
+} from './vm-mode.js';
+
+describe('getWorkflowVmFromEnv', () => {
+  it('returns undefined when WORKFLOW_VM is not set', () => {
+    expect(getWorkflowVmFromEnv({})).toBeUndefined();
+  });
+
+  it('returns undefined when WORKFLOW_VM is empty', () => {
+    expect(getWorkflowVmFromEnv({ WORKFLOW_VM: '' })).toBeUndefined();
+  });
+
+  it('returns "node" when WORKFLOW_VM=node', () => {
+    expect(getWorkflowVmFromEnv({ WORKFLOW_VM: 'node' })).toBe('node');
+  });
+
+  it('returns "quickjs" when WORKFLOW_VM=quickjs', () => {
+    expect(getWorkflowVmFromEnv({ WORKFLOW_VM: 'quickjs' })).toBe('quickjs');
+  });
+
+  it('throws WorkflowRuntimeError on unknown values', () => {
+    expect(() => getWorkflowVmFromEnv({ WORKFLOW_VM: 'bogus' })).toThrow(
+      WorkflowRuntimeError
+    );
+    expect(() => getWorkflowVmFromEnv({ WORKFLOW_VM: 'bogus' })).toThrow(
+      /Invalid WORKFLOW_VM value: "bogus"/
+    );
+  });
+
+  it('is case-sensitive: uppercase values are rejected', () => {
+    expect(() => getWorkflowVmFromEnv({ WORKFLOW_VM: 'QUICKJS' })).toThrow(
+      WorkflowRuntimeError
+    );
+    expect(() => getWorkflowVmFromEnv({ WORKFLOW_VM: 'Node' })).toThrow(
+      WorkflowRuntimeError
+    );
+  });
+
+  it('rejects leading/trailing whitespace', () => {
+    expect(() => getWorkflowVmFromEnv({ WORKFLOW_VM: ' quickjs' })).toThrow(
+      WorkflowRuntimeError
+    );
+    expect(() => getWorkflowVmFromEnv({ WORKFLOW_VM: 'node ' })).toThrow(
+      WorkflowRuntimeError
+    );
+  });
+
+  it('error message lists valid options', () => {
+    try {
+      getWorkflowVmFromEnv({ WORKFLOW_VM: 'bogus' });
+      expect.fail('expected to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(WorkflowRuntimeError);
+      for (const mode of WORKFLOW_VMS) {
+        expect((err as Error).message).toContain(mode);
+      }
+    }
+  });
+});
+
+describe('useQuickJSVm', () => {
+  const makeRun = (executionContext?: Record<string, unknown>) =>
+    ({
+      runId: 'wrun_test',
+      workflowName: 'test',
+      executionContext,
+    }) as unknown as WorkflowRun;
+
+  afterEach(() => {
+    delete process.env.WORKFLOW_VM;
+  });
+
+  it('defaults to node:vm (false) when nothing is configured', () => {
+    expect(useQuickJSVm(makeRun())).toBe(false);
+  });
+
+  it('returns true when WORKFLOW_VM=quickjs is set in the environment', () => {
+    process.env.WORKFLOW_VM = 'quickjs';
+    expect(useQuickJSVm(makeRun())).toBe(true);
+  });
+
+  it('returns false when WORKFLOW_VM=node is set in the environment', () => {
+    process.env.WORKFLOW_VM = 'node';
+    expect(useQuickJSVm(makeRun())).toBe(false);
+  });
+
+  it('executionContext.workflowVm=quickjs wins over env node', () => {
+    process.env.WORKFLOW_VM = 'node';
+    expect(useQuickJSVm(makeRun({ workflowVm: 'quickjs' }))).toBe(true);
+  });
+
+  it('executionContext.workflowVm=node wins over env quickjs (run affinity)', () => {
+    process.env.WORKFLOW_VM = 'quickjs';
+    expect(useQuickJSVm(makeRun({ workflowVm: 'node' }))).toBe(false);
+  });
+
+  it('throws on unknown executionContext.workflowVm values', () => {
+    expect(() => useQuickJSVm(makeRun({ workflowVm: 'bogus' }))).toThrow(
+      WorkflowRuntimeError
+    );
+  });
+
+  it('throws on unknown WORKFLOW_VM env values', () => {
+    process.env.WORKFLOW_VM = 'bogus';
+    expect(() => useQuickJSVm(makeRun())).toThrow(WorkflowRuntimeError);
+  });
+});
+
+describe('getSnapshotThresholdFromEnv', () => {
+  it('returns undefined when unset or empty', () => {
+    expect(getSnapshotThresholdFromEnv({})).toBeUndefined();
+    expect(
+      getSnapshotThresholdFromEnv({ WORKFLOW_SNAPSHOT_THRESHOLD: '' })
+    ).toBeUndefined();
+  });
+
+  it('parses non-negative integers', () => {
+    expect(
+      getSnapshotThresholdFromEnv({ WORKFLOW_SNAPSHOT_THRESHOLD: '0' })
+    ).toBe(0);
+    expect(
+      getSnapshotThresholdFromEnv({ WORKFLOW_SNAPSHOT_THRESHOLD: '1' })
+    ).toBe(1);
+    expect(
+      getSnapshotThresholdFromEnv({ WORKFLOW_SNAPSHOT_THRESHOLD: '250' })
+    ).toBe(250);
+  });
+
+  it('throws on invalid values', () => {
+    for (const bad of [
+      '-1',
+      '1.5',
+      'abc',
+      'Infinity',
+      '1e3',
+      '0x10',
+      ' 5 ',
+      '99999999999999999999',
+    ]) {
+      expect(() =>
+        getSnapshotThresholdFromEnv({ WORKFLOW_SNAPSHOT_THRESHOLD: bad })
+      ).toThrow(WorkflowRuntimeError);
+    }
+  });
+});
+
+describe('getSnapshotThreshold', () => {
+  const makeRun = (executionContext?: Record<string, unknown>) =>
+    ({
+      runId: 'wrun_test',
+      workflowName: 'test',
+      executionContext,
+    }) as unknown as WorkflowRun;
+
+  afterEach(() => {
+    delete process.env.WORKFLOW_SNAPSHOT_THRESHOLD;
+  });
+
+  it('defaults to DEFAULT_QUICKJS_SNAPSHOT_THRESHOLD (1000)', () => {
+    expect(DEFAULT_QUICKJS_SNAPSHOT_THRESHOLD).toBe(1000);
+    expect(getSnapshotThreshold(makeRun())).toBe(1000);
+  });
+
+  it('WORKFLOW_SNAPSHOT_THRESHOLD=0 explicitly opts out', () => {
+    process.env.WORKFLOW_SNAPSHOT_THRESHOLD = '0';
+    expect(getSnapshotThreshold(makeRun())).toBe(0);
+  });
+
+  it('honors a stamped policy', () => {
+    expect(getSnapshotThreshold(makeRun({ snapshotThreshold: 0 }))).toBe(0);
+  });
+
+  it('reads the env var when the run has no stamped policy', () => {
+    process.env.WORKFLOW_SNAPSHOT_THRESHOLD = '100';
+    expect(getSnapshotThreshold(makeRun())).toBe(100);
+  });
+
+  it('executionContext.snapshotThreshold wins over env (run affinity)', () => {
+    process.env.WORKFLOW_SNAPSHOT_THRESHOLD = '100';
+    expect(getSnapshotThreshold(makeRun({ snapshotThreshold: 5 }))).toBe(5);
+    expect(getSnapshotThreshold(makeRun({ snapshotThreshold: 0 }))).toBe(0);
+  });
+
+  it('throws on invalid stamped values', () => {
+    expect(() =>
+      getSnapshotThreshold(makeRun({ snapshotThreshold: -1 }))
+    ).toThrow(WorkflowRuntimeError);
+    expect(() =>
+      getSnapshotThreshold(makeRun({ snapshotThreshold: 'x' }))
+    ).toThrow(WorkflowRuntimeError);
+  });
+});
+
+describe('getSnapshotThresholdForStart', () => {
+  it('stamps the default for QuickJS runs when the env var is unset', () => {
+    expect(getSnapshotThresholdForStart('quickjs', {})).toBe(
+      DEFAULT_QUICKJS_SNAPSHOT_THRESHOLD
+    );
+  });
+
+  it('does not stamp a threshold for node runs or unset VM', () => {
+    expect(getSnapshotThresholdForStart('node', {})).toBeUndefined();
+    expect(getSnapshotThresholdForStart(undefined, {})).toBeUndefined();
+  });
+
+  it('prefers WORKFLOW_SNAPSHOT_THRESHOLD, including an explicit 0', () => {
+    const env = { WORKFLOW_SNAPSHOT_THRESHOLD: '250' };
+    expect(getSnapshotThresholdForStart('quickjs', env)).toBe(250);
+    expect(getSnapshotThresholdForStart(undefined, env)).toBe(250);
+    expect(
+      getSnapshotThresholdForStart('quickjs', {
+        WORKFLOW_SNAPSHOT_THRESHOLD: '0',
+      })
+    ).toBe(0);
+  });
+
+  it('throws on an invalid env value', () => {
+    expect(() =>
+      getSnapshotThresholdForStart('quickjs', {
+        WORKFLOW_SNAPSHOT_THRESHOLD: 'abc',
+      })
+    ).toThrow(WorkflowRuntimeError);
+  });
+});
+
+describe('getSnapshotThresholdForHandler', () => {
+  afterEach(() => {
+    delete process.env.WORKFLOW_SNAPSHOT_THRESHOLD;
+  });
+
+  it('disables snapshotting with a warning instead of throwing', () => {
+    process.env.WORKFLOW_SNAPSHOT_THRESHOLD = 'abc';
+    const warnings: string[] = [];
+    const run = { runId: 'wrun_test' } as unknown as WorkflowRun;
+    expect(getSnapshotThresholdForHandler(run, (m) => warnings.push(m))).toBe(
+      0
+    );
+    expect(warnings).toEqual([
+      expect.stringContaining('Invalid WORKFLOW_SNAPSHOT_THRESHOLD'),
+    ]);
+  });
+});

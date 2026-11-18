@@ -1,32 +1,271 @@
 import { z } from 'zod';
-import type { PaginationOptions, ResolveData } from './shared.js';
+import { AttributeChangesSchema } from './attributes.js';
+import { getEventDataRefFields } from './event-metadata.js';
+import type { Hook } from './hooks.js';
+import type { StartedWorkflowRun, WorkflowRun } from './runs.js';
+import { SerializedDataSchema } from './serialization.js';
+import type {
+  EventsResolveData,
+  PaginatedResponse,
+  PaginationOptions,
+  ResolveData,
+} from './shared.js';
+import { StartHookSchema } from './start-hook.js';
+import type { StartedStep, Step } from './steps.js';
+import type { Wait } from './waits.js';
+
+export * from './event-metadata.js';
 
 // Event type enum
 export const EventTypeSchema = z.enum([
+  // Run lifecycle events
+  'run_created',
+  'run_started',
+  'run_completed',
+  'run_failed',
+  'run_cancelled',
+  // Run attribute events
+  'attr_set',
+  // Step lifecycle events
+  'step_created',
   'step_completed',
   'step_failed',
   'step_retrying',
   'step_started',
+  // Hook lifecycle events
   'hook_created',
   'hook_received',
   'hook_disposed',
-  'workflow_completed',
-  'workflow_failed',
-  'workflow_started',
+  'hook_conflict', // Created by world when hook token already exists
+  // Wait lifecycle events
+  'wait_created',
+  'wait_completed',
+  // Sealed-log filler (specVersion >= 7): written ONLY by the World's backend
+  // to occupy a slot whose writer allocated it and died. Carries no workflow
+  // meaning; replay skips it (see EventsConsumer). Never user-creatable.
+  'noop',
 ]);
+export type EventType = z.infer<typeof EventTypeSchema>;
+
+const RunEventTypeSchema = EventTypeSchema.extract([
+  'run_created',
+  'run_started',
+  'run_completed',
+  'run_failed',
+  'run_cancelled',
+] as const);
+export type RunEventType = z.infer<typeof RunEventTypeSchema>;
+export const RUN_EVENT_TYPES = RunEventTypeSchema.options;
+
+export function isRunEventType(eventType: string): eventType is RunEventType {
+  return RUN_EVENT_TYPES.includes(eventType as RunEventType);
+}
+
+export const TerminalRunEventTypeSchema = EventTypeSchema.extract([
+  'run_completed',
+  'run_failed',
+  'run_cancelled',
+] as const);
+export type TerminalRunEventType = z.infer<typeof TerminalRunEventTypeSchema>;
+export const TERMINAL_RUN_EVENT_TYPES = TerminalRunEventTypeSchema.options;
+
+export function isTerminalRunEventType(
+  eventType: string
+): eventType is TerminalRunEventType {
+  return TERMINAL_RUN_EVENT_TYPES.includes(eventType as TerminalRunEventType);
+}
+
+const StepEventTypeSchema = EventTypeSchema.extract([
+  'step_created',
+  'step_completed',
+  'step_failed',
+  'step_retrying',
+  'step_started',
+] as const);
+export type StepEventType = z.infer<typeof StepEventTypeSchema>;
+export const STEP_EVENT_TYPES = StepEventTypeSchema.options;
+
+export function isStepEventType(eventType: string): eventType is StepEventType {
+  return STEP_EVENT_TYPES.includes(eventType as StepEventType);
+}
+
+const TerminalStepEventTypeSchema = EventTypeSchema.extract([
+  'step_completed',
+  'step_failed',
+] as const);
+export type TerminalStepEventType = z.infer<typeof TerminalStepEventTypeSchema>;
+export const TERMINAL_STEP_EVENT_TYPES = TerminalStepEventTypeSchema.options;
+
+export function isTerminalStepEventType(
+  eventType: string
+): eventType is TerminalStepEventType {
+  return TERMINAL_STEP_EVENT_TYPES.includes(eventType as TerminalStepEventType);
+}
+
+const HookLifecycleEventTypeSchema = EventTypeSchema.extract([
+  'hook_created',
+  'hook_received',
+  'hook_disposed',
+] as const);
+export type HookLifecycleEventType = z.infer<
+  typeof HookLifecycleEventTypeSchema
+>;
+export const HOOK_LIFECYCLE_EVENT_TYPES = HookLifecycleEventTypeSchema.options;
+
+export function isHookLifecycleEventType(
+  eventType: string
+): eventType is HookLifecycleEventType {
+  return HOOK_LIFECYCLE_EVENT_TYPES.includes(
+    eventType as HookLifecycleEventType
+  );
+}
+
+const HookEventRequiringExistenceTypeSchema = EventTypeSchema.extract([
+  'hook_disposed',
+  'hook_received',
+] as const);
+export type HookEventRequiringExistenceType = z.infer<
+  typeof HookEventRequiringExistenceTypeSchema
+>;
+export const HOOK_EVENTS_REQUIRING_EXISTENCE =
+  HookEventRequiringExistenceTypeSchema.options;
+
+export function isHookEventRequiringExistence(
+  eventType: string
+): eventType is HookEventRequiringExistenceType {
+  return HOOK_EVENTS_REQUIRING_EXISTENCE.includes(
+    eventType as HookEventRequiringExistenceType
+  );
+}
+
+const WaitEventTypeSchema = EventTypeSchema.extract([
+  'wait_created',
+  'wait_completed',
+] as const);
+export type WaitEventType = z.infer<typeof WaitEventTypeSchema>;
+export const WAIT_EVENT_TYPES = WaitEventTypeSchema.options;
+
+export function isWaitEventType(eventType: string): eventType is WaitEventType {
+  return WAIT_EVENT_TYPES.includes(eventType as WaitEventType);
+}
+
+const ChildEntityCreationEventTypeSchema = EventTypeSchema.extract([
+  'step_created',
+  'hook_created',
+  'wait_created',
+] as const);
+export type ChildEntityCreationEventType = z.infer<
+  typeof ChildEntityCreationEventTypeSchema
+>;
+export const CHILD_ENTITY_CREATION_EVENT_TYPES =
+  ChildEntityCreationEventTypeSchema.options;
+
+export function isChildEntityCreationEventType(
+  eventType: string
+): eventType is ChildEntityCreationEventType {
+  return CHILD_ENTITY_CREATION_EVENT_TYPES.includes(
+    eventType as ChildEntityCreationEventType
+  );
+}
+
+/**
+ * Strip ref/payload fields from eventData based on resolveData setting.
+ * When resolveData is 'none', removes only large data fields (refs) from
+ * eventData while preserving metadata like stepName, workflowName, etc.
+ */
+export function stripEventDataRefs(
+  event: Event,
+  resolveData: EventsResolveData
+): Event {
+  if (resolveData !== 'none') return event;
+  if (!('eventData' in event)) return event;
+
+  const eventData = (event as any).eventData;
+  if (!eventData || typeof eventData !== 'object') {
+    const { eventData: _, ...rest } = event as any;
+    return rest;
+  }
+
+  const refFields = getEventDataRefFields(event.eventType);
+  if (refFields.length === 0) return event;
+
+  const stripped = { ...eventData };
+  for (const field of refFields) {
+    delete stripped[field];
+  }
+
+  const { eventData: _, ...rest } = event as any;
+  return {
+    ...rest,
+    ...(Object.keys(stripped).length > 0 ? { eventData: stripped } : {}),
+  };
+}
 
 // Base event schema with common properties
+// TODO: Event data on all specific event schemas can actually be undefined,
+// as the world may omit eventData when resolveData is set to 'none'.
+// Changing the type here will mainly improve type safety for o11y consumers.
+// Note: specVersion is optional for backward compatibility with legacy data in storage,
+// but is always sent by the runtime on new events.
 export const BaseEventSchema = z.object({
   eventType: EventTypeSchema,
   correlationId: z.string().optional(),
+  specVersion: z.number().optional(),
 });
 
 // Event schemas (shared between creation requests and server responses)
+// Note: Serialized data fields use SerializedDataSchema to support both:
+// - specVersion >= 2: Uint8Array (binary devalue format)
+// - specVersion 1: any (legacy JSON format)
+// Client-measured latency telemetry carried on a step's terminal event so a
+// backend can emit latency metrics without extra event-log queries. Fields
+// are populated as applicable by the runtime, only on the terminal event of
+// a first-attempt step execution that qualified for measurement (see
+// `@workflow/core` runtime/step-latency.ts). Backends may consume these for
+// metrics and are not required to persist them.
+const stepLatencyTelemetryFields = {
+  // Time-to-first-step: milliseconds from run creation until the run's first
+  // step body began executing, minus time spent committing hook_created
+  // events. Only reported when nothing else (hooks received, waits,
+  // attributes, other steps) happened before the first step.
+  ttfs: z.number().optional(),
+  // Step-to-step overhead: milliseconds between the previous step's terminal
+  // event and this step's body beginning to execute. Only reported when the
+  // two steps ran back-to-back (the previous event-log entry is a
+  // step_completed/step_failed).
+  stso: z.number().optional(),
+  // Progress counters taken when the STSO gap began. Only present alongside
+  // stso.
+  stepCount: z.number().int().positive().optional(),
+  eventCount: z.number().int().positive().optional(),
+  // Run-started-to-first-step: milliseconds from the `run_started` response
+  // landing (or, under turbo, the local run synthesis instant) until this
+  // step's start POST was issued. A sub-window of ttfs. Only reported
+  // alongside the same eligibility as ttfs.
+  rsfs: z.number().optional(),
+  // Synchronous workflow-function replay duration of only the FINAL replay
+  // pass within the rsfs window (the pass that scheduled the first step),
+  // excluding awaited network I/O. Not accumulated across earlier
+  // pre-first-step passes, so it is not "the replay portion of rsfs". Only
+  // present alongside rsfs, and only for the run's first step.
+  finalSchedulingReplay: z.number().optional(),
+  // Names of the runtime's optional startup-latency optimizations that were
+  // active for this measurement (e.g. 'turbo', 'lazyStepStart',
+  // 'optimisticStart'), so latency metrics can be segmented by them.
+  optimizations: z.array(z.string()).optional(),
+};
+
 const StepCompletedEventSchema = BaseEventSchema.extend({
   eventType: z.literal('step_completed'),
   correlationId: z.string(),
   eventData: z.object({
-    result: z.any(),
+    stepName: z.string().optional(),
+    // Carried so a backend that keys payload refs by workflow name can build
+    // the key without an extra run lookup on this hot per-step write.
+    // Optional: older runtimes omit it and the backend falls back to a read.
+    workflowName: z.string().optional(),
+    result: SerializedDataSchema,
+    ...stepLatencyTelemetryFields,
   }),
 });
 
@@ -34,103 +273,1234 @@ const StepFailedEventSchema = BaseEventSchema.extend({
   eventType: z.literal('step_failed'),
   correlationId: z.string(),
   eventData: z.object({
-    error: z.any(),
-    stack: z.string().optional(),
-    fatal: z.boolean().optional(),
+    stepName: z.string().optional(),
+    // The thrown value, serialized via the workflow serialization pipeline.
+    // Can be any JavaScript value (string, number, object, Error, etc.)
+    error: SerializedDataSchema,
+    /** The attempt that failed (spec >= 9). */
+    attempt: z.number().int().positive().optional(),
+    ...stepLatencyTelemetryFields,
   }),
 });
 
-// TODO: this is not actually used anywhere yet, we could remove it
-// on client and server if needed
+/**
+ * Event created when a step fails and will be retried.
+ * Sets the step status back to 'pending' and records the error.
+ * The error is stored in step.error for debugging.
+ */
 const StepRetryingEventSchema = BaseEventSchema.extend({
   eventType: z.literal('step_retrying'),
   correlationId: z.string(),
   eventData: z.object({
-    attempt: z.number().min(1),
+    stepName: z.string().optional(),
+    // The thrown value, serialized via the workflow serialization pipeline.
+    // Can be any JavaScript value (string, number, object, Error, etc.)
+    error: SerializedDataSchema,
+    retryAfter: z.coerce.date().optional(),
+    /** The attempt that failed (spec >= 9). */
+    attempt: z.number().int().positive().optional(),
+    /**
+     * Queue message id of the orchestrator delivery that wrote this event
+     * (spec >= 9): set only when an inline step's failed attempt moves its
+     * retry to the background. Only a redelivery of this same message
+     * enqueues the step's message again, and only while this is the step's
+     * last event. Absent when the step's own message wrote it.
+     */
+    creatorMessageId: z.string().optional(),
   }),
 });
 
+/**
+ * Event created when a step begins executing.
+ * Transitions the step entity to status 'running' and increments its attempt.
+ *
+ * The optional `stepName` + `input` carry step creation data for the lazy-start
+ * path: when a handler owns a step it is about to run inline (the owned-inline
+ * path in the runtime), it can skip the separate `step_created` round-trip and
+ * send only `step_started` carrying the step input. The World implementation
+ * then atomically creates the step (materializing the step entity and writing a
+ * synthetic `step_created` event so replay still observes it) before starting
+ * it. This mirrors the resilient `run_started` start path above. When `input`
+ * is absent the World requires a prior `step_created` (the legacy contract).
+ */
 const StepStartedEventSchema = BaseEventSchema.extend({
   eventType: z.literal('step_started'),
   correlationId: z.string(),
+  eventData: z
+    .object({
+      stepName: z.string().optional(),
+      attempt: z.number().optional(),
+      // Carried on the lazy-start path (where `input` is present) so the
+      // backend can build the payload ref key without re-reading the run.
+      workflowName: z.string().optional(),
+      // Lazy-start: the dehydrated step input, present only when this
+      // step_started is also responsible for creating the step. On a
+      // single-orchestrator run (spec >= 9) an inline step has no
+      // `step_created`: its first `step_started` carries the input and is its
+      // creation.
+      input: SerializedDataSchema.optional(),
+      /**
+       * A creation-bearing start's execution mode, as
+       * `step_created.eventData.inline` (spec >= 9): always `true`, since
+       * only an inline step is created by its start.
+       */
+      inline: z.boolean().optional(),
+      // Inline step ownership: the queue message ID of the invocation whose
+      // handler is executing this step's body inline. Stamped on the lazy
+      // step_started (and re-stamped on an owner-recovery bare start) so
+      // that a wake replay can tell "this attempt is in flight in a live
+      // invocation" apart from "this attempt died with its process": the
+      // owner's queue message doubles as the liveness lease (a crash means
+      // the queue redelivers that same messageId, which is allowed to
+      // re-execute). Ownership derives from the step's LATEST step_started:
+      // an unstamped bare start (a retry attempt driven by a queued step
+      // message) clears it. Absent on eager steps and from older runtimes.
+      // Requires the queue's messageId to be stable across redeliveries of
+      // one message (see the Queue.createQueueHandler meta contract).
+      ownerMessageId: z.string().optional(),
+    })
+    .optional(),
 });
 
-const HookCreatedEventSchema = BaseEventSchema.extend({
+/**
+ * Event created when a step is first invoked. The World implementation
+ * atomically creates both the event and the step entity.
+ */
+const StepCreatedEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('step_created'),
+  correlationId: z.string(),
+  eventData: z.object({
+    stepName: z.string(),
+    workflowName: z.string().optional(),
+    input: SerializedDataSchema,
+    /**
+     * The step's execution mode, fixed at creation (spec >= 9). `true`: the
+     * orchestrator invocation that wrote this event may run the body in its
+     * own process, and a retry of that invocation may run it again. `false`
+     * (or absent): the step was handed to the queue, and only its queue
+     * message's invocation ever runs the body.
+     */
+    inline: z.boolean().optional(),
+    /**
+     * Queue message id of the orchestrator delivery that wrote this event
+     * (spec >= 9). A background step is enqueued again only by a
+     * redelivery of this same message, and only while the step has no
+     * `step_started`.
+     */
+    creatorMessageId: z.string().optional(),
+  }),
+});
+
+/**
+ * Event created when a hook is first invoked. The World implementation
+ * atomically creates both the event and the hook entity.
+ */
+export const HookCreatedEventSchema = BaseEventSchema.extend({
   eventType: z.literal('hook_created'),
   correlationId: z.string(),
+  eventData: z.object({
+    token: z.string(),
+    tokenRetentionUntil: z.coerce.date().optional(),
+    metadata: SerializedDataSchema.optional(),
+    isWebhook: z.boolean().optional(),
+    isSystem: z.boolean().optional(),
+    /**
+     * `createHook({ experimental_force: true })`: when the token belongs to
+     * another live run, the World takes it over — journaling
+     * `hook_disposed{forceClaimedBy}` in that run's log and re-pointing the
+     * token — instead of answering `hook_conflict`. Requires the
+     * `hookForceClaim` capability.
+     */
+    force: z.boolean().optional(),
+    /**
+     * World-written on a forced creation that did take a token over: the
+     * run and hook it was taken from, plus what a queue message to that run
+     * needs (`workflowName`, `deploymentId`, `runSpecVersion`). Absent when
+     * the token was free. The wake-targeting fields are in the LOG, not only
+     * on the hook entity, so a replay can republish the victim's wake from
+     * the row alone; see `publishForceClaimVictimWake` in @workflow/core.
+     */
+    forceClaimedFrom: z
+      .object({
+        runId: z.string(),
+        hookId: z.string(),
+        workflowName: z.string().optional(),
+        deploymentId: z.string().optional(),
+        runSpecVersion: z.number().optional(),
+      })
+      .optional(),
+  }),
 });
 
 const HookReceivedEventSchema = BaseEventSchema.extend({
   eventType: z.literal('hook_received'),
   correlationId: z.string(),
   eventData: z.object({
-    payload: z.any(), // Serialized payload
+    token: z.string().optional(),
+    // The target run's workflow name, sent by `resumeHook()` on a spec 9 run
+    // so a backend that keys payload refs by workflow name can build the key
+    // without reading the run first (as on `step_completed`). Optional:
+    // older runtimes and older runs omit it.
+    workflowName: z.string().optional(),
+    payload: SerializedDataSchema,
   }),
 });
 
 const HookDisposedEventSchema = BaseEventSchema.extend({
   eventType: z.literal('hook_disposed'),
   correlationId: z.string(),
+  eventData: z
+    .object({
+      token: z.string().optional(),
+      /**
+       * World-written: this disposal was not the run's own. Another run
+       * took the hook's token with `experimental_force`, and this names
+       * it. The hook consumer rejects the hook's awaiters with
+       * `HookForceClaimedError` when it reads this row.
+       */
+      forceClaimedBy: z
+        .object({ runId: z.string(), hookId: z.string() })
+        .optional(),
+    })
+    .optional(),
 });
 
-// TODO: not used yet
-const WorkflowCompletedEventSchema = BaseEventSchema.extend({
-  eventType: z.literal('workflow_completed'),
-});
-
-// TODO: not used yet
-const WorkflowFailedEventSchema = BaseEventSchema.extend({
-  eventType: z.literal('workflow_failed'),
+/**
+ * Event created by World implementations when a hook_created request
+ * conflicts with an existing hook token. This event is NOT user-creatable -
+ * it is only returned by the World when a token conflict is detected.
+ *
+ * When the hook consumer sees this event, it should reject any awaited
+ * promises with a HookTokenConflictError.
+ */
+const HookConflictEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('hook_conflict'),
+  correlationId: z.string(),
   eventData: z.object({
-    error: z.any(),
+    token: z.string(),
+    // TODO: Make this required once all persisted hook_conflict events and
+    // remote World implementations always include the active hook owner's run ID.
+    conflictingRunId: z.string().optional(),
+    /**
+     * Set when the creation asked for `force` and the World declined to take
+     * the token over. `victim-spec-version`: the run holding the token was
+     * started at a spec version below
+     * `SPEC_VERSION_SUPPORTS_HOOK_FORCE_CLAIM`, so its runtime would not
+     * understand the involuntary disposal — the forced hook gets the
+     * ordinary `HookConflictError` it opted out of instead of stranding
+     * that run. Absent on a conflict answered by a World that does not
+     * implement forcing at all. (A run's `start({ experimental_hook })` Hook is taken like
+     * any other Hook, so it is never a reason to refuse.)
+     */
+    forceRefusedReason: z.literal('victim-spec-version').optional(),
   }),
 });
 
-// TODO: not used yet
-const WorkflowStartedEventSchema = BaseEventSchema.extend({
-  eventType: z.literal('workflow_started'),
+/**
+ * Sealed-log filler event (specVersion >= 7). Written ONLY by the World's
+ * backend when it seals a slot whose writer allocated the position and died
+ * before committing (see `SPEC_VERSION_SUPPORTS_SEALED_LOG`). It occupies its
+ * slot, so density arithmetic and cursors count it, but carries no workflow
+ * meaning: replay steps over it without delivering it to any consumer and
+ * without advancing the deterministic clock. NOT user-creatable, and absent
+ * from `CreateEventSchema` for that reason.
+ */
+const NoopEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('noop'),
+  eventData: z
+    .object({
+      sealed: z.boolean().optional(),
+    })
+    .passthrough()
+    .optional(),
 });
 
-// Discriminated union (used for both creation requests and server responses)
+const WaitCreatedEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('wait_created'),
+  correlationId: z.string(),
+  eventData: z.object({
+    resumeAt: z.coerce.date(),
+    /**
+     * Queue message id of the orchestrator delivery that wrote this event
+     * (spec >= 9). Only that delivery, or a redelivery of the same message,
+     * schedules the wait's timer.
+     */
+    creatorMessageId: z.string().optional(),
+  }),
+});
+
+const WaitCompletedEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('wait_completed'),
+  correlationId: z.string(),
+  eventData: z
+    .object({
+      resumeAt: z.coerce.date().optional(),
+    })
+    .optional(),
+});
+
+const AttributeWriterSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('workflow'),
+  }),
+  z.object({
+    type: z.literal('step'),
+    stepId: z.string(),
+    attempt: z.number(),
+  }),
+]);
+
+/**
+ * Event created when workflow or step code changes the run's plaintext
+ * attributes. The World materializes changes into `run.attributes`.
+ */
+const AttrSetEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('attr_set'),
+  correlationId: z.string().optional(),
+  eventData: z.object({
+    changes: AttributeChangesSchema,
+    writer: AttributeWriterSchema,
+    allowReservedAttributes: z.literal(true).optional(),
+  }),
+});
+
+// =============================================================================
+// Run lifecycle events
+// =============================================================================
+
+/**
+ * Event created when a workflow run is first created. The World implementation
+ * atomically creates both the event and the run entity with status 'pending'.
+ */
+const RunCreatedEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('run_created'),
+  eventData: z
+    .object({
+      deploymentId: z.string(),
+      workflowName: z.string(),
+      input: SerializedDataSchema,
+      executionContext: z.record(z.string(), z.any()).optional(),
+      attributes: z.record(z.string(), z.string()).optional(),
+      allowReservedAttributes: z.literal(true).optional(),
+      /**
+       * A dynamic run's serialized workflow VM code. The World materializes it
+       * onto the run record and does not keep a second copy on the event.
+       * Mutually exclusive with `dynamicWorkflowCodeRef`.
+       */
+      dynamicWorkflowCode: SerializedDataSchema.optional(),
+      /**
+       * Ref for dynamic workflow code uploaded before this write. Worlds must
+       * validate it against the caller and run before attaching it.
+       */
+      dynamicWorkflowCodeRef: z.string().optional(),
+      /**
+       * The run's X25519 public key (base64), stamped by SDKs that support
+       * sealed (`encp`) envelopes. Persisted onto the run entity so that
+       * cross-run writers can seal payloads to this run without holding its
+       * symmetric key. Not secret. See `WorkflowRunBaseSchema`.
+       */
+      encryptionPublicKey: z.string().optional(),
+      /**
+       * Create the run's start Hook (id `startHookId(runId)`) for this token
+       * atomically with the run's creation. Only sent to Worlds that declare
+       * `capabilities.atomicStartHook`; see `start-hook.ts` for the admission
+       * contract. A stored `run_created` keeps it, with `hookId`, as the
+       * record of the start Hook's creation: no `hook_created` is written for
+       * that Hook, so `run_created` stands for one with `{ token, metadata,
+       * tokenRetentionUntil, isWebhook: false }`. A World may strip
+       * `metadata` from the stored copy.
+       */
+      startHook: StartHookSchema.optional(),
+    })
+    .refine(
+      (value) =>
+        value.dynamicWorkflowCode === undefined ||
+        value.dynamicWorkflowCodeRef === undefined,
+      {
+        path: ['dynamicWorkflowCodeRef'],
+        message:
+          'dynamicWorkflowCode and dynamicWorkflowCodeRef are mutually exclusive',
+      }
+    ),
+});
+
+/**
+ * Event created when a workflow run starts executing.
+ * Updates the run entity to status 'running'.
+ *
+ * The optional eventData carries run creation data for the resilient start path:
+ * when the run_created event failed (e.g., storage outage during start()), the
+ * runtime passes the run input through the queue so the server can create the run
+ * on the run_started call if it doesn't exist yet.
+ *
+ * On a spec >= 9 run, a `run_started` that created its run may also be stored
+ * with that data at the run's first slot, standing for the run's creation, with
+ * no `run_created` in the log. Readers accept that shape (`isRunCreationEvent`);
+ * nothing in this SDK asks a World to write it yet.
+ */
+const RunStartedEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('run_started'),
+  eventData: z
+    .object({
+      input: SerializedDataSchema.optional(),
+      deploymentId: z.string().optional(),
+      workflowName: z.string().optional(),
+      executionContext: z.record(z.string(), z.any()).optional(),
+      attributes: z.record(z.string(), z.string()).optional(),
+      allowReservedAttributes: z.literal(true).optional(),
+      /**
+       * Mirrors `run_created.eventData.encryptionPublicKey`. Carried here for
+       * the resilient-start path: when the `run_created` write failed, the
+       * server creates the run from this event instead, and without the key
+       * the run would silently lose its ability to receive sealed writes.
+       */
+      encryptionPublicKey: z.string().optional(),
+      /** Dynamic code carried for resilient run creation. */
+      dynamicWorkflowCode: SerializedDataSchema.optional(),
+      dynamicWorkflowCodeRef: z.string().optional(),
+      /**
+       * Mirrors `run_created.eventData.startHook` for the queued copy of an
+       * atomic start. Either write may admit the candidate, and both must
+       * reach the same decision; see `start-hook.ts`.
+       */
+      startHook: StartHookSchema.optional(),
+    })
+    .refine(
+      (value) =>
+        value.dynamicWorkflowCode === undefined ||
+        value.dynamicWorkflowCodeRef === undefined,
+      {
+        path: ['dynamicWorkflowCodeRef'],
+        message:
+          'dynamicWorkflowCode and dynamicWorkflowCodeRef are mutually exclusive',
+      }
+    )
+    .optional(),
+});
+
+/**
+ * Event created when a workflow run completes successfully.
+ * Updates the run entity to status 'completed' with output.
+ */
+const RunCompletedEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('run_completed'),
+  eventData: z.object({
+    output: SerializedDataSchema.optional(),
+  }),
+});
+
+/**
+ * Event created when a workflow run fails.
+ * Updates the run entity to status 'failed' with error.
+ */
+const RunFailedEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('run_failed'),
+  eventData: z.object({
+    // The thrown value, serialized via the workflow serialization pipeline.
+    // Can be any JavaScript value (string, number, object, Error, etc.)
+    error: SerializedDataSchema,
+    // The high-level error category (USER_ERROR, RUNTIME_ERROR, etc.) used
+    // for routing and classification. Kept as plaintext metadata so
+    // observability tools can filter/categorize without needing to decrypt
+    // the full error payload.
+    errorCode: z.string().optional(),
+  }),
+});
+
+/**
+ * Event created when a workflow run is cancelled.
+ * Updates the run entity to status 'cancelled'.
+ */
+const RunCancelledEventSchema = BaseEventSchema.extend({
+  eventType: z.literal('run_cancelled'),
+  eventData: z
+    .object({
+      // Optional free-text reason for the cancellation. Kept as small
+      // plaintext metadata (like run_failed's errorCode) so it survives
+      // resolveData: 'none' and can be displayed without decryption.
+      cancelReason: z.string().max(512).optional(),
+    })
+    .optional(),
+});
+
+// Discriminated union for user-creatable events (requests to world.events.create)
+// Note: hook_conflict is NOT included here - it can only be created by World implementations
 export const CreateEventSchema = z.discriminatedUnion('eventType', [
+  // Run lifecycle events
+  RunCreatedEventSchema,
+  RunStartedEventSchema,
+  RunCompletedEventSchema,
+  RunFailedEventSchema,
+  RunCancelledEventSchema,
+  AttrSetEventSchema,
+  // Step lifecycle events
+  StepCreatedEventSchema,
   StepCompletedEventSchema,
   StepFailedEventSchema,
   StepRetryingEventSchema,
   StepStartedEventSchema,
+  // Hook lifecycle events
   HookCreatedEventSchema,
   HookReceivedEventSchema,
   HookDisposedEventSchema,
-  WorkflowCompletedEventSchema,
-  WorkflowFailedEventSchema,
-  WorkflowStartedEventSchema,
+  // Wait lifecycle events
+  WaitCreatedEventSchema,
+  WaitCompletedEventSchema,
 ]);
 
-// Server response include runId, eventId, and createdAt
-export const EventSchema = CreateEventSchema.and(
+// Discriminated union for ALL events (includes World-only events like hook_conflict)
+// This is used for reading events from the event log
+const AllEventsSchema = z.discriminatedUnion('eventType', [
+  // Run lifecycle events
+  RunCreatedEventSchema,
+  RunStartedEventSchema,
+  RunCompletedEventSchema,
+  RunFailedEventSchema,
+  RunCancelledEventSchema,
+  AttrSetEventSchema,
+  // Step lifecycle events
+  StepCreatedEventSchema,
+  StepCompletedEventSchema,
+  StepFailedEventSchema,
+  StepRetryingEventSchema,
+  StepStartedEventSchema,
+  // Hook lifecycle events
+  HookCreatedEventSchema,
+  HookReceivedEventSchema,
+  HookDisposedEventSchema,
+  HookConflictEventSchema, // World-only: created when hook token conflicts
+  // Wait lifecycle events
+  WaitCreatedEventSchema,
+  WaitCompletedEventSchema,
+  NoopEventSchema, // World-only: sealed-log filler for an abandoned slot
+]);
+
+// Server response includes runId, eventId, and createdAt
+// specVersion is optional in database for backward compatibility
+export const EventSchema = AllEventsSchema.and(
   z.object({
     runId: z.string(),
     eventId: z.string(),
     createdAt: z.coerce.date(),
+    occurredAt: z.coerce.date().optional(),
+    specVersion: z.number().optional(),
+    /**
+     * Lazy hook resume idempotency key, persisted on `hook_received` events so
+     * the queue consumer can detect that the producer's concurrent direct write
+     * already landed in the run_started preload and skip its own re-ensure.
+     * Mirrors {@link CreateEventParams.resumeId}; absent on all other events and
+     * on legacy (non-lazy) resumes.
+     */
+    resumeId: z.string().optional(),
   })
 );
 
 // Inferred types
 export type Event = z.infer<typeof EventSchema>;
-export type CreateEventRequest = z.infer<typeof CreateEventSchema>;
+export type EventOfType<T extends EventType> = Extract<Event, { eventType: T }>;
+export type EventRequestOfType<T extends EventType> = Extract<
+  AnyEventRequest,
+  { eventType: T }
+>;
+export type HookCreatedEvent = EventOfType<'hook_created'>;
+export type HookCreatedEventRequest = EventRequestOfType<'hook_created'>;
 export type HookReceivedEvent = z.infer<typeof HookReceivedEventSchema>;
+export type HookConflictEvent = z.infer<typeof HookConflictEventSchema>;
+
+/**
+ * Union of all possible event request types.
+ * @internal Use CreateEventRequest or RunCreatedEventRequest instead.
+ */
+export type AnyEventRequest = z.infer<typeof CreateEventSchema>;
+
+type ChildEntityCreationEventRequest =
+  | EventRequestOfType<ChildEntityCreationEventType>
+  | (EventRequestOfType<'step_started'> & {
+      eventData: {
+        stepName: string;
+        input: unknown;
+      };
+    });
+
+/** Includes lazy step_started requests that create their step on demand. */
+export function isChildEntityCreationEvent(
+  event: AnyEventRequest
+): event is ChildEntityCreationEventRequest {
+  if (isChildEntityCreationEventType(event.eventType)) return true;
+  return (
+    event.eventType === 'step_started' &&
+    typeof event.eventData?.stepName === 'string' &&
+    event.eventData.input !== undefined
+  );
+}
+
+/**
+ * Event request for creating a new workflow run.
+ * Can be used with a client-generated runId or null for server-generated.
+ */
+export type RunCreatedEventRequest = z.infer<typeof RunCreatedEventSchema>;
+
+/**
+ * Event request types that require an existing runId.
+ * This is the common case for all events except run_created.
+ */
+export type CreateEventRequest = Exclude<
+  AnyEventRequest,
+  RunCreatedEventRequest
+>;
 
 export interface CreateEventParams {
+  v1Compat?: boolean;
+  /**
+   * Whether the run's orchestrator is making this write (spec >= 9).
+   *
+   * In-band writes are everything the orchestrator invocation writes:
+   * `run_started`, `run_completed`, `run_failed`, `step_created`,
+   * `wait_created`, `wait_completed`, `hook_created`, `hook_disposed`, an
+   * `attr_set` from the workflow body, a `hook_received` it writes for a
+   * resume carried on its own queue message, and every event of a step it
+   * runs inline. Out-of-band writes are everything else: events from a
+   * background step's invocation, `hook_received` from `resumeHook()` and
+   * webhooks, `run_cancelled` from `cancel()`, and `attr_set` from
+   * `setAttributes()` outside the workflow body. Classification is by writer,
+   * not by event type.
+   *
+   * A World that creates spec 9 runs implements the in-band fence
+   * (`WorldCapabilities.inBandFence`): it counts the positions it allocates to
+   * in-band writes, and accepts an in-band write only when
+   * {@link expectedSeqInBand} equals that count.
+   */
+  inBand?: boolean;
+  /**
+   * The orchestrator's count of in-band positions, required with
+   * `inBand: true` (a World answers an in-band write without it with a 400).
+   * The runtime starts
+   * it from {@link EventListResponse.snapshot}`.seqInBand` of the first page
+   * of the delivery's full log load, and advances it by the number of
+   * positions each accepted in-band write allocated (1 for a single create,
+   * the event count for a batch).
+   *
+   * The World refuses a write whose value differs from its count with
+   * `InBandSupersededError`, and writes and allocates nothing for it, so a
+   * refusal never leaves a hole in the log.
+   */
+  expectedSeqInBand?: number;
+  /**
+   * `'skip-step-inputs'` applies only to the event-log page this create
+   * returns (the `sinceCursor` delta or a replay preload), never to the
+   * created `event` or the returned `step` entity, whose `input` is what step
+   * execution reads. See {@link EventsResolveData}.
+   *
+   * Code that forwards these params to an entity read (runs, steps, hooks,
+   * whose `resolveData` is a plain {@link ResolveData}) must map them with
+   * `entityResolveData()` first.
+   */
+  resolveData?: EventsResolveData;
+  /**
+   * Lazy hook resume idempotency key. Set only by `resumeHook()` when it
+   * persists a `hook_received` event whose creation must be deduplicated
+   * against a concurrent re-ensure from the queue consumer. The World routes
+   * it to the backend's `(runId, resumeId)` constraint so both writers
+   * converge on exactly one event. Only meaningful for `hook_received`.
+   */
+  resumeId?: string;
+  /**
+   * Content digest of the serialized resume payload, computed once by
+   * `resumeHook()` and forwarded identically on the direct write and the queue
+   * re-ensure. The World routes it to the backend so both writers record the
+   * same digest on the `(runId, resumeId)` constraint. Only meaningful
+   * alongside {@link resumeId}.
+   */
+  resumePayloadDigest?: string;
+  /** Require the server's deduplicated resolved-hook endpoint. Unsupported
+   * backends must reject before writing rather than silently dropping dedup. */
+  requireHookResumeDedup?: boolean;
+  /**
+   * Marks a `step_created` create as the queue consumer's re-ensure of a
+   * resilient step dispatch (a step message carrying `stepInput`, see
+   * `WorkflowInvokePayload.stepInput`): the producer's direct write was
+   * parallelized with the queue publish and may have failed. Only meaningful
+   * for `step_created`.
+   *
+   * Advisory, and not set by the current `@workflow/core` runtime, which
+   * publishes a step's queue message only after its create. A producer that
+   * parallelizes the two accepts that a create can come back refused while
+   * the message carrying its payload is already out, and a backend MAY use
+   * this flag to narrow that window: refuse the re-ensure (world-vercel surfaces the
+   * backend's 410 as `RunExpiredError`, which the consumer treats as "nothing
+   * left to execute" and acks the message) when it has recorded a refusal for
+   * this correlation id and no step entity exists. Best-effort by nature (a
+   * marker written at refusal time cannot be ordered before the redelivery it
+   * is meant to stop), so it hardens, and does not close, the window. Worlds
+   * may ignore this flag entirely.
+   */
+  viaStepDispatch?: boolean;
+  /**
+   * Marks a `step_failed` write that records the failure of a step body this
+   * invocation already ran. Losing such a write to queue redelivery runs the
+   * body again, so a World may keep a throttled write waiting longer than it
+   * otherwise would (world-vercel waits until the invocation's deadline).
+   * `step_failed` needs the mark because the runtime also writes it for a step
+   * whose arguments failed to serialize, where no body ran. `step_completed`
+   * and `step_retrying` are only ever written after a body ran. Advisory;
+   * Worlds may ignore it.
+   */
+  afterStepBody?: true;
+  /** Request ID (x-vercel-id when on Vercel) for correlating request logs with workflow events. */
+  requestId?: string;
+  /**
+   * Compute instance whose handler is writing this event (`COMPUTE_INSTANCE_ID`
+   * in @workflow/core). Ambient per-event identity like {@link requestId},
+   * which distinguishes invocations *within* an instance. Read back via
+   * `AnalyticsEventSchema` / `AnalyticsStepSchema`.
+   */
+  computeInstanceId?: string;
+  /**
+   * Creation time of the step a `step_started` starts, as epoch milliseconds:
+   * the `createdAt` the World answered that step's `step_created` with. Set
+   * only on the first-attempt `step_started` of a background step (one
+   * created by `step_created`, and started by its own queue message), so a
+   * World can report the step's creation-to-start latency without reading
+   * the log. Request telemetry, not workflow state: Worlds may ignore it and
+   * must not persist it into the event log.
+   */
+  stepCreatedAt?: number;
+  /**
+   * How many events the writer held in its loaded log when it decided to write
+   * this one: equivalently, the slot it expects to land on minus one. Sent by
+   * the replay loop and the suspension handler, which merge the report below
+   * back into their loaded log. Omitted by callers with no loaded log to be
+   * stale against, the step executor included: for those the report would be
+   * a read the World does for no one. Independent concurrent hook registrations
+   * in a hooks-only suspension also omit it deliberately: the runtime verifies
+   * their committed events together after every write settles, and reloads if
+   * they do not form a complete suffix. Absence does not imply no loaded log;
+   * without a count there is no evidence for count-based stale rejection.
+   *
+   * A World's slots are dense and 1-based (see `Storage.events`), so a count
+   * and a position are the same number. An id that is not a position does not
+   * produce a count here: it throws, since the runtime cannot state a
+   * snapshot for a log it cannot place. Such a World attempts
+   * `eventCount + 1`, and on contention **bumps** to the next free slot and
+   * commits there anyway: a stale count never rejects a write. What it does
+   * instead is report: when the committed slot is higher than the one asked
+   * for, the events occupying the skipped slots come back on the success
+   * response in {@link EventResult.events} / `cursor` / `hasMore`, so the
+   * writer learns exactly what it had not seen.
+   *
+   * Understating is safe and overstating is not. A count below the writer's
+   * true position only widens the reported span, and the client discards what
+   * its log already holds. A count above it makes the World report less than
+   * the writer is missing, which is a hole the writer never learns about.
+   *
+   * A batch of writes issued from one snapshot starts from the same
+   * `eventCount`; they land on consecutive slots in whatever order the World
+   * serializes them, which is why they can stay a parallel fan-out instead of
+   * a chain of round-trips. The count a given write sends is the writer's
+   * position *at that moment*, so it advances mid-batch as reported events are
+   * folded back into the loaded log: a write issued after a sibling's
+   * bump-and-report already holds the slots that report named, and asks for a
+   * slot above them.
+   *
+   * For an in-band write on a spec >= 9 run the report is authoritative: the
+   * success response carries every event in positions `eventCount + 1` up to
+   * (not including) the write's own first position, in position order, each
+   * committed or sealed. When the World cannot produce all of it within its
+   * request budget it still answers success, with `hasMore: true`
+   * ({@link EventResult}). The orchestrator consumes an
+   * event it wrote that resolves a promise only after merging this report,
+   * so the VM consumes events in log order. Out-of-band writes get no report.
+   */
+  eventCount?: number;
+  /**
+   * Timestamp for when the event occurred on the client side. Worlds that
+   * support this can persist it separately from `createdAt`, which represents
+   * when the backing service accepted or stored the event.
+   */
+  occurredAt?: Date;
+  /**
+   * Number of consecutive replay divergences resolved by this event write.
+   *
+   * This is request telemetry, not workflow state. Worlds may use it for
+   * metrics and diagnostics, but must not require it for event
+   * materialization or persist it into the event log.
+   */
+  replayDivergenceCount?: number;
+  /**
+   * Inline-delta optimization (opt-in). When set, the World MAY return,
+   * on the resulting {@link EventResult}, the first page of events written
+   * strictly after this cursor (via `events`/`cursor`/`hasMore`): the
+   * same page an `events.list({ cursor: sinceCursor, sortOrder: 'asc' })`
+   * call would return immediately after this write. Outside turbo mode the
+   * runtime sets this on every write it makes from the orchestrator loop
+   * and folds any returned delta into its in-memory log, so each write
+   * carries the log forward and the loop reads it back for free: instead of
+   * re-reading its own just-written events (and any events interleaved
+   * in-band, such as `hook_received`), it consumes the authoritative delta
+   * the write already had to compute. Turbo mode does not set it: the
+   * point there is to keep the first invocation's writes as cheap as
+   * possible, and it has no loaded log to extend.
+   *
+   * The suspension handler sets it too, on the hook create of a single-hook
+   * suspension. That write is the whole continuation for the hook's own
+   * awaiter — the event it commits is what settles it — so a delta lets the
+   * runtime advance the workflow in the same process instead of enqueueing a
+   * message whose only job is to read back the event it just wrote. It is
+   * asked for on one hook create per suspension because two creates issued
+   * from the same cursor each diff against it, and only one of the returned
+   * deltas can be folded into the log.
+   *
+   * A World that answers it on `hook_created` MUST answer it on the
+   * `hook_conflict` a create whose token is already claimed commits instead.
+   * That event settles the same awaiter — a payload await rejects, a
+   * `hook.getConflict()` resolves with the conflicting run — and the runtime
+   * continues over it in-process just the same, so withholding the delta
+   * there would silently cost a delivery on exactly the path the caller
+   * asked to avoid one on. The delta is keyed on the requested event type,
+   * not the committed one; there is nothing extra to compute, since it is the
+   * same slice of the log either way.
+   *
+   * The cursor MUST share `events.list` semantics: the returned `events`
+   * are everything sorted strictly after `sinceCursor`, `cursor` is the
+   * position past the last returned event, and `hasMore` indicates a
+   * further page exists. A World MAY return a single page and set
+   * `hasMore: true` rather than paginating to exhaustion. The runtime
+   * consumes that page and continues from its cursor, so it never reads the
+   * returned prefix again.
+   * Returning these fields at all is OPTIONAL: a World that omits them is
+   * fully supported; the runtime falls back to `events.list`. This
+   * preserves the same divergence guarantees as the fetch path because the
+   * delta is computed atomically against the same log the fetch would read.
+   */
+  sinceCursor?: string;
+  /**
+   * Run-started preload opt-out (advisory). On a `run_started` write a World
+   * MAY preload the run's event log onto the {@link EventResult}
+   * (`events`/`cursor`/`hasMore`) so the runtime can skip its initial
+   * `events.list`. The turbo first invocation backgrounds `run_started`
+   * purely as a write barrier and never reads that preload, so it sets this
+   * to tell the World to skip the wasted list+resolve, trimming the
+   * `run_started` round-trip that the chained first `step_started` waits on.
+   * A World that ignores it (or doesn't preload) remains fully correct: the
+   * runtime falls back to `events.list` whenever it actually needs the log.
+   * Only honored for `run_started`; ignored for other event types.
+   *
+   * Named to match the World boundary, the wire frame meta, and the backend
+   * option end-to-end (cf. {@link sinceCursor}) so the single name greps
+   * across the SDK and the backend.
+   */
+  skipPreload?: true;
+  /**
+   * Replay-log preload opt-in (advisory): the `hook_received` dual of
+   * {@link skipPreload}. Set only by the queue consumer's idempotent
+   * `hook_received` re-ensure on a lazy hook resume (alongside
+   * {@link resumeId} + {@link resumePayloadDigest}). A World MAY return the
+   * run's current replay event log with the event creation
+   * (`events`/`cursor`/`hasMore`, plus `run` and `maxEvents`) so the runtime
+   * can initialize replay from this one request and skip both the
+   * `run_started` write and the initial `events.list`.
+   *
+   * The runtime trusts a returned preload as replay input ONLY when all of
+   * the following hold (a World that cannot guarantee them should return
+   * its normal {@link EventResult} instead):
+   *
+   * - `events` is the COMPLETE log with `hasMore: false` (the runtime has no
+   *   cursor-continuation machinery on this path; a bounded page is
+   *   rejected).
+   * - `cursor` is a valid non-null resume point matching `events.list`
+   *   semantics (present even on the final page).
+   * - `run` (with `run.startedAt`) and `maxEvents` are present: this
+   *   response plays `run_started`'s role, including the event-ceiling
+   *   handshake.
+   * - The log contains the run's creation (`run_created`, or a creating
+   *   `run_started` at the first slot: `isRunCreationEvent`), `run_started`,
+   *   and the canonical
+   *   `hook_received` carrying the requested {@link resumeId}.
+   * - `events` uses the same ascending ordering semantics as `events.list`.
+   * - The log is read atomically/consistently WITH (i.e. no earlier than)
+   *   the `hook_received` write, so no concurrently committed event can be
+   *   omitted from the replay input.
+   *
+   * Anything less and the runtime observes that no usable replay preload
+   * came back and falls back to the existing `run_started` setup. A World
+   * that ignores the param entirely remains fully correct. Only meaningful
+   * for `hook_received`; ignored for other event types. Producer-side
+   * `resumeHook()` must not set it.
+   */
+  preloadEvents?: true;
+  /**
+   * Synchronously observes each validated event in a streamed replay-log
+   * response. A retried request may observe the same event again; observers
+   * must therefore be idempotent. Throwing aborts the operation and the World
+   * must surface the original error without retrying or reclassifying it.
+   */
+  replayEventObserver?: (event: Event) => void;
+}
+
+/**
+ * Result of creating an event. Includes the created event and optionally
+ * the entity that was created or updated as a result of the event, with any updates applied to it.
+ *
+ * Note: `event` is optional to support legacy runs where event storage is skipped.
+ */
+export type EventResult<T extends EventType = EventType> = {
+  /** The created event (optional for legacy compatibility) */
+  event?: Event;
+  /**
+   * Optional ascending events.list cursor immediately after `event`, minted
+   * by the World that owns the cursor format. This does not attest that the
+   * caller holds any earlier events. The runtime may advance to it only after
+   * proving that its loaded prefix plus committed responses covers every slot
+   * through this event. Worlds that omit it retain the normal reload path.
+   * When supplied, `event` MUST match what ascending events.list returns for
+   * that slot with the same resolveData option, including stored timestamps,
+   * normalized retention, metadata bytes, and hook-conflict details. The
+   * runtime uses this stored event as replay input, not an echo of the request.
+   */
+  eventCursor?: string;
+  /** The workflow run entity (for run_* events) */
+  run?: WorkflowRun;
+  /** The step entity (for step_* events) */
+  step?: Step;
+  /** The hook entity (for hook_created events) */
+  hook?: Hook;
+  /** The wait entity (for wait_created/wait_completed events) */
+  wait?: Wait;
+  /**
+   * Lazy step start: set to `true` only when a `step_started` event with
+   * step-creation data atomically *created* the step on this call (the
+   * caller won the create-claim), as opposed to transitioning a step that
+   * already existed. The owned-inline runtime path uses this as the
+   * exactly-once ownership signal: it runs the step body inline only when
+   * it created the step, so a concurrent handler that lost the create race
+   * (and gets `EntityConflictError`/skipped) never double-executes. Absent
+   * (undefined) on the legacy path and from older servers/worlds, which is
+   * the safe default (treated as "not the lazy creator").
+   */
+  stepCreated?: true;
+  /** Server-owned max event count for the run (run-lifecycle responses); the runtime enforces it. */
+  maxEvents?: number;
+  /**
+   * How many positions this write allocated (spec >= 9):
+   * 1 for a create that appended its event, 0 for one that converged on an
+   * event the log already held (an idempotent replay). The orchestrator
+   * advances its in-band count by this number. Absent from a World that
+   * does not report it; the runtime then infers it.
+   */
+  allocated?: number;
+} & (
+  | {
+      /**
+       * Events with data resolved. Five producers populate this:
+       *
+       * - On a `run_started` response: all events up to this point, so the
+       *   runtime can skip the initial `events.list` call and reduce TTFB.
+       * - On a step-terminal write (`step_completed` / `step_failed`) when
+       *   the caller passed {@link CreateEventParams.sinceCursor}: the delta
+       *   of events written strictly after that cursor, so the inline loop
+       *   can skip the per-step incremental `events.list` round-trip.
+       * - On a hook-create write when the caller passed
+       *   {@link CreateEventParams.sinceCursor}: the same delta, which
+       *   includes the event the create committed — the `hook_created`, or
+       *   the `hook_conflict` of an already-claimed token — so the hook's
+       *   awaiter can be settled in the writing process rather than by a
+       *   re-invocation that reads the event back.
+       * - On a `hook_received` response when the caller passed
+       *   {@link CreateEventParams.preloadEvents}: the run's current replay
+       *   log through the canonical `hook_received`, so the lazy hook queue
+       *   consumer can skip both the `run_started` write and the initial
+       *   `events.list`.
+       * - On any response whose committed slot came out higher than the one
+       *   {@link CreateEventParams.eventCount} asked for:
+       *   the events occupying the slots that were skipped over, in slot
+       *   order. This is the "report" half of bump-and-report: the write
+       *   succeeded, and these are the events the writer had not seen when it
+       *   decided to make it.
+       */
+      events: Event[];
+      /** Pagination cursor for `events`, matching events.list semantics. */
+      cursor: string | null;
+      /**
+       * Whether additional event pages are available for `events`. On an
+       * in-band write's response (spec >= 9), `true` also means the World
+       * could not produce the complete skipped-slot report within its
+       * request budget: the write committed, and the writer must reload the
+       * log before it consumes anything the write resolves, since the report
+       * may be missing events that sit below its own.
+       */
+      hasMore: boolean;
+    }
+  | {
+      events?: undefined;
+      cursor?: undefined;
+      hasMore?: undefined;
+    }
+) &
+  (T extends 'run_created'
+    ? { run: WorkflowRun }
+    : T extends 'run_started'
+      ? { run: StartedWorkflowRun }
+      : T extends 'step_started'
+        ? {
+            /**
+             * The started step, on a run that keeps step entities (spec 8 and
+             * below). A single-orchestrator run (spec >= 9) keeps none, so
+             * its start returns no step.
+             */
+            step?: StartedStep;
+          }
+        : unknown);
+
+/**
+ * One event of a batch write ({@link Storage.events.createBatch}), in request
+ * order, which is the order the events land in the run's log.
+ */
+export interface BatchEventRequest {
+  /** The event, same discriminated union the single `create` takes. */
+  event: CreateEventRequest;
+  /**
+   * Client event time for this event. Under slot identity this is the source
+   * of the durable event's `createdAt` (a slot id carries no time), so the
+   * timestamp a replay observes is the one the writer chose: set it to the
+   * instant the event logically occurred.
+   */
+  occurredAt?: Date;
+  /**
+   * Compute-instance attribution for this event, same as the single create's
+   * {@link CreateEventParams.computeInstanceId}. Set on the `step_started`
+   * half of a pre-claimed inline pair so a batched claim attributes the
+   * executing instance exactly like the lazy claim it replaces.
+   */
+  computeInstanceId?: string;
+  /**
+   * Step creation time for a `step_started`, same as the single create's
+   * {@link CreateEventParams.stepCreatedAt}.
+   */
+  stepCreatedAt?: number;
+}
+
+/** Per-batch parameters for {@link Storage.events.createBatch}. */
+export interface CreateEventBatchParams {
   resolveData?: ResolveData;
+  /**
+   * Request id for per-write attribution, same as the single create's
+   * {@link CreateEventParams.requestId}: stamped on every event in the batch
+   * so a batched write's usage facts and telemetry carry the same request
+   * attribution its single-path twin would.
+   */
+  requestId?: string;
+  /**
+   * Whether the run's orchestrator makes this batch (spec >= 9), as
+   * {@link CreateEventParams.inBand}. Every event of a batch shares it.
+   */
+  inBand?: boolean;
+  /**
+   * The orchestrator's in-band count for the whole block, as
+   * {@link CreateEventParams.expectedSeqInBand}. The World allocates the
+   * block's positions in one conditional allocation.
+   */
+  expectedSeqInBand?: number;
+  /**
+   * The position the batch was decided from, as
+   * {@link CreateEventParams.eventCount}; required with `inBand: true`. The
+   * response then carries the skipped-slot report for
+   * the block at the top level (`events` / `hasMore` on
+   * {@link EventBatchResult}).
+   */
+  eventCount?: number;
+}
+
+/**
+ * One event's outcome in a batch response, index-aligned with the submitted
+ * events. `error === undefined` discriminates success.
+ *
+ * A batch is processed as a whole (HTTP 200 whenever the World evaluated it);
+ * each event reports the outcome its OWN single `create` would have had:
+ *
+ * - success → `status: 200` plus the committed event and the same
+ *   materialized entity the single create returns (`step` for step events,
+ *   `wait` for wait events, `run` for run terminals);
+ * - rejection → the status code and error code the single create would have
+ *   failed with, so callers reuse their single-path conflict handling per
+ *   event. A `409`/`conflict` means the entity was not in the prior state
+ *   the event requires, most commonly because an earlier delivery already
+ *   applied the same event, but possibly because the entity reached a
+ *   DIFFERENT state (e.g. `step_completed` conflicting because the step
+ *   failed). A 409 alone does not prove the equivalent effect was applied;
+ *   a caller that needs effect-equivalence consults the entity (returned on
+ *   sibling successes, or reloaded).
+ *
+ * The batch is atomic per attempt, not all-or-nothing across the submitted
+ * set: a World may drop rejected events and commit the survivors, so a batch
+ * can return a mix of 200s and 409s from one call.
+ *
+ * Retry semantics: a transport retry of a committed batch converges to
+ * per-event 409s ONLY for entity-conditioned events: creates and terminal
+ * transitions. A standalone bare `step_started` or a `step_retrying`
+ * re-patches its step on every attempt and does NOT converge, and
+ * `hook_received` appends a new row per attempt, so `world-vercel` rejects
+ * `hook_received` in a batch outright and only auto-retries batches whose
+ * every event is retry-convergent.
+ *
+ * The born-running `step_created`+`step_started` pair converges (the pair's
+ * create fences it) but is still excluded from auto-retry, because
+ * convergence alone is not enough for the caller: a pair 409 means "this step
+ * already exists", and on a retry that is indistinguishable from "my own
+ * previous attempt committed it". A caller that reads the 409 as a lost claim
+ * would skip a body it actually owns, so a batch carrying a `step_started`
+ * runs single-attempt and leaves transient-failure recovery to queue
+ * redelivery.
+ */
+export type BatchEventItemResult =
+  | {
+      status: 200;
+      error?: undefined;
+      message?: undefined;
+      event: Event;
+      run?: WorkflowRun;
+      step?: Step;
+      wait?: Wait;
+    }
+  | {
+      status: number;
+      error: string;
+      message: string;
+      event?: undefined;
+      run?: undefined;
+      step?: undefined;
+      wait?: undefined;
+    };
+
+/** Result of {@link Storage.events.createBatch}. */
+export interface EventBatchResult {
+  /** One entry per submitted event, in request order. */
+  results: BatchEventItemResult[];
+  /**
+   * The skipped-slot report of an in-band batch (spec >= 9): the events in
+   * positions `eventCount + 1` up to the block's first position.
+   */
+  events?: Event[];
+  /**
+   * `true` when the skipped-slot report in `events` is incomplete, as
+   * `hasMore` on an in-band write's {@link EventResult}: the writer reloads
+   * the log before it consumes anything the batch resolves.
+   */
+  hasMore?: boolean;
+  /**
+   * How many positions the batch allocated: the admitted items, one block.
+   * As {@link EventResult.allocated}; absent when the World does not report
+   * it.
+   */
+  allocated?: number;
+}
+
+export interface GetEventParams {
+  resolveData?: ResolveData;
+  /**
+   * The run's spec version, when the caller knows it. A hint a World may use
+   * to pick how it reads; it never changes which event is returned. See
+   * {@link ListEventsParams.specVersion}.
+   */
+  specVersion?: number;
+}
+
+/**
+ * The sequencer state a World read, strongly consistently, before it listed
+ * a run's log (spec >= 9). Positions are slots.
+ */
+export interface EventLogSnapshot {
+  /** Highest position allocated to any write when the list began. */
+  seq: number;
+  /** Number of positions allocated to in-band writes when the list began. */
+  seqInBand: number;
+}
+
+/**
+ * A run's in-band count right after its creation, before any other write:
+ * `run_created` counts as the run's first in-band position, so the run's
+ * first orchestrator write (`run_started`) expects this value. It is the same
+ * when `run_created` never landed and `run_started` creates the run (resilient
+ * start): the creation the World performs for it counts in its place, also
+ * when that `run_started` holds the first slot as the creation itself
+ * (`isRunCreationEvent`). The log then has one event where the count says
+ * two, which is why a count is only ever read from a snapshot.
+ *
+ * The runtime adopts it in place of a load snapshot when it knows the log
+ * holds nothing but the run's creation: a run with no events yet, and turbo
+ * mode's first delivery, which skips the initial load.
+ */
+export const IN_BAND_SEQ_AT_RUN_CREATION = 1;
+
+/**
+ * Result of {@link Storage.events.list}.
+ *
+ * `snapshot` is set by a World that implements the in-band writer fence
+ * (`WorldCapabilities.inBandFence`), on every page of a slot-numbered run's
+ * log where the World reads one. It is read before the listing, so a full
+ * load (following `cursor` until `hasMore` is false) covers every position
+ * up to the FIRST page's `snapshot.seq`, each one committed or sealed as a
+ * `noop`. A fenced writer takes its
+ * {@link CreateEventParams.expectedSeqInBand} from the first page's
+ * `snapshot.seqInBand`, never from counting events: a count cannot tell
+ * which positions were in-band.
+ *
+ * On a single-orchestrator run (spec >= 9) it is required on every page: the
+ * runtime refuses to write in-band from a full load whose first page has
+ * none. On earlier runs a fencing World that lists no snapshot reports the
+ * counters on a refusal (`InBandSupersededError`) instead.
+ */
+export type EventListResponse = PaginatedResponse<Event> & {
+  snapshot?: EventLogSnapshot;
+  /**
+   * The run's event ceiling, the same value {@link EventResult.maxEvents}
+   * carries on a run-lifecycle write. Optional: a World that does not report
+   * it here leaves the runtime with the ceiling from its own `run_started`
+   * write, if any. The spec 9 orchestrator, which writes `run_started` only on
+   * a run's first delivery, enforces it on every later one from its log load.
+   */
+  maxEvents?: number;
+};
+
+/** Options for {@link Storage.events.subscribe}. */
+export interface EventsSubscribeOptions {
+  /** Called once when the World stops delivering for a transport reason. */
+  onError?: (error: unknown) => void;
 }
 
 export interface ListEventsParams {
   runId: string;
+  /** Omit `limit` to return every remaining event. */
   pagination?: PaginationOptions;
-  resolveData?: ResolveData;
+  resolveData?: EventsResolveData;
+  /**
+   * Aborted when the caller has given up on the read. A World may stop the
+   * request early and reject; one that ignores it is still correct, since the
+   * caller no longer uses the result.
+   */
+  signal?: AbortSignal;
+  /**
+   * The run's spec version, when the caller knows it. A hint a World may use
+   * to pick how it reads; it never changes which events are returned. The
+   * spec 9 orchestrator passes it on its own log loads, which need
+   * {@link EventListResponse.snapshot}: world-vercel reads a run stamped 9 or
+   * above from the route that reports it, and every other read from the route
+   * earlier releases use. A World that always returns `snapshot` can ignore
+   * it.
+   */
+  specVersion?: number;
 }
 
 export interface ListEventsByCorrelationIdParams {
   correlationId: string;
+  /**
+   * The run the correlation id belongs to. A correlation id is unique per
+   * run, not globally: a slot-numbered run counts its own steps and waits, so
+   * `step_…001` names the first step of *every* such run. Naming the run is
+   * what makes the answer that run's events, and it is what makes the
+   * pagination cursor unambiguous: `(runId, eventId)` is a key where an
+   * event id alone is not.
+   */
+  runId: string;
   pagination?: PaginationOptions;
   resolveData?: ResolveData;
 }

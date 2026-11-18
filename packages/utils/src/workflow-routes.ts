@@ -1,0 +1,69 @@
+export const WORKFLOW_ROUTE_BASE = '/.well-known/workflow/v1';
+const BASE_PATH_SYMBOL = Symbol.for('@workflow/core/basePath');
+const globalConfig = globalThis as typeof globalThis &
+  Record<symbol, string | undefined>;
+
+export function setWorkflowBasePath(basePath: string | undefined): void {
+  globalConfig[BASE_PATH_SYMBOL] = basePath ?? '';
+}
+
+function getWorkflowBasePath(): string {
+  return globalConfig[BASE_PATH_SYMBOL] ?? '';
+}
+
+export function createWorkflowBaseUrl(origin: string): string {
+  new URL(origin);
+  return `${origin.replace(/[?#].*$/, '').replace(/\/+$/, '')}${getWorkflowBasePath()}`;
+}
+
+export type WorkflowUrlRoute =
+  | { type: 'flow' }
+  | { type: 'manifest' }
+  | { type: 'webhook'; token: string }
+  | { type: 'health' };
+
+export function createWorkflowUrl(
+  baseUrl: string,
+  route: WorkflowUrlRoute
+): string {
+  const url = new URL(baseUrl);
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}${WORKFLOW_ROUTE_BASE}/${getWorkflowRouteEndpoint(route)}`;
+  url.search = route.type === 'health' ? '__health' : '';
+  url.hash = '';
+  return url.toString();
+}
+
+/**
+ * The URL of an app route `path` (such as `/api/agent/queue`) on `baseUrl`,
+ * which already carries the app's base path, so a queue consumer's own route
+ * resolves under the same base path as the flow route does.
+ */
+export function createAppRouteUrl(baseUrl: string, path: string): string {
+  if (!path.startsWith('/')) {
+    throw new TypeError(`App route "${path}" must start with "/"`);
+  }
+  const url = new URL(baseUrl);
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}${path}`;
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+function getWorkflowRouteEndpoint(route: WorkflowUrlRoute): string {
+  switch (route.type) {
+    case 'flow':
+    case 'health':
+      return 'flow';
+    case 'manifest':
+      return 'manifest.json';
+    case 'webhook':
+      return `webhook/${encodeURIComponent(route.token)}`;
+  }
+  throw new Error(
+    `Unsupported workflow route: ${String((route as { type?: unknown }).type)}`
+  );
+}
+
+export function createWorkflowHealthEndpoint(): string {
+  return `${getWorkflowBasePath()}${WORKFLOW_ROUTE_BASE}/flow?__health`;
+}

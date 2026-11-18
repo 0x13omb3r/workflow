@@ -1,0 +1,96 @@
+import { describe, expect, it } from 'vitest';
+import {
+  AnalyticsAttributeKeySchema,
+  AnalyticsEventSchema,
+  AnalyticsRunSchema,
+} from './analytics.js';
+
+const base = {
+  runId: 'wrun_01KX2M5N3RBNC12RYWYYH4WWQJ',
+  status: 'completed',
+  deploymentId: 'dpl_1',
+  workflowName: 'workflow//./src/w//myWorkflow',
+  updatedAt: '2026-07-13 17:09:11.593',
+};
+
+describe('AnalyticsEventSchema', () => {
+  it('preserves vercelId and computeInstanceId as distinct provenance fields', () => {
+    const event = AnalyticsEventSchema.parse({
+      runId: 'wrun_01KX2M5N3RBNC12RYWYYH4WWQJ',
+      eventId: 'evnt_01KX2M5N3RBNC12RYWYYH4WWQJ',
+      eventType: 'run_started',
+      workflowName: 'test-workflow',
+      deploymentId: 'dpl_1',
+      runCreatedAt: '2026-07-13 17:09:11.000',
+      createdAt: '2026-07-13 17:09:11.593',
+      vercelId: 'request-grain-id',
+      requestId: 'sibling-request-column',
+      computeInstanceId: 'compute-instance-id',
+    });
+
+    expect(event.vercelId).toBe('request-grain-id');
+    expect(event.requestId).toBe('sibling-request-column');
+    expect(event.computeInstanceId).toBe('compute-instance-id');
+  });
+});
+
+describe('analytics date coercion', () => {
+  it('parses timezone-naive datetime strings as UTC regardless of process TZ', () => {
+    // ClickHouse DateTime64 JSON shape: naive, UTC by convention.
+    const run = AnalyticsRunSchema.parse({
+      ...base,
+      createdAt: '2026-07-13 17:09:11.593',
+    });
+    expect(run.createdAt.getTime()).toBe(Date.UTC(2026, 6, 13, 17, 9, 11, 593));
+    expect(run.createdAt.toISOString()).toBe('2026-07-13T17:09:11.593Z');
+  });
+
+  it('accepts naive strings without fractional seconds', () => {
+    const run = AnalyticsRunSchema.parse({
+      ...base,
+      createdAt: '2026-07-13 17:09:11',
+    });
+    expect(run.createdAt.toISOString()).toBe('2026-07-13T17:09:11.000Z');
+  });
+
+  // These two were the only analytics timestamps left on a plain coercion,
+  // which reads a naive string in the process's local zone.
+  it('parses attribute key timestamps as UTC', () => {
+    const attribute = AnalyticsAttributeKeySchema.parse({
+      key: 'source',
+      runCount: '42',
+      firstSeenAt: '2026-07-13 17:09:11.593',
+      lastSeenAt: '2026-07-14 09:30:00',
+    });
+    expect(attribute.firstSeenAt.toISOString()).toBe(
+      '2026-07-13T17:09:11.593Z'
+    );
+    expect(attribute.lastSeenAt.toISOString()).toBe('2026-07-14T09:30:00.000Z');
+  });
+
+  it('leaves timezone-aware strings untouched', () => {
+    const run = AnalyticsRunSchema.parse({
+      ...base,
+      createdAt: '2026-07-13T10:09:11.593-07:00',
+    });
+    expect(run.createdAt.toISOString()).toBe('2026-07-13T17:09:11.593Z');
+    const zulu = AnalyticsRunSchema.parse({
+      ...base,
+      createdAt: '2026-07-13T17:09:11.593Z',
+    });
+    expect(zulu.createdAt.toISOString()).toBe('2026-07-13T17:09:11.593Z');
+  });
+
+  it('passes through Date objects and nullable fields', () => {
+    const d = new Date('2026-07-13T17:09:11.593Z');
+    const run = AnalyticsRunSchema.parse({
+      ...base,
+      createdAt: d,
+      startedAt: '2026-07-13 17:09:12.000',
+      completedAt: null,
+    });
+    expect(run.createdAt.getTime()).toBe(d.getTime());
+    expect(run.startedAt?.toISOString()).toBe('2026-07-13T17:09:12.000Z');
+    expect(run.completedAt).toBeNull();
+  });
+});

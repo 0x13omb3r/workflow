@@ -3,7 +3,8 @@
   "extends": ["//"],
   "tasks": {
     "build": {
-      "outputs": [".next/**", "!.next/cache/**"]
+      "env": ["WORKFLOW_WEB_VERCEL_BUILD"],
+      "outputs": ["build/**", ".vercel/react-router-build-result.json"]
     }
   }
 }

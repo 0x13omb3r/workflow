@@ -1,10 +1,30 @@
-import builtinModules from 'builtin-modules';
 import {
   findFunctionCalls,
   getDirective,
   getDirectiveTypo,
   isAsyncFunction,
+  isDirectiveFunctionLike,
 } from './utils';
+
+const BUILTIN_MODULES = new Set<string>();
+
+// Get built-in modules from Node.js `module.builtinModules`
+// https://nodejs.org/api/module.html#modulebuiltinmodules
+for (const mod of require('node:module').builtinModules as string[]) {
+  // Add both unprefixed and 'node:' prefixed variants to the set of builtin modules
+  BUILTIN_MODULES.add(mod);
+  if (!mod.startsWith('node:')) {
+    BUILTIN_MODULES.add(`node:${mod}`);
+  }
+}
+
+function isBuiltinModule(moduleName: string): boolean {
+  return BUILTIN_MODULES.has(moduleName);
+}
+
+function isBunModule(moduleName: string): boolean {
+  return moduleName === 'bun' || moduleName.startsWith('bun:');
+}
 
 type TypeScriptLib = typeof import('typescript/lib/tsserverlibrary');
 type Program = import('typescript/lib/tsserverlibrary').Program;
@@ -26,6 +46,9 @@ export function getCustomDiagnostics(
 
   const diagnostics: Diagnostic[] = [];
   const typeChecker = program.getTypeChecker();
+
+  // Track function declarations with "use workflow" directive
+  const workflowFunctions = new Set<string>();
 
   function addTypoError(node: Node, typo: string, expected: string) {
     const formattedTypo = `'${typo}'`;
@@ -61,9 +84,7 @@ export function getCustomDiagnostics(
 
     // Check if this is the first statement in a function body
     const isFunctionBody =
-      (ts.isFunctionDeclaration(blockParent) ||
-        ts.isArrowFunction(blockParent) ||
-        ts.isFunctionExpression(blockParent)) &&
+      isDirectiveFunctionLike(blockParent, ts) &&
       block.statements[0] === parent;
 
     if (!isFunctionBody) {
@@ -81,17 +102,15 @@ export function getCustomDiagnostics(
     checkDirectiveStringLiteral(node);
 
     // Check function declarations for workflow/step directives
-    if (
-      ts.isFunctionDeclaration(node) ||
-      ts.isArrowFunction(node) ||
-      ts.isFunctionExpression(node)
-    ) {
-      const directive = getDirective(node, sourceFile, ts);
+    if (isDirectiveFunctionLike(node, ts)) {
+      const directive = getDirective(node, ts);
 
       if (directive === 'use workflow') {
         checkWorkflowFunction(node);
-      } else if (directive === 'use step') {
-        checkStepFunction(node);
+        // Track workflow functions by name (for function declarations)
+        if (ts.isFunctionDeclaration(node) && node.name) {
+          workflowFunctions.add(node.name.text);
+        }
       }
     }
 
@@ -196,88 +215,6 @@ export function getCustomDiagnostics(
     return httpMethods.includes(functionName);
   }
 
-  function checkStepFunction(node: FunctionLikeDeclaration) {
-    // Ensure it's async
-    if (!isAsyncFunction(node, typeChecker, ts)) {
-      const start = node.getStart(sourceFile);
-      const length = node.getWidth(sourceFile);
-      diagnostics.push({
-        file: sourceFile,
-        start,
-        length,
-        messageText: 'Step functions must be async or return a Promise',
-        category: ts.DiagnosticCategory.Error,
-        code: 9002,
-      });
-    }
-  }
-
-  function checkSymbolForDisallowedModule(
-    symbol: import('typescript/lib/tsserverlibrary').Symbol | undefined,
-    callNode: CallExpression
-  ) {
-    if (!symbol) {
-      return;
-    }
-
-    const declarations = symbol.getDeclarations();
-    if (!declarations || declarations.length === 0) {
-      return;
-    }
-
-    for (const decl of declarations) {
-      if (!decl) {
-        continue;
-      }
-
-      // Check if it's an import declaration
-      if (
-        ts.isImportClause(decl) ||
-        ts.isImportSpecifier(decl) ||
-        ts.isNamespaceImport(decl)
-      ) {
-        // ImportClause: parent is ImportDeclaration
-        // ImportSpecifier: parent is NamedImports, parent.parent is ImportClause, parent.parent.parent is ImportDeclaration
-        // NamespaceImport: parent is ImportClause, parent.parent is ImportDeclaration
-        let importDecl:
-          | import('typescript/lib/tsserverlibrary').ImportDeclaration
-          | undefined;
-        if (ts.isImportClause(decl)) {
-          importDecl =
-            decl.parent as import('typescript/lib/tsserverlibrary').ImportDeclaration;
-        } else if (ts.isImportSpecifier(decl)) {
-          importDecl = decl.parent?.parent
-            ?.parent as import('typescript/lib/tsserverlibrary').ImportDeclaration;
-        } else if (ts.isNamespaceImport(decl)) {
-          importDecl = decl.parent
-            ?.parent as import('typescript/lib/tsserverlibrary').ImportDeclaration;
-        }
-
-        if (
-          importDecl &&
-          importDecl.moduleSpecifier &&
-          ts.isStringLiteral(importDecl.moduleSpecifier)
-        ) {
-          const moduleName = importDecl.moduleSpecifier.text;
-
-          // Check if it's a disallowed Node.js module
-          // builtin-modules already includes both 'fs' and 'node:fs' variants
-          if (builtinModules.includes(moduleName)) {
-            diagnostics.push({
-              file: sourceFile,
-              start: callNode.getStart(),
-              length: callNode.getWidth(),
-              messageText: `Node.js API "${moduleName}" is not available in workflow functions. Consider moving this code to a step function with "use step".`,
-              category: ts.DiagnosticCategory.Error,
-              code: 9003,
-            });
-            return;
-          }
-        }
-      }
-    }
-  }
-
   function checkDisallowedApiUsage(call: CallExpression) {
     try {
       // Check for timer functions (setTimeout, setInterval, setImmediate)
@@ -340,8 +277,7 @@ export function getCustomDiagnostics(
                 }
 
                 if (
-                  importDecl &&
-                  importDecl.moduleSpecifier &&
+                  importDecl?.moduleSpecifier &&
                   ts.isStringLiteral(importDecl.moduleSpecifier)
                 ) {
                   const moduleName = importDecl.moduleSpecifier.text;
@@ -388,6 +324,155 @@ export function getCustomDiagnostics(
     }
   }
 
+  function checkSymbolForDisallowedModule(
+    symbol: import('typescript/lib/tsserverlibrary').Symbol | undefined,
+    callNode: CallExpression
+  ) {
+    if (!symbol) {
+      return;
+    }
+
+    const declarations = symbol.getDeclarations();
+    if (!declarations || declarations.length === 0) {
+      return;
+    }
+
+    for (const decl of declarations) {
+      if (!decl) {
+        continue;
+      }
+
+      // Check if it's an import declaration
+      if (
+        ts.isImportClause(decl) ||
+        ts.isImportSpecifier(decl) ||
+        ts.isNamespaceImport(decl)
+      ) {
+        // ImportClause: parent is ImportDeclaration
+        // ImportSpecifier: parent is NamedImports, parent.parent is ImportClause, parent.parent.parent is ImportDeclaration
+        // NamespaceImport: parent is ImportClause, parent.parent is ImportDeclaration
+        let importDecl:
+          | import('typescript/lib/tsserverlibrary').ImportDeclaration
+          | undefined;
+        if (ts.isImportClause(decl)) {
+          importDecl =
+            decl.parent as import('typescript/lib/tsserverlibrary').ImportDeclaration;
+        } else if (ts.isImportSpecifier(decl)) {
+          importDecl = decl.parent?.parent
+            ?.parent as import('typescript/lib/tsserverlibrary').ImportDeclaration;
+        } else if (ts.isNamespaceImport(decl)) {
+          importDecl = decl.parent
+            ?.parent as import('typescript/lib/tsserverlibrary').ImportDeclaration;
+        }
+
+        if (
+          importDecl?.moduleSpecifier &&
+          ts.isStringLiteral(importDecl.moduleSpecifier)
+        ) {
+          const moduleName = importDecl.moduleSpecifier.text;
+
+          // Check if it's a disallowed Node.js or Bun module
+          if (isBuiltinModule(moduleName) || isBunModule(moduleName)) {
+            const moduleType = isBunModule(moduleName) ? 'Bun' : 'Node.js';
+            diagnostics.push({
+              file: sourceFile,
+              start: callNode.getStart(),
+              length: callNode.getWidth(),
+              messageText: `${moduleType} API "${moduleName}" is not available in workflow functions. Consider moving this code to a step function with "use step".`,
+              category: ts.DiagnosticCategory.Error,
+              code: 9003,
+            });
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  function addDirectWorkflowInvocationDiagnostic(node: CallExpression) {
+    diagnostics.push({
+      file: sourceFile,
+      start: node.getStart(),
+      length: node.getWidth(),
+      messageText: `Workflow functions should not be invoked directly. Use the \`start()\` function from 'workflow/api' to invoke this workflow.`,
+      category: ts.DiagnosticCategory.Warning,
+      code: 9009,
+    });
+  }
+
+  function declarationHasWorkflowDirective(decl: Node): boolean {
+    if (isDirectiveFunctionLike(decl, ts)) {
+      return getDirective(decl, ts) === 'use workflow';
+    }
+
+    if (
+      ts.isVariableDeclaration(decl) &&
+      decl.initializer &&
+      isDirectiveFunctionLike(decl.initializer, ts)
+    ) {
+      return getDirective(decl.initializer, ts) === 'use workflow';
+    }
+
+    return false;
+  }
+
+  function isDirectWorkflowInvocation(node: CallExpression): boolean {
+    if (!ts.isIdentifier(node.expression)) {
+      return false;
+    }
+
+    // First check: is it a locally-defined workflow function?
+    if (workflowFunctions.has(node.expression.text)) {
+      return true;
+    }
+
+    // Second check: is it an imported workflow function?
+    let symbolToCheck = typeChecker.getSymbolAtLocation(node.expression);
+
+    if (symbolToCheck?.flags & ts.SymbolFlags.Alias) {
+      const aliasedSymbol = typeChecker.getAliasedSymbol(symbolToCheck);
+      if (aliasedSymbol !== symbolToCheck) {
+        symbolToCheck = aliasedSymbol;
+      }
+    }
+
+    return (
+      symbolToCheck?.getDeclarations()?.some(declarationHasWorkflowDirective) ??
+      false
+    );
+  }
+
+  // Second pass: check all calls in the file for direct workflow function invocations
+  function checkAllCallsForDirectWorkflowInvocation(
+    node: Node,
+    allowDirectWorkflowInvocation = false
+  ) {
+    if (isDirectiveFunctionLike(node, ts)) {
+      const directive = getDirective(node, ts);
+      if (directive === 'use workflow') {
+        allowDirectWorkflowInvocation = true;
+      } else if (directive === 'use step') {
+        allowDirectWorkflowInvocation = false;
+      }
+    }
+
+    if (
+      !allowDirectWorkflowInvocation &&
+      ts.isCallExpression(node) &&
+      isDirectWorkflowInvocation(node)
+    ) {
+      addDirectWorkflowInvocationDiagnostic(node);
+    }
+
+    ts.forEachChild(node, (child) =>
+      checkAllCallsForDirectWorkflowInvocation(
+        child,
+        allowDirectWorkflowInvocation
+      )
+    );
+  }
+
   visit(sourceFile);
+  checkAllCallsForDirectWorkflowInvocation(sourceFile);
   return diagnostics;
 }

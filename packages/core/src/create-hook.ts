@@ -1,3 +1,6 @@
+import type { StringValue } from 'ms';
+import { throwNotInWorkflowContext } from './context-errors.js';
+import type { Run } from './runtime/run.js';
 import type { Serializable } from './schemas.js';
 
 /**
@@ -18,12 +21,77 @@ export interface RequestWithResponse extends Request {
 /**
  * A hook that can be awaited and/or iterated over to receive
  * a value within a workflow from an external system.
+ *
+ * Hooks implement the TC39 Explicit Resource Management proposal,
+ * allowing them to be used with the `using` keyword for automatic disposal.
  */
 export interface Hook<T = any> extends AsyncIterable<T>, Thenable<T> {
   /**
    * The token used to identify this hook.
    */
   token: string;
+
+  /**
+   * Returns the {@link Run} already using this token, or `null` when this Hook
+   * registers successfully.
+   *
+   * Calling `createHook()` alone does not register the hook: registration
+   * only happens when the workflow suspends. Awaiting `getConflict()`
+   * suspends the workflow to commit the hook registration without waiting for
+   * payload data.
+   *
+   * If it returns a run, this Hook was not created. Awaiting the Hook instead
+   * rejects with `HookConflictError`.
+   *
+   * @example
+   * ```ts
+   * using hook = createHook({ token: `order:${orderId}` });
+   * const conflict = await hook.getConflict();
+   * if (conflict) {
+   *   // another run already owns this token
+   *   return { status: 'duplicate', runId: conflict.runId };
+   * }
+   * // this Hook registered without waiting for payload data
+   * ```
+   */
+  getConflict(): Promise<Run<unknown> | null>;
+
+  /**
+   * Disposes the hook, releasing its token for reuse by other workflows.
+   *
+   * After calling `dispose()`, the hook will no longer receive any events.
+   * This is useful when you want to explicitly release a hook token before
+   * the workflow completes, allowing another workflow to register a hook
+   * with the same token.
+   *
+   * @example
+   * ```ts
+   * const hook = createHook<{ message: string }>({ token: 'my-token' });
+   *
+   * for await (const payload of hook) {
+   *   if (payload.message === 'done') {
+   *     hook.dispose(); // Release the token early
+   *     break;
+   *   }
+   * }
+   * ```
+   */
+  dispose(): void;
+
+  /**
+   * Implements the TC39 Explicit Resource Management proposal.
+   * Called automatically when using the `using` keyword.
+   *
+   * @example
+   * ```ts
+   * {
+   *   using hook = createHook<{ message: string }>({ token: 'my-token' });
+   *   const payload = await hook;
+   *   // hook is automatically disposed when the block exits
+   * }
+   * ```
+   */
+  [Symbol.dispose](): void;
 }
 
 /**
@@ -40,6 +108,22 @@ export interface Webhook<T extends Request> extends Hook<T> {
   url: string;
 }
 
+/**
+ * Options accepted by the orchestrator's `createHook` for hooks the SDK
+ * itself creates (the `AbortController` signal hook, the child-run completion
+ * hook). Deliberately not part of the public {@link HookOptions}.
+ *
+ * A system hook is an ordinary hook (same tokens, conflicts, resumes and
+ * disposal) that is recorded with `isSystem: true`, so observability can
+ * label it and the runtime can treat it as written by another run: its
+ * resumes come from outside this run's replay.
+ *
+ * @internal
+ */
+export interface SystemHookOptions extends HookOptions {
+  isSystem?: boolean;
+}
+
 export interface HookOptions {
   /**
    * Unique token that is used to associate with the hook.
@@ -48,7 +132,18 @@ export interface HookOptions {
    * with information that the dispatching side can reliably reconstruct
    * the token with the information it has available.
    *
-   * If not provided, a randomly generated token will be assigned.
+   * Deterministic tokens are intended for use with `createHook()` and
+   * server-side `resumeHook()` only. For webhooks (`createWebhook()`), an
+   * explicit token is not accepted, one is always generated for you.
+   *
+   * A generated token is not trivial to guess but is not a security
+   * contract, so authenticate webhook requests themselves rather than
+   * relying on URL secrecy:
+   * https://workflow-sdk.dev/docs/foundations/hooks#token-design
+   *
+   * If provided, the token must be a non-empty string; passing an empty
+   * string throws. If not provided (or `undefined`), a token is generated
+   * for you.
    *
    * @example
    *
@@ -62,7 +157,79 @@ export interface HookOptions {
   token?: string;
 
   /**
+   * **Experimental.** Keeps this Hook's token unavailable for at least the
+   * configured time after `createHook()` runs.
+   *
+   * Accepts the same values as `sleep()`: a duration string, a number of
+   * milliseconds, or an absolute `Date`. Relative durations start when
+   * `createHook()` runs, not when the workflow ends.
+   *
+   * The Hook remains active until the workflow ends, even if the configured
+   * time passes first. Another Hook can use the token only after both the run
+   * has ended and the configured time has passed.
+   * After the run ends, the Hook can still be found with `getHookByToken()`
+   * until retention ends, but it cannot be resumed.
+   *
+   * Calling `dispose()` (including through `using`) releases the token
+   * immediately.
+   *
+   * `createHook()` throws if the configured World does not support this
+   * experimental option.
+   *
+   * @example
+   *
+   * ```ts
+   * const hook = createHook({
+   *   token: `order:${orderId}`,
+   *   experimental_minRetention: '30d',
+   * });
+   * ```
+   */
+  experimental_minRetention?: StringValue | Date | number;
+
+  /**
+   * **Experimental.** Take the token over if another run currently holds it.
+   *
+   * Without this, a `token` that another active run already registered makes
+   * the hook reject with `HookConflictError`. With it, this run always ends
+   * up owning the token: the other run's hook is disposed and its awaiters
+   * reject with `HookForceClaimedError`, that run is woken so it can react,
+   * and every `resumeHook(token)` from then on reaches this run — including
+   * one that was already in flight when the takeover happened. Payloads the
+   * previous owner received before the takeover stay with it.
+   *
+   * Any number of runs forcing the same token converge on one owner; each
+   * run that loses it gets `HookForceClaimedError`, and none can get stuck.
+   * A finished run holding the token under `experimental_minRetention` is
+   * taken over silently. A run can also take over a token held by its own
+   * earlier hook.
+   *
+   * A token is only taken from a run whose runtime understands being taken
+   * from (started at spec version 8 or later). For an older run the World
+   * declines and the hook rejects with the ordinary `HookConflictError`,
+   * as if this option had not been set.
+   *
+   * Requires an explicit `token` (a generated token can never conflict) and
+   * is not available on `createWebhook()`. `createHook()` throws if the
+   * configured World does not support this experimental option.
+   *
+   * @example
+   *
+   * ```ts
+   * // Whichever run for this channel starts most recently owns its hook.
+   * const hook = createHook<SlackMessage>({
+   *   token: `slack_webhook:${channelId}`,
+   *   experimental_force: true,
+   * });
+   * ```
+   */
+  experimental_force?: boolean;
+
+  /**
    * Additional user-defined data to include with the hook payload.
+   *
+   * Read it back outside the workflow with `getHookByToken()`, where
+   * `hook.metadata` is a Promise: `await hook.metadata`.
    *
    * @example
    *
@@ -76,9 +243,27 @@ export interface HookOptions {
    * ```
    */
   metadata?: Serializable;
+
+  /**
+   * Whether this hook can be resumed via the public webhook endpoint.
+   *
+   * When `true`, the hook can be triggered by sending an HTTP request to the
+   * public workflow webhook URL. This is automatically set when using
+   * `createWebhook()`.
+   *
+   * When `false` (the default), the hook can only be resumed server-side
+   * via `resumeHook()`.
+   *
+   * @default false
+   */
+  isWebhook?: boolean;
 }
 
-export interface WebhookOptions extends HookOptions {
+export interface WebhookOptions
+  extends Omit<
+    HookOptions,
+    'token' | 'isWebhook' | 'experimental_minRetention' | 'experimental_force'
+  > {
   /**
    * If set to a `Response` object, the webhook will automatically
    * respond with the specified response.
@@ -117,8 +302,10 @@ export interface WebhookOptions extends HookOptions {
  */
 // @ts-expect-error `options` is here for types/docs
 export function createHook<T = any>(options?: HookOptions): Hook<T> {
-  throw new Error(
-    '`createHook()` can only be called inside a workflow function'
+  throwNotInWorkflowContext(
+    'createHook()',
+    'https://workflow-sdk.dev/docs/api-reference/workflow/create-hook',
+    createHook
   );
 }
 
@@ -137,7 +324,9 @@ export function createWebhook(
   // @ts-expect-error `options` is here for types/docs
   options?: WebhookOptions
 ): Webhook<Request> | Webhook<RequestWithResponse> {
-  throw new Error(
-    '`createWebhook()` can only be called inside a workflow function'
+  throwNotInWorkflowContext(
+    'createWebhook()',
+    'https://workflow-sdk.dev/docs/api-reference/workflow/create-webhook',
+    createWebhook
   );
 }

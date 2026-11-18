@@ -1,4 +1,9 @@
 {
+  "git": {
+    "deploymentEnabled": {
+      "changeset-release/main": false
+    }
+  },
   "rewrites": [
     {
       "source": "/api/webhook/:webhookId",
@@ -8,5 +13,8 @@
       "source": "/api/:provider/webhook",
       "destination": "/api/webhook"
     }
-  ]
+  ],
+  "env": {
+    "WORKFLOW_PUBLIC_MANIFEST": "1"
+  }
 }

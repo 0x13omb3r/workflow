@@ -1,7 +1,7 @@
 {
   "name": "@workflow/cli",
-  "version": "4.0.1-beta.4",
-  "description": "Command-line interface for Workflow DevKit",
+  "version": "5.2.0",
+  "description": "Command-line interface for Workflow SDK",
   "type": "module",
   "bin": {
     "workflow": "./bin/run.js",
@@ -9,22 +9,27 @@
   },
   "files": [
     "dist",
-    "bin"
+    "bin",
+    "oclif.manifest.json",
+    "!dist/**/*.test.*",
+    "!dist/**/*.d.ts.map"
   ],
   "publishConfig": {
     "access": "public"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/vercel/workflow.git",
     "directory": "packages/cli"
   },
   "scripts": {
-    "build": "tsc && chmod +x bin/run.js",
+    "build": "rm -f oclif.manifest.json && tsc && chmod +x bin/run.js",
     "clean": "tsc --build --clean && rm -r dist ||:",
-    "dev": "tsc --watch",
-    "test": "vitest run src",
+    "dev": "rm -f oclif.manifest.json && tsc --watch",
+    "prepack": "node scripts/generate-oclif-manifest.mjs",
+    "postpack": "rm -f oclif.manifest.json",
+    "test": "vitest run --config=../../vitest.config.ts src",
     "typecheck": "tsc --noEmit"
   },
   "oclif": {
@@ -38,37 +43,39 @@
   },
   "devDependencies": {
     "@types/node": "catalog:",
-    "@types/watchpack": "2.4.4",
-    "@workflow/tsconfig": "workspace:*"
+    "@workflow/tsconfig": "workspace:*",
+    "date-fns": "4.4.0",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "typescript": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
   },
   "dependencies": {
-    "@oclif/core": "^4.0.0",
-    "@oclif/plugin-help": "^6.0.0",
-    "@swc/core": "1.11.24",
-    "@workflow/swc-plugin": "workspace:*",
-    "@workflow/errors": "workspace:*",
+    "@oclif/core": "4.11.4",
+    "@oclif/plugin-help": "6.2.37",
+    "@vercel/cli-auth": "0.0.1",
+    "@workflow/builders": "workspace:*",
     "@workflow/core": "workspace:*",
+    "@workflow/errors": "workspace:*",
+    "@workflow/utils": "workspace:*",
     "@workflow/web": "workspace:*",
     "@workflow/world": "workspace:*",
     "@workflow/world-local": "workspace:*",
     "@workflow/world-vercel": "workspace:*",
-    "boxen": "^8.0.1",
-    "builtin-modules": "^5.0.0",
-    "chalk": "^5.6.2",
-    "chokidar": "^4.0.3",
-    "comment-json": "4.2.5",
-    "date-fns": "^4.1.0",
-    "easy-table": "^1.2.0",
-    "enhanced-resolve": "5.18.2",
-    "esbuild": "catalog:",
-    "find-up": "7.0.0",
-    "mixpart": "^0.0.4",
-    "open": "^10.2.0",
-    "ora": "^8.2.0",
-    "terminal-link": "^5.0.0",
-    "tinyglobby": "^0.2.14",
-    "watchpack": "2.4.4",
-    "xdg-app-paths": "^5.1.0",
+    "boxen": "8.0.1",
+    "chalk": "5.6.2",
+    "dotenv": "^17.4.2",
+    "easy-table": "1.2.0",
+    "open": "10.2.0",
+    "terminal-link": "5.0.0",
+    "tinyglobby": "0.2.17",
+    "xdg-app-paths": "5.5.1",
     "zod": "catalog:"
   }
 }

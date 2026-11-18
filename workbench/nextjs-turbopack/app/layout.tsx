@@ -13,8 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'Durable Agents',
-  description: 'A durable agent using the new Workflow DevKit',
+  title: 'Workflow SDK Examples',
+  description:
+    'Interactive examples for Workflow SDK - durable, reliable TypeScript workflows',
 };
 
 export default function RootLayout({

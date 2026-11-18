@@ -1,0 +1,827 @@
+import { describe, expect, it } from 'vitest';
+import {
+  detectWorkflowPatterns,
+  shouldTransformFile,
+  stripCommentsFromSource,
+  useStepPattern,
+  useWorkflowPattern,
+  workflowSerdeComputedPropertyPattern,
+  workflowSerdeImportPattern,
+  workflowSerdeSymbolPattern,
+} from './transform-utils.js';
+
+describe('transform-utils patterns', () => {
+  describe('useWorkflowPattern', () => {
+    it('should match "use workflow" with single quotes', () => {
+      expect(useWorkflowPattern.test(`'use workflow';`)).toBe(true);
+      expect(useWorkflowPattern.test(`'use workflow'`)).toBe(true);
+    });
+
+    it('should match "use workflow" with double quotes', () => {
+      expect(useWorkflowPattern.test(`"use workflow";`)).toBe(true);
+      expect(useWorkflowPattern.test(`"use workflow"`)).toBe(true);
+    });
+
+    it('should match with leading whitespace', () => {
+      expect(useWorkflowPattern.test(`  'use workflow';`)).toBe(true);
+      expect(useWorkflowPattern.test(`\t"use workflow";`)).toBe(true);
+    });
+
+    it('should not match inline usage', () => {
+      expect(useWorkflowPattern.test(`const x = 'use workflow';`)).toBe(false);
+    });
+  });
+
+  describe('useStepPattern', () => {
+    it('should match "use step" with single quotes', () => {
+      expect(useStepPattern.test(`'use step';`)).toBe(true);
+      expect(useStepPattern.test(`'use step'`)).toBe(true);
+    });
+
+    it('should match "use step" with double quotes', () => {
+      expect(useStepPattern.test(`"use step";`)).toBe(true);
+      expect(useStepPattern.test(`"use step"`)).toBe(true);
+    });
+  });
+
+  describe('workflowSerdeImportPattern', () => {
+    it('should match import from @workflow/serde with single quotes', () => {
+      const source = `import { WORKFLOW_SERIALIZE } from '@workflow/serde';`;
+      expect(workflowSerdeImportPattern.test(source)).toBe(true);
+    });
+
+    it('should match import from @workflow/serde with double quotes', () => {
+      const source = `import { WORKFLOW_SERIALIZE } from "@workflow/serde";`;
+      expect(workflowSerdeImportPattern.test(source)).toBe(true);
+    });
+
+    it('should match import with multiple specifiers', () => {
+      const source = `import { WORKFLOW_SERIALIZE, WORKFLOW_DESERIALIZE } from '@workflow/serde';`;
+      expect(workflowSerdeImportPattern.test(source)).toBe(true);
+    });
+
+    it('should match import with type', () => {
+      const source = `import type { SerializationSymbol } from '@workflow/serde';`;
+      expect(workflowSerdeImportPattern.test(source)).toBe(true);
+    });
+
+    it('should not match similar but different packages', () => {
+      expect(
+        workflowSerdeImportPattern.test(`import { x } from '@other/serde';`)
+      ).toBe(false);
+      expect(
+        workflowSerdeImportPattern.test(
+          `import { x } from '@workflow/serde-utils';`
+        )
+      ).toBe(false);
+    });
+  });
+
+  describe('workflowSerdeSymbolPattern', () => {
+    it('should match Symbol.for with workflow-serialize', () => {
+      const source = `static [Symbol.for('workflow-serialize')](instance) {}`;
+      expect(workflowSerdeSymbolPattern.test(source)).toBe(true);
+    });
+
+    it('should match Symbol.for with workflow-deserialize', () => {
+      const source = `static [Symbol.for('workflow-deserialize')](data) {}`;
+      expect(workflowSerdeSymbolPattern.test(source)).toBe(true);
+    });
+
+    it('should match with double quotes', () => {
+      const source = `static [Symbol.for("workflow-serialize")](instance) {}`;
+      expect(workflowSerdeSymbolPattern.test(source)).toBe(true);
+    });
+
+    it('should match with whitespace variations', () => {
+      expect(
+        workflowSerdeSymbolPattern.test(`Symbol.for( 'workflow-serialize' )`)
+      ).toBe(true);
+      expect(
+        workflowSerdeSymbolPattern.test(`Symbol.for('workflow-deserialize')`)
+      ).toBe(true);
+    });
+
+    it('should match in a full class definition', () => {
+      const source = `
+        export class Point {
+          constructor(x, y) {
+            this.x = x;
+            this.y = y;
+          }
+
+          static [Symbol.for('workflow-serialize')](instance) {
+            return { x: instance.x, y: instance.y };
+          }
+
+          static [Symbol.for('workflow-deserialize')](data) {
+            return new Point(data.x, data.y);
+          }
+        }
+      `;
+      expect(workflowSerdeSymbolPattern.test(source)).toBe(true);
+    });
+
+    it('should not match other Symbol.for usage', () => {
+      expect(
+        workflowSerdeSymbolPattern.test(`Symbol.for('other-symbol')`)
+      ).toBe(false);
+      expect(
+        workflowSerdeSymbolPattern.test(`Symbol.for('workflow-something-else')`)
+      ).toBe(false);
+    });
+
+    it('should not match non-Symbol.for patterns', () => {
+      expect(workflowSerdeSymbolPattern.test(`'workflow-serialize'`)).toBe(
+        false
+      );
+      expect(workflowSerdeSymbolPattern.test(`workflow-deserialize`)).toBe(
+        false
+      );
+    });
+  });
+
+  describe('combined detection', () => {
+    it('should detect file using imported symbols', () => {
+      const source = `
+        import { WORKFLOW_SERIALIZE, WORKFLOW_DESERIALIZE } from '@workflow/serde';
+
+        export class MyClass {
+          static [WORKFLOW_SERIALIZE](instance) {
+            return { value: instance.value };
+          }
+
+          static [WORKFLOW_DESERIALIZE](data) {
+            return new MyClass(data.value);
+          }
+        }
+      `;
+      expect(workflowSerdeImportPattern.test(source)).toBe(true);
+      // Note: workflowSerdeSymbolPattern won't match here because the symbols
+      // are referenced by identifier, not directly as Symbol.for()
+      expect(workflowSerdeSymbolPattern.test(source)).toBe(false);
+    });
+
+    it('should detect file using direct Symbol.for', () => {
+      const source = `
+        export class Point {
+          static [Symbol.for('workflow-serialize')](instance) {
+            return { x: instance.x };
+          }
+
+          static [Symbol.for('workflow-deserialize')](data) {
+            return new Point(data.x);
+          }
+        }
+      `;
+      expect(workflowSerdeImportPattern.test(source)).toBe(false);
+      expect(workflowSerdeSymbolPattern.test(source)).toBe(true);
+    });
+
+    it('should detect file with both patterns', () => {
+      // This would be unusual but valid
+      const source = `
+        import { WORKFLOW_SERIALIZE } from '@workflow/serde';
+
+        export class Point {
+          // Using imported symbol
+          static [WORKFLOW_SERIALIZE](instance) {
+            return { x: instance.x };
+          }
+
+          // Using direct Symbol.for
+          static [Symbol.for('workflow-deserialize')](data) {
+            return new Point(data.x);
+          }
+        }
+      `;
+      expect(workflowSerdeImportPattern.test(source)).toBe(true);
+      expect(workflowSerdeSymbolPattern.test(source)).toBe(true);
+    });
+  });
+
+  describe('workflowSerdeComputedPropertyPattern', () => {
+    it('should match [WORKFLOW_SERIALIZE] computed property', () => {
+      const source = `static [WORKFLOW_SERIALIZE](instance) {}`;
+      expect(workflowSerdeComputedPropertyPattern.test(source)).toBe(true);
+    });
+
+    it('should match [WORKFLOW_DESERIALIZE] computed property', () => {
+      const source = `static [WORKFLOW_DESERIALIZE](data) {}`;
+      expect(workflowSerdeComputedPropertyPattern.test(source)).toBe(true);
+    });
+
+    it('should match with whitespace inside brackets', () => {
+      expect(
+        workflowSerdeComputedPropertyPattern.test(`[ WORKFLOW_SERIALIZE ]`)
+      ).toBe(true);
+      expect(
+        workflowSerdeComputedPropertyPattern.test(`[  WORKFLOW_DESERIALIZE  ]`)
+      ).toBe(true);
+    });
+
+    it('should match in bundled code where symbols are imported from chunks', () => {
+      // This is the pattern seen in bundled packages like just-bash
+      const source = `
+        import {
+          WORKFLOW_DESERIALIZE,
+          WORKFLOW_SERIALIZE
+        } from "./chunks/chunk-453323QY.js";
+
+        var Bash = class _Bash {
+          static [WORKFLOW_SERIALIZE](instance) {
+            return { fs: instance.fs };
+          }
+          static [WORKFLOW_DESERIALIZE](serialized) {
+            return Object.create(_Bash.prototype, {
+              fs: { value: serialized.fs }
+            });
+          }
+        };
+      `;
+      expect(workflowSerdeComputedPropertyPattern.test(source)).toBe(true);
+      // Note: import pattern won't match because it's from a chunk, not @workflow/serde
+      expect(workflowSerdeImportPattern.test(source)).toBe(false);
+    });
+
+    it('should not match partial names', () => {
+      expect(
+        workflowSerdeComputedPropertyPattern.test(`[WORKFLOW_SERIALIZE_EXTRA]`)
+      ).toBe(false);
+      expect(
+        workflowSerdeComputedPropertyPattern.test(`[MY_WORKFLOW_SERIALIZE]`)
+      ).toBe(false);
+    });
+
+    it('should not match string literals', () => {
+      expect(
+        workflowSerdeComputedPropertyPattern.test(`['WORKFLOW_SERIALIZE']`)
+      ).toBe(false);
+      expect(
+        workflowSerdeComputedPropertyPattern.test(`["WORKFLOW_DESERIALIZE"]`)
+      ).toBe(false);
+    });
+  });
+
+  describe('detectWorkflowPatterns', () => {
+    it('should detect hasSerde for @workflow/serde import', () => {
+      const source = `import { WORKFLOW_SERIALIZE } from '@workflow/serde';`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasSerde).toBe(true);
+      expect(result.hasSerdeImport).toBe(true);
+    });
+
+    it('should detect hasSerde for Symbol.for pattern', () => {
+      const source = `static [Symbol.for('workflow-serialize')](instance) {}`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasSerde).toBe(true);
+      expect(result.hasSerdeSymbol).toBe(true);
+    });
+
+    it('should detect hasSerde for computed property pattern', () => {
+      const source = `static [WORKFLOW_SERIALIZE](instance) {}`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasSerde).toBe(true);
+    });
+
+    it('should detect hasSerde for bundled third-party packages', () => {
+      // Simulates bundled output from packages like just-bash
+      const source = `
+        import {
+          WORKFLOW_DESERIALIZE,
+          WORKFLOW_SERIALIZE
+        } from "./chunks/chunk-ABC123.js";
+
+        var MyClass = class {
+          static [WORKFLOW_SERIALIZE](instance) {
+            return { data: instance.data };
+          }
+          static [WORKFLOW_DESERIALIZE](serialized) {
+            return new MyClass(serialized.data);
+          }
+        };
+      `;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasSerde).toBe(true);
+    });
+
+    it('should not detect hasSerde for unrelated code', () => {
+      const source = `
+        export class RegularClass {
+          constructor(value) {
+            this.value = value;
+          }
+        }
+      `;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasSerde).toBe(false);
+    });
+
+    it('should detect both directive and serde patterns', () => {
+      const source = `
+        'use step';
+        import { WORKFLOW_SERIALIZE } from '@workflow/serde';
+        
+        export class Point {
+          static [WORKFLOW_SERIALIZE](instance) {
+            return { x: instance.x };
+          }
+        }
+      `;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasDirective).toBe(true);
+      expect(result.hasUseStep).toBe(true);
+      expect(result.hasSerde).toBe(true);
+    });
+
+    it('does not detect directives inside template literals', () => {
+      const source = `'use client';
+const CODE_SNIPPET = \`import { sleep } from "workflow";
+
+export async function handleUserSignup(email: string) {
+  "use workflow";
+  const user = await createUser(email);
+}
+\`;
+export default function Page() { return null; }
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseWorkflow).toBe(false);
+      expect(result.hasDirective).toBe(false);
+    });
+
+    it('does not detect single-quoted step directives inside template literals', () => {
+      const source = `const CODE_SNIPPET = \`
+export async function doThing() {
+  'use step';
+}
+\`;
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(false);
+      expect(result.hasDirective).toBe(false);
+    });
+
+    it('does not detect directives inside comments', () => {
+      const source = `/*
+export async function run() {
+  "use workflow";
+}
+*/
+
+// 'use step';
+export const value = 1;
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseWorkflow).toBe(false);
+      expect(result.hasUseStep).toBe(false);
+      expect(result.hasDirective).toBe(false);
+    });
+
+    it('does not detect directive-looking strings inside multiline calls', () => {
+      const source = `console.log(
+  "use step"
+);
+
+console.log(
+  'use workflow'
+);
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseWorkflow).toBe(false);
+      expect(result.hasUseStep).toBe(false);
+      expect(result.hasDirective).toBe(false);
+    });
+
+    it('does not detect quoted directive-looking strings inside multiline calls', () => {
+      const source = `console.log(
+  '"use step"'
+);
+
+console.log(
+  "'use step'"
+);
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(false);
+      expect(result.hasDirective).toBe(false);
+    });
+
+    it('detects a directive after a backtick in a comment', () => {
+      const source = `// Markdown fence marker: \`\`\`
+export async function brokenStep() {
+  "use step";
+  return \`ok\`;
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(true);
+      expect(result.hasDirective).toBe(true);
+    });
+
+    it('detects a directive after a backtick in a regex literal', () => {
+      const source = `const openFence = /\`\`\`/;
+
+export async function brokenStep() {
+  "use step";
+  return \`ok\`;
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(true);
+      expect(result.hasDirective).toBe(true);
+    });
+
+    it('detects a directive after a backtick in a string literal', () => {
+      const source = `const fence = '\`';
+export async function run() {
+  'use workflow';
+  return \`done\`;
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseWorkflow).toBe(true);
+    });
+
+    it('detects a directive after a division that looks like a regex start', () => {
+      const source = `const ratio = total / count;
+const other = (a) / b;
+export async function run() {
+  'use step';
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(true);
+    });
+
+    it('treats code inside template literal expressions as real code', () => {
+      const source = `const snippet = \`before \${(() => {
+  'use step';
+  return \`inner \${'x'} \`;
+})()} after\`;
+export const value = 1;
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(true);
+    });
+
+    it('detects a directive after a template literal with nested expressions', () => {
+      const source = `const snippet = \`a \${b ? \`c \${d}\` : "}"} e\`;
+export async function run() {
+  'use step';
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(true);
+    });
+
+    it('ignores comment markers inside strings when masking', () => {
+      const source = `const url = 'https://example.com/*not-a-comment';
+export async function run() {
+  'use step';
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(true);
+    });
+
+    it('ignores directives inside an unterminated template literal', () => {
+      const source = `const snippet = \`
+  'use step';
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(false);
+    });
+
+    it('detects a directive after a regex with a backtick that follows a tilde', () => {
+      const source = `const ok = ~/\`/.test(a);
+export async function run() {
+  "use step";
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(true);
+    });
+
+    it('still reads a slash after a template literal as a division', () => {
+      const source = `const half = \`a\` / 2;
+export async function run() {
+  "use step";
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseStep).toBe(true);
+    });
+
+    it('still detects real directives after template literals', () => {
+      const source = `const CODE_SNIPPET = \`
+  "use workflow";
+\`;
+
+export async function run() {
+  "use workflow";
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseWorkflow).toBe(true);
+      expect(result.hasDirective).toBe(true);
+    });
+
+    it('detects a directive after blank lines and CRLF line endings', () => {
+      const source =
+        'export async function run() {\r\n\r\n  \r\n  "use step";\r\n}\r\n';
+      expect(detectWorkflowPatterns(source).hasUseStep).toBe(true);
+    });
+
+    it('checks every line that mentions a directive', () => {
+      const source = `const label = 'use step';
+export async function run() {
+  "use step";
+}
+`;
+      expect(detectWorkflowPatterns(source).hasUseStep).toBe(true);
+    });
+
+    it('still detects directives after other directive prologue entries', () => {
+      const source = `export async function run() {
+  "use strict";
+  "use workflow";
+}
+`;
+      const result = detectWorkflowPatterns(source);
+      expect(result.hasUseWorkflow).toBe(true);
+      expect(result.hasDirective).toBe(true);
+    });
+
+    it('detects a directive in a .tsx file after a closing tag and a template with a slash', () => {
+      const source = `export default function Page({ id }: { id: string }) {
+  return (
+    <div>
+      <h1>Order</h1>
+      <a href={\`/orders/\${id}\`}>View</a>
+    </div>
+  );
+}
+
+export async function processOrder(id: string) {
+  'use workflow';
+  return id;
+}
+`;
+      expect(stripCommentsFromSource(source, true)).toContain(
+        "'use workflow';"
+      );
+      expect(detectWorkflowPatterns(source).hasUseWorkflow).toBe(true);
+    });
+
+    it('does not detect a directive in a code sample template after a closing tag', () => {
+      const source = `export function Sample() {
+  return <p>Run it anywhere</p>;
+}
+
+const code = \`export async function welcome(userId: string) {
+  "use workflow";
+  await fetch('/api/welcome');
+}\`;
+`;
+      expect(stripCommentsFromSource(source, true)).not.toContain(
+        '"use workflow"'
+      );
+      expect(detectWorkflowPatterns(source).hasUseWorkflow).toBe(false);
+    });
+
+    it('detects a directive after an apostrophe in JSX text', () => {
+      const source = `export function Hint() {
+  return <p>Don't panic</p>;
+}
+const msg = \`it's fine\`;
+export async function run() {
+  'use step';
+}
+`;
+      expect(detectWorkflowPatterns(source).hasUseStep).toBe(true);
+    });
+
+    it('does not detect a directive in a code sample after an apostrophe in JSX text', () => {
+      const source = `export default function Page() {
+  return <p>Don't copy this</p>;
+}
+const code = \`
+export async function wf() {
+  'use workflow';
+}
+\`;
+`;
+      expect(stripCommentsFromSource(source, true)).not.toContain(
+        "'use workflow'"
+      );
+      expect(detectWorkflowPatterns(source).hasUseWorkflow).toBe(false);
+    });
+
+    it('does not detect a directive in a JSX template prop after an apostrophe in JSX text', () => {
+      const source = `export function Docs() {
+  return (
+    <section>
+      <p>It's easy to write a workflow:</p>
+      <CodeBlock code={\`export async function signup() {
+  "use workflow";
+}\`} />
+    </section>
+  );
+}
+`;
+      expect(stripCommentsFromSource(source, true)).not.toContain(
+        '"use workflow"'
+      );
+      expect(detectWorkflowPatterns(source).hasUseWorkflow).toBe(false);
+    });
+
+    it('detects a directive after a division that follows a long block comment', () => {
+      const source = `const pct = done /* number of completed items */ / total;
+const url = \`https://example.com\`;
+export async function run() {
+  'use step';
+}
+`;
+      expect(stripCommentsFromSource(source, true)).toContain("'use step';");
+      expect(detectWorkflowPatterns(source).hasUseStep).toBe(true);
+    });
+
+    it('detects a directive after a division that follows a long run of whitespace', () => {
+      const source = `const a = b
+                    / c;
+const url = \`https://example.com\`;
+export async function run() {
+  'use step';
+}
+`;
+      expect(stripCommentsFromSource(source, true)).toContain("'use step';");
+      expect(detectWorkflowPatterns(source).hasUseStep).toBe(true);
+    });
+  });
+
+  describe('shouldTransformFile', () => {
+    const noPatterns = {
+      hasUseWorkflow: false,
+      hasUseStep: false,
+      hasSerdeImport: false,
+      hasSerdeSymbol: false,
+      hasDirective: false,
+      hasSerde: false,
+    };
+
+    it('excludes generated workflow route files even with directives', () => {
+      expect(
+        shouldTransformFile('/app/.well-known/workflow/v1/route.ts', {
+          ...noPatterns,
+          hasUseWorkflow: true,
+          hasDirective: true,
+        })
+      ).toBe(false);
+    });
+
+    it('transforms files with directive patterns', () => {
+      expect(
+        shouldTransformFile('/app/workflows/my-workflow.ts', {
+          ...noPatterns,
+          hasUseWorkflow: true,
+          hasDirective: true,
+        })
+      ).toBe(true);
+    });
+
+    it('transforms files with serde patterns', () => {
+      expect(
+        shouldTransformFile('/app/lib/my-class.ts', {
+          ...noPatterns,
+          hasSerdeImport: true,
+          hasSerde: true,
+        })
+      ).toBe(true);
+    });
+
+    it('transforms SDK files with serde patterns (no longer excluded)', () => {
+      expect(
+        shouldTransformFile(
+          '/app/node_modules/@workflow/core/dist/serialization.js',
+          { ...noPatterns, hasSerdeSymbol: true, hasSerde: true }
+        )
+      ).toBe(true);
+    });
+
+    it('does not transform files without directives or serde patterns', () => {
+      expect(shouldTransformFile('/app/lib/utils.ts', noPatterns)).toBe(false);
+    });
+  });
+
+  describe('stripCommentsFromSource', () => {
+    it('removes comments but keeps strings, templates, and regex literals', () => {
+      const source = `const a = 'x // y'; // note
+const b = \`t /* u */\`; /* block
+comment */ const c = /\\/[/]/g;
+`;
+      expect(stripCommentsFromSource(source)).toBe(
+        `const a = 'x // y';        
+const b = \`t /* u */\`;         
+           const c = /\\/[/]/g;
+`
+      );
+    });
+
+    it('scans code inside template expressions when templates are not masked', () => {
+      const source = `const s = \`a \${'\`'} b // not a comment\`;
+const n = 1; // c
+`;
+      expect(stripCommentsFromSource(source)).toBe(
+        `const s = \`a \${'\`'} b // not a comment\`;
+const n = 1;     
+`
+      );
+    });
+
+    it('reads a slash after an identifier ending in a keyword as a division', () => {
+      const source = `const half = plugin              / 2; const s = \`/\`;
+`;
+      expect(stripCommentsFromSource(source, true)).toBe(
+        `const half = plugin              / 2; const s = \` \`;
+`
+      );
+    });
+
+    it('reads a slash after a keyword and a long comment as a regex', () => {
+      const source = `return /* a long comment here */ /\`/.test(s);
+`;
+      expect(stripCommentsFromSource(source, true)).toBe(
+        `return                           /\`/.test(s);
+`
+      );
+    });
+
+    it('reads a slash after a keyword and a line comment as a regex', () => {
+      const source = `return // c
+  /\`/.test(s);
+`;
+      expect(stripCommentsFromSource(source, true)).toBe(
+        `return     
+  /\`/.test(s);
+`
+      );
+    });
+
+    it('reads a regex right after ) as a division (known limitation)', () => {
+      const source = `if (x) /\`/.test(s);
+const y = 1;
+`;
+      // The backtick in the regex opens a template that runs to the end.
+      const output = stripCommentsFromSource(source, true);
+      expect(output.startsWith('if (x) /`')).toBe(true);
+      expect(output).not.toContain('const y = 1;');
+    });
+
+    it('keeps the output the same length as the source', () => {
+      const source = `const a = 'x' // c\r\n/* b\r\n */ const t = \`a \${\`b \${c}\`} /* d */\`;\r\nconst r = /[/]\`/; const u = \`unterminated /* `;
+      for (const maskTemplates of [false, true]) {
+        for (const maskQuoted of [false, true]) {
+          const output = stripCommentsFromSource(
+            source,
+            maskTemplates,
+            maskQuoted
+          );
+          expect(output.length).toBe(source.length);
+          expect(output.split('\n').length).toBe(source.split('\n').length);
+        }
+      }
+    });
+
+    it('blanks quoted string contents but keeps the quotes when masking', () => {
+      const source = `const a = 'static [X](v)'; const b = "it's // not a comment";
+const c = 'unterminated
+const d = 1; // tail
+`;
+      expect(stripCommentsFromSource(source, false, true)).toBe(
+        `const a = '             '; const b = "                     ";
+const c = '            
+const d = 1;        
+`
+      );
+    });
+
+    it('keeps quoted string contents when only masking templates', () => {
+      const source = `const a = 'static [X](v)';\n`;
+      expect(stripCommentsFromSource(source, true)).toBe(source);
+    });
+
+    it('blanks template contents but keeps delimiters when masking', () => {
+      const source = `const s = \`a \${b} c\`;
+const t = \`line
+break\`;
+`;
+      expect(stripCommentsFromSource(source, true)).toBe(
+        `const s = \`  \${b}  \`;
+const t = \`    
+     \`;
+`
+      );
+    });
+  });
+});

@@ -1,0 +1,591 @@
+import { describe, expect, it } from 'vitest';
+import { z } from 'zod/v4';
+import {
+  getQueueTopicPrefix,
+  getRunQueueNamespace,
+  HealthCheckPayloadSchema,
+  isSingleOrchestratorMessage,
+  messageRunSpecVersion,
+  orchestratorRunIdOf,
+  parseQueueName,
+  parseQueueRoute,
+  QueuePayloadSchema,
+  QueuePrefix,
+  RunInputSchema,
+  SINGLE_ORCHESTRATOR_CONTINUATION_FIELDS,
+  singleOrchestratorContinuationPayload,
+  singleOrchestratorRunIdOf,
+  ValidQueueName,
+  WorkflowInvokePayloadSchema,
+} from './queue.js';
+import { SPEC_VERSION_SINGLE_ORCHESTRATOR } from './spec-version.js';
+
+describe('getQueueTopicPrefix', () => {
+  it('returns default workflow prefix without namespace', () => {
+    expect(getQueueTopicPrefix('workflow')).toBe('__wkf_workflow_');
+  });
+
+  it('returns namespaced workflow prefix', () => {
+    expect(getQueueTopicPrefix('workflow', 'custom')).toBe(
+      '__custom_wkf_workflow_'
+    );
+  });
+
+  it('accepts multi-character namespace', () => {
+    expect(getQueueTopicPrefix('workflow', 'myframework123')).toBe(
+      '__myframework123_wkf_workflow_'
+    );
+  });
+
+  it('rejects the retired step queue kind at runtime', () => {
+    expect(() => getQueueTopicPrefix('step' as never)).toThrow(
+      'Unsupported queue kind: step'
+    );
+  });
+
+  it('throws for namespace starting with a digit', () => {
+    expect(() => getQueueTopicPrefix('workflow', '123abc')).toThrow();
+  });
+
+  it('throws for uppercase namespace', () => {
+    expect(() => getQueueTopicPrefix('workflow', 'Custom')).toThrow();
+  });
+
+  it('throws for empty namespace', () => {
+    expect(() => getQueueTopicPrefix('workflow', '')).toThrow();
+  });
+
+  it('throws for namespace with special characters', () => {
+    expect(() => getQueueTopicPrefix('workflow', 'my-framework')).toThrow();
+    expect(() => getQueueTopicPrefix('workflow', 'my_framework')).toThrow();
+  });
+
+  it('returns undefined namespace same as no namespace', () => {
+    expect(getQueueTopicPrefix('workflow', undefined)).toBe(
+      getQueueTopicPrefix('workflow')
+    );
+  });
+});
+
+describe('QueuePrefix schema', () => {
+  it('accepts default workflow prefix', () => {
+    expect(QueuePrefix.parse('__wkf_workflow_')).toBe('__wkf_workflow_');
+  });
+
+  it('accepts namespaced workflow prefix', () => {
+    expect(QueuePrefix.parse('__custom_wkf_workflow_')).toBe(
+      '__custom_wkf_workflow_'
+    );
+  });
+
+  it('rejects retired step prefixes', () => {
+    expect(() => QueuePrefix.parse('__wkf_step_')).toThrow();
+    expect(() => QueuePrefix.parse('__custom_wkf_step_')).toThrow();
+  });
+
+  it('rejects invalid prefix', () => {
+    expect(() => QueuePrefix.parse('bad_prefix')).toThrow();
+  });
+
+  it('rejects prefix without trailing underscore', () => {
+    expect(() => QueuePrefix.parse('__wkf_workflow')).toThrow();
+  });
+
+  it('rejects uppercase namespace', () => {
+    expect(() => QueuePrefix.parse('__Custom_wkf_workflow_')).toThrow();
+  });
+});
+
+describe('ValidQueueName schema', () => {
+  it('accepts default queue names', () => {
+    expect(ValidQueueName.parse('__wkf_workflow_myFlow')).toBe(
+      '__wkf_workflow_myFlow'
+    );
+  });
+
+  it('accepts namespaced queue names', () => {
+    expect(ValidQueueName.parse('__custom_wkf_workflow_myFlow')).toBe(
+      '__custom_wkf_workflow_myFlow'
+    );
+  });
+
+  it('rejects retired step queue names', () => {
+    expect(() => ValidQueueName.parse('__wkf_step_myStep')).toThrow();
+  });
+
+  it('rejects prefix-only without a name', () => {
+    expect(() => ValidQueueName.parse('__wkf_workflow_')).toThrow();
+  });
+
+  it('rejects invalid names', () => {
+    expect(() => ValidQueueName.parse('not_a_queue_name')).toThrow();
+  });
+});
+
+describe('parseQueueName', () => {
+  it('parses default workflow queue names', () => {
+    expect(parseQueueName('__wkf_workflow_myFlow')).toEqual({
+      prefix: '__wkf_workflow_',
+      id: 'myFlow',
+    });
+  });
+
+  it('parses namespaced workflow queue names', () => {
+    expect(parseQueueName('__custom_wkf_workflow_myFlow')).toEqual({
+      prefix: '__custom_wkf_workflow_',
+      id: 'myFlow',
+    });
+  });
+});
+
+describe('QueuePayloadSchema', () => {
+  // A probe issued to prepare a cross-deployment `start()` carries the run id
+  // it is about to create, which also makes it satisfy
+  // `WorkflowInvokePayloadSchema` (whose only required field is `runId`). Zod
+  // unions return the first matching member and strip keys that member doesn't
+  // declare, so if the invoke member were matched first the discriminator would
+  // be dropped and the runtime would reinterpret the probe as a run replay.
+  it('preserves the health-check discriminator on a probe that carries a runId', () => {
+    const parsed = QueuePayloadSchema.parse({
+      __healthCheck: true,
+      correlationId: 'corr_123',
+      runId: 'wrun_01ABC',
+    });
+
+    expect(parsed).toEqual({
+      __healthCheck: true,
+      correlationId: 'corr_123',
+      runId: 'wrun_01ABC',
+    });
+  });
+
+  it('preserves the health-check discriminator and probeRunId on a probe', () => {
+    expect(
+      QueuePayloadSchema.parse({
+        __healthCheck: true,
+        correlationId: 'corr_123',
+        probeRunId: 'wrun_01ABC',
+      })
+    ).toEqual({
+      __healthCheck: true,
+      correlationId: 'corr_123',
+      probeRunId: 'wrun_01ABC',
+    });
+  });
+
+  it('parses a probeRunId probe as a health check even when the invoke schema is tried first', () => {
+    // 4.x deployments order their queue payload union invoke-first. The probe
+    // must not satisfy the invoke schema, or it is replayed as a run.
+    const invokeFirst = z.union([
+      WorkflowInvokePayloadSchema,
+      HealthCheckPayloadSchema,
+    ]);
+    expect(
+      invokeFirst.parse({
+        __healthCheck: true,
+        correlationId: 'corr_123',
+        probeRunId: 'wrun_01ABC',
+      })
+    ).toMatchObject({ __healthCheck: true, correlationId: 'corr_123' });
+  });
+
+  it('preserves health-check payloads that carry no runId', () => {
+    expect(
+      QueuePayloadSchema.parse({
+        __healthCheck: true,
+        correlationId: 'corr_123',
+      })
+    ).toEqual({ __healthCheck: true, correlationId: 'corr_123' });
+  });
+
+  it('still resolves workflow invoke payloads', () => {
+    expect(
+      QueuePayloadSchema.parse({ runId: 'wrun_01ABC', stepId: 'step_1' })
+    ).toEqual({ runId: 'wrun_01ABC', stepId: 'step_1' });
+  });
+
+  // Resilient step dispatch: a step message may carry `stepInput` with the
+  // serialized (binary) step input, which the consumer re-ensures the
+  // step_created event from. The bytes must survive parsing untouched.
+  it('round-trips a step message carrying stepInput', () => {
+    const input = new Uint8Array([1, 2, 3]);
+    const parsed = QueuePayloadSchema.parse({
+      runId: 'wrun_01ABC',
+      stepId: 'step_1',
+      stepName: 'myStep',
+      stepInput: { input },
+    });
+    expect(parsed).toEqual({
+      runId: 'wrun_01ABC',
+      stepId: 'step_1',
+      stepName: 'myStep',
+      stepInput: { input },
+    });
+    expect((parsed as { stepInput: { input: unknown } }).stepInput.input).toBe(
+      input
+    );
+  });
+
+  // Producers only attach stepInput when the dehydrated input is binary and
+  // the queue transport preserves bytes (CBOR). A non-binary value means the
+  // payload was mangled in transit — fail the parse rather than letting it be
+  // written into a step_created as non-binary data.
+  it('rejects a stepInput whose input is not a Uint8Array', () => {
+    expect(
+      QueuePayloadSchema.safeParse({
+        runId: 'wrun_01ABC',
+        stepId: 'step_1',
+        stepName: 'myStep',
+        stepInput: { input: 'mangled-to-string' },
+      }).success
+    ).toBe(false);
+  });
+
+  describe('replayDivergence', () => {
+    it('round-trips the divergence history', () => {
+      expect(
+        QueuePayloadSchema.parse({
+          runId: 'wrun_01ABC',
+          replayDivergence: {
+            eventId: 'evnt_2',
+            count: 2,
+            eventIds: ['evnt_1', 'evnt_2'],
+          },
+        })
+      ).toEqual({
+        runId: 'wrun_01ABC',
+        replayDivergence: {
+          eventId: 'evnt_2',
+          count: 2,
+          eventIds: ['evnt_1', 'evnt_2'],
+        },
+      });
+    });
+
+    // A producer that predates the history sends only the latest position.
+    it('accepts a message without a history', () => {
+      expect(
+        QueuePayloadSchema.parse({
+          runId: 'wrun_01ABC',
+          replayDivergence: { eventId: 'evnt_1', count: 1 },
+        })
+      ).toEqual({
+        runId: 'wrun_01ABC',
+        replayDivergence: { eventId: 'evnt_1', count: 1 },
+      });
+    });
+
+    // The history is diagnostic only. A malformed value must not fail the
+    // parse, which would fail every delivery of the recovery message.
+    it('drops a malformed history instead of failing the parse', () => {
+      const parsed = QueuePayloadSchema.parse({
+        runId: 'wrun_01ABC',
+        replayDivergence: {
+          eventId: 'evnt_1',
+          count: 1,
+          eventIds: [1, { not: 'a string' }],
+        },
+      });
+      expect(parsed).toEqual({
+        runId: 'wrun_01ABC',
+        replayDivergence: { eventId: 'evnt_1', count: 1 },
+      });
+    });
+  });
+});
+
+describe('RunInputSchema environment', () => {
+  const baseRunInput = {
+    input: { foo: 'bar' },
+    deploymentId: 'dpl_123',
+    workflowName: 'myWorkflow',
+    specVersion: 5,
+  };
+
+  it('round-trips the creator environment when present', () => {
+    expect(
+      RunInputSchema.parse({ ...baseRunInput, environment: 'preview' })
+    ).toEqual({ ...baseRunInput, environment: 'preview' });
+  });
+
+  it('parses without an environment, leaving the field absent', () => {
+    const parsed = RunInputSchema.parse(baseRunInput);
+    expect(parsed).toEqual(baseRunInput);
+    expect('environment' in parsed).toBe(false);
+  });
+
+  it('rejects a non-string environment rather than coercing it', () => {
+    expect(
+      RunInputSchema.safeParse({ ...baseRunInput, environment: 1 }).success
+    ).toBe(false);
+  });
+
+  // Wire compatibility in the OTHER direction: an SDK older than this field
+  // must be able to consume a message minted by a newer one. `z.object` strips
+  // unknown keys rather than rejecting, so the old consumer drops `environment`
+  // and processes the message normally. If this ever becomes `.strict()`, every
+  // in-flight message from a newer client starts failing validation on older
+  // deployments.
+  it('accepts neither, inline code only, or a code ref only', () => {
+    expect(RunInputSchema.safeParse(baseRunInput).success).toBe(true);
+    expect(
+      RunInputSchema.safeParse({
+        ...baseRunInput,
+        dynamicWorkflowCode: new Uint8Array([1]),
+      }).success
+    ).toBe(true);
+    expect(
+      RunInputSchema.safeParse({
+        ...baseRunInput,
+        dynamicWorkflowCodeRef: 'ref_1',
+      }).success
+    ).toBe(true);
+  });
+
+  it('rejects inline code and a code ref together', () => {
+    expect(
+      RunInputSchema.safeParse({
+        ...baseRunInput,
+        dynamicWorkflowCode: new Uint8Array([1]),
+        dynamicWorkflowCodeRef: 'ref_1',
+      }).success
+    ).toBe(false);
+  });
+
+  it('tolerates unknown keys by stripping them, so old consumers keep working', () => {
+    const parsed = RunInputSchema.parse({
+      ...baseRunInput,
+      someFutureField: 'ignored',
+    });
+    expect(parsed).toEqual(baseRunInput);
+  });
+
+  it('carries the environment through a full invoke payload', () => {
+    const parsed = QueuePayloadSchema.parse({
+      runId: 'wrun_01ABC',
+      runInput: { ...baseRunInput, environment: 'production' },
+    });
+    expect(parsed).toMatchObject({
+      runId: 'wrun_01ABC',
+      runInput: { environment: 'production' },
+    });
+  });
+});
+
+describe('orchestratorRunIdOf', () => {
+  it('names the run of an orchestrator delivery', () => {
+    expect(orchestratorRunIdOf({ runId: 'wrun_a' })).toBe('wrun_a');
+    expect(
+      orchestratorRunIdOf({ runId: 'wrun_a', runInput: { input: [] } })
+    ).toBe('wrun_a');
+  });
+
+  it('leaves step messages and health checks unserialized', () => {
+    expect(
+      orchestratorRunIdOf({ runId: 'wrun_a', stepId: 'step_1' })
+    ).toBeUndefined();
+    expect(
+      orchestratorRunIdOf({
+        __healthCheck: true,
+        correlationId: 'hc_1',
+        runId: 'wrun_a',
+      })
+    ).toBeUndefined();
+  });
+
+  it('is undefined for anything without a run id', () => {
+    expect(orchestratorRunIdOf(undefined)).toBeUndefined();
+    expect(orchestratorRunIdOf('wrun_a')).toBeUndefined();
+    expect(orchestratorRunIdOf({ runId: 1 })).toBeUndefined();
+  });
+});
+
+describe('messageRunSpecVersion', () => {
+  const SPEC = SPEC_VERSION_SINGLE_ORCHESTRATOR;
+
+  it('reads runInput, then runContext, then the runSpecVersion hint', () => {
+    expect(
+      messageRunSpecVersion({
+        runId: 'wrun_a',
+        runInput: { specVersion: SPEC },
+      })
+    ).toBe(SPEC);
+    expect(
+      messageRunSpecVersion({
+        runId: 'wrun_a',
+        stepId: 'step_1',
+        runContext: { specVersion: SPEC },
+      })
+    ).toBe(SPEC);
+    expect(
+      messageRunSpecVersion({ runId: 'wrun_a', runSpecVersion: SPEC })
+    ).toBe(SPEC);
+  });
+
+  it('is undefined for health checks and unstamped messages', () => {
+    expect(
+      messageRunSpecVersion({
+        __healthCheck: true,
+        correlationId: 'hc_1',
+        runId: 'wrun_a',
+        runSpecVersion: SPEC,
+      })
+    ).toBeUndefined();
+    expect(messageRunSpecVersion({ runId: 'wrun_a' })).toBeUndefined();
+    expect(messageRunSpecVersion(undefined)).toBeUndefined();
+  });
+
+  it('treats only spec >= 9 messages as single-orchestrator ones', () => {
+    expect(
+      isSingleOrchestratorMessage({ runId: 'a', runSpecVersion: SPEC })
+    ).toBe(true);
+    expect(
+      isSingleOrchestratorMessage({ runId: 'a', runSpecVersion: SPEC - 1 })
+    ).toBe(false);
+    expect(isSingleOrchestratorMessage({ runId: 'a' })).toBe(false);
+  });
+
+  it('serializes the orchestrator deliveries of spec 9 runs only', () => {
+    expect(
+      singleOrchestratorRunIdOf({ runId: 'wrun_a', runSpecVersion: SPEC })
+    ).toBe('wrun_a');
+    expect(
+      singleOrchestratorRunIdOf({
+        runId: 'wrun_a',
+        stepId: 'step_1',
+        runSpecVersion: SPEC,
+      })
+    ).toBeUndefined();
+    expect(
+      singleOrchestratorRunIdOf({ runId: 'wrun_a', runSpecVersion: SPEC - 1 })
+    ).toBeUndefined();
+    expect(singleOrchestratorRunIdOf({ runId: 'wrun_a' })).toBeUndefined();
+  });
+});
+
+describe('singleOrchestratorContinuationPayload', () => {
+  const SPEC = SPEC_VERSION_SINGLE_ORCHESTRATOR;
+
+  it('classifies every payload field', () => {
+    expect(Object.keys(SINGLE_ORCHESTRATOR_CONTINUATION_FIELDS).sort()).toEqual(
+      Object.keys(WorkflowInvokePayloadSchema.shape).sort()
+    );
+  });
+
+  it("drops the start message's runInput and keeps its spec stamp", () => {
+    const traceCarrier = { traceparent: '00-abc-def-01' };
+    const continuation = singleOrchestratorContinuationPayload({
+      runId: 'wrun_a',
+      requestedAt: new Date(),
+      traceCarrier,
+      runInput: { specVersion: SPEC, workflowName: 'w' },
+    });
+    expect(continuation).toEqual({
+      runId: 'wrun_a',
+      runSpecVersion: SPEC,
+      traceCarrier,
+    });
+    expect(WorkflowInvokePayloadSchema.parse(continuation)).toEqual(
+      continuation
+    );
+    expect(singleOrchestratorRunIdOf(continuation)).toBe('wrun_a');
+  });
+
+  it('keeps what a wake is for, and drops the rest', () => {
+    const wake = {
+      runId: 'wrun_a',
+      runSpecVersion: SPEC,
+      runContext: { specVersion: SPEC, deploymentId: 'dpl_a' },
+      waitContinuation: { correlationId: 'wait_1', attempt: 2 },
+      completeWaits: ['wait_2'],
+      hookInput: { hookId: 'hook_1', resumeId: 'r_1', token: 't', payload: 1 },
+      recovery: true,
+      hookResumeTiming: { resumedAt: 1 },
+      deploymentMismatchRetryCount: 2,
+      serverErrorRetryCount: 3,
+    };
+    const continuation = singleOrchestratorContinuationPayload(wake);
+    expect(continuation).toEqual({
+      runId: wake.runId,
+      runSpecVersion: SPEC,
+      runContext: wake.runContext,
+      waitContinuation: wake.waitContinuation,
+      completeWaits: wake.completeWaits,
+      hookInput: wake.hookInput,
+    });
+  });
+
+  it('is undefined for step messages and runs below spec 9', () => {
+    expect(
+      singleOrchestratorContinuationPayload({
+        runId: 'wrun_a',
+        stepId: 'step_1',
+        runSpecVersion: SPEC,
+      })
+    ).toBeUndefined();
+    expect(
+      singleOrchestratorContinuationPayload({
+        runId: 'wrun_a',
+        runSpecVersion: SPEC - 1,
+      })
+    ).toBeUndefined();
+    expect(
+      singleOrchestratorContinuationPayload({ runId: 'wrun_a' })
+    ).toBeUndefined();
+  });
+});
+
+describe('parseQueueRoute', () => {
+  it('accepts an absolute path on the app', () => {
+    expect(parseQueueRoute('/api/agent/queue')).toBe('/api/agent/queue');
+    expect(parseQueueRoute('/.well-known/workflow/v1/flow')).toBe(
+      '/.well-known/workflow/v1/flow'
+    );
+  });
+
+  it.each([
+    'api/agent/queue',
+    '//evil.example/queue',
+    'https://example.com/queue',
+    '/api/queue?x=1',
+    '/api/queue#frag',
+    '/api/ queue',
+    '',
+  ])('rejects %j', (path) => {
+    expect(() => parseQueueRoute(path)).toThrow(TypeError);
+  });
+});
+
+describe('getRunQueueNamespace', () => {
+  it('reads the namespace a run recorded', () => {
+    expect(getRunQueueNamespace({ queueNamespace: 'agent' })).toBe('agent');
+  });
+
+  it.each([
+    undefined,
+    null,
+    'agent',
+    new Uint8Array([1, 2]),
+    {},
+    { queueNamespace: 7 },
+    { queueNamespace: 'Not-Valid' },
+    { queueNamespace: '' },
+  ])('is undefined for %j', (executionContext) => {
+    expect(getRunQueueNamespace(executionContext)).toBeUndefined();
+  });
+});
+
+describe('RunInputSchema encryptionPublicKey', () => {
+  const baseRunInput = {
+    input: { foo: 'bar' },
+    deploymentId: 'dpl_123',
+    workflowName: 'myWorkflow',
+    specVersion: 5,
+  };
+
+  it('keeps the run public key, so a resilient start can forward it', () => {
+    expect(
+      RunInputSchema.parse({ ...baseRunInput, encryptionPublicKey: 'pk' })
+    ).toEqual({ ...baseRunInput, encryptionPublicKey: 'pk' });
+  });
+});

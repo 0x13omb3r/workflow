@@ -1,3 +1,6 @@
+import { WorkflowRuntimeError } from '@workflow/errors';
+import { pluralize } from '@workflow/utils';
+import type { AttributeChange } from '@workflow/world';
 import type { Serializable } from './schemas.js';
 
 export interface StepInvocationQueueItem {
@@ -5,16 +8,75 @@ export interface StepInvocationQueueItem {
   correlationId: string;
   stepName: string;
   args: Serializable[];
+  closureVars?: Record<string, Serializable>;
+  thisVal?: Serializable;
+  hasCreatedEvent?: boolean;
+  /**
+   * Inline step ownership, derived from the step's LATEST `step_started`
+   * during replay: the queue message ID stamped by the invocation running
+   * the step inline, or undefined when the latest start was unstamped (a
+   * retry attempt driven by a queued step message, or an older runtime).
+   * Latest start wins: an unstamped bare start clears a previous stamp; an
+   * owner-recovery re-stamped start restores it.
+   */
+  ownerMessageId?: string;
+  /**
+   * `createdAt` (ms) of the step's latest observed `step_started`. Anchors
+   * the ownership lease: `leaseRemaining = lastStartedAt + lease − now`.
+   */
+  lastStartedAt?: number;
+  /**
+   * Whether a `step_retrying` was observed for this step. From that point
+   * the step is queue-owned (the delayed retry handoff or replay requeue),
+   * so inline ownership is permanently lapsed for this correlation ID.
+   */
+  sawRetrying?: boolean;
 }
 
 export interface HookInvocationQueueItem {
   type: 'hook';
   correlationId: string;
   token: string;
+  /** Earliest time the token can be reused after the run ends. */
+  tokenRetentionUntil?: Date;
+  /** `createHook({ experimental_force })`: take the token over if held. */
+  force?: boolean;
   metadata?: Serializable;
+  hasCreatedEvent?: boolean;
+  /**
+   * The run's start Hook: created by the run's admission, so it never has a
+   * `hook_created` of its own (`hasCreatedEvent` is set from the start).
+   * Disposal still writes an ordinary `hook_disposed`.
+   */
+  startHook?: true;
+  /** Whether the workflow is awaiting `hook.getConflict()` for this hook */
+  hasConflictAwaiter?: boolean;
+  disposed?: boolean;
+  isWebhook?: boolean;
+  isSystem?: boolean;
+  abortRequested?: boolean;
+  abortReason?: unknown;
 }
 
-export type QueueItem = StepInvocationQueueItem | HookInvocationQueueItem;
+export interface WaitInvocationQueueItem {
+  type: 'wait';
+  correlationId: string;
+  resumeAt: Date;
+  hasCreatedEvent?: boolean;
+}
+
+export interface AttributeInvocationQueueItem {
+  type: 'attribute';
+  correlationId: string;
+  changes: AttributeChange[];
+  allowReservedAttributes?: true;
+}
+
+export type QueueItem =
+  | StepInvocationQueueItem
+  | HookInvocationQueueItem
+  | WaitInvocationQueueItem
+  | AttributeInvocationQueueItem;
 
 /**
  * An error that is thrown when one or more operations (steps/hooks/etc.) are called but do
@@ -23,32 +85,94 @@ export type QueueItem = StepInvocationQueueItem | HookInvocationQueueItem;
  * onto the queue.
  */
 export class WorkflowSuspension extends Error {
+  items: QueueItem[];
+  /** @deprecated Use `items` instead. */
   steps: QueueItem[];
   globalThis: typeof globalThis;
   stepCount: number;
   hookCount: number;
+  waitCount: number;
+  attributeCount: number;
+  hookDisposedCount: number;
+  abortCount: number;
+  /**
+   * Correlation ids of the open hooks that workflow code was waiting on a
+   * payload for when the VM went idle, i.e. the hooks whose `hook_received`
+   * could change what this suspension leads to. A hook absent from the set has
+   * no waiting consumer, so a payload landing for it is buffered and inert
+   * until the first `await`. `undefined` when the suspension was built without
+   * the workflow context that tracks awaiters, which callers must read as
+   * "every open hook is observed". See `runtime/out-of-band-observation.ts`.
+   */
+  observedHookIds?: ReadonlySet<string>;
 
-  constructor(steps: QueueItem[], global: typeof globalThis) {
-    const stepCount = steps.filter((s) => s.type === 'step').length;
-    const hookCount = steps.filter((s) => s.type === 'hook').length;
+  constructor(itemsInput: Map<string, QueueItem>, global: typeof globalThis) {
+    // Convert Map to array for iteration and storage
+    const items = [...itemsInput.values()];
+
+    // Single-pass counting for efficiency
+    let stepCount = 0;
+    let hookCount = 0;
+    let waitCount = 0;
+    let attributeCount = 0;
+    let hookDisposedCount = 0;
+    let abortCount = 0;
+    for (const item of items) {
+      if (item.type === 'step') stepCount++;
+      else if (item.type === 'hook') {
+        if (item.disposed) hookDisposedCount++;
+        else if (item.abortRequested) abortCount++;
+        else hookCount++;
+      } else if (item.type === 'wait') waitCount++;
+      else if (item.type === 'attribute') attributeCount++;
+    }
 
     // Build description parts
     const parts: string[] = [];
     if (stepCount > 0) {
-      parts.push(`${stepCount} ${stepCount === 1 ? 'step' : 'steps'}`);
+      parts.push(`${stepCount} ${pluralize('step', 'steps', stepCount)}`);
     }
     if (hookCount > 0) {
-      parts.push(`${hookCount} ${hookCount === 1 ? 'hook' : 'hooks'}`);
+      parts.push(`${hookCount} ${pluralize('hook', 'hooks', hookCount)}`);
+    }
+    if (waitCount > 0) {
+      parts.push(`${waitCount} ${pluralize('wait', 'waits', waitCount)}`);
+    }
+    if (attributeCount > 0) {
+      parts.push(
+        `${attributeCount} ${pluralize('attribute write', 'attribute writes', attributeCount)}`
+      );
+    }
+    if (hookDisposedCount > 0) {
+      parts.push(
+        `${hookDisposedCount} hook ${pluralize('disposal', 'disposals', hookDisposedCount)}`
+      );
     }
 
     // Determine verb (has/have) and action (run/created/received)
-    const totalCount = stepCount + hookCount;
-    const hasOrHave = totalCount === 1 ? 'has' : 'have';
+    const totalCount =
+      stepCount + hookCount + waitCount + attributeCount + hookDisposedCount;
+    const hasOrHave = pluralize('has', 'have', totalCount);
+    // Pick action verb: use "processed" when mixed types are present
+    const typeCount =
+      (stepCount > 0 ? 1 : 0) +
+      (hookCount > 0 ? 1 : 0) +
+      (waitCount > 0 ? 1 : 0) +
+      (attributeCount > 0 ? 1 : 0) +
+      (hookDisposedCount > 0 ? 1 : 0);
     let action: string;
-    if (stepCount > 0) {
+    if (typeCount > 1) {
+      action = 'processed';
+    } else if (stepCount > 0) {
       action = 'run';
     } else if (hookCount > 0) {
       action = 'created';
+    } else if (waitCount > 0) {
+      action = 'created';
+    } else if (attributeCount > 0) {
+      action = 'written';
+    } else if (hookDisposedCount > 0) {
+      action = 'processed';
     } else {
       action = 'received';
     }
@@ -59,13 +183,24 @@ export class WorkflowSuspension extends Error {
         : '0 steps have not been run yet'; // Default case for empty array
     super(description);
     this.name = 'WorkflowSuspension';
-    this.steps = steps;
+    this.items = items;
+    this.steps = items;
     this.globalThis = global;
     this.stepCount = stepCount;
     this.hookCount = hookCount;
+    this.waitCount = waitCount;
+    this.attributeCount = attributeCount;
+    this.hookDisposedCount = hookDisposedCount;
+    this.abortCount = abortCount;
+  }
+
+  static is(value: unknown): value is WorkflowSuspension {
+    return value instanceof WorkflowSuspension;
   }
 }
 
 export function ENOTSUP(): never {
-  throw new Error('Not supported in workflow functions');
+  throw new WorkflowRuntimeError(
+    'This API is not available inside a workflow function. Workflow functions run in a deterministic VM; move the call to a step function for full Node.js access.'
+  );
 }

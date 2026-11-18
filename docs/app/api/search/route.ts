@@ -1,7 +1,5 @@
-import { source } from '@/lib/source';
-import { createFromSource } from 'fumadocs-core/search/server';
+import { createSearchRoute } from '@vercel/geistdocs/routes/search';
+import { config } from '@/lib/geistdocs/config';
+import { currentSources } from '@/lib/geistdocs/source';
 
-export const { GET } = createFromSource(source, {
-  // https://docs.orama.com/docs/orama-js/supported-languages
-  language: 'english',
-});
+export const GET = createSearchRoute({ config, sources: currentSources });

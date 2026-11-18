@@ -1,0 +1,997 @@
+import { stringify } from 'devalue';
+import { describe, expect, it } from 'vitest';
+import { STATE_REFS_FIELD } from './serialization/state-refs.js';
+import {
+  ClassInstanceRef,
+  decodeFormatPrefix,
+  encodeWithFormatPrefix,
+  extractStreamIds,
+  hydrateData,
+  hydrateDataWithKey,
+  hydrateResourceIO,
+  isClassInstanceRef,
+  isEncryptedData,
+  isExpiredStub,
+  isSealedData,
+  isStreamId,
+  isStreamRef,
+  observabilityRevivers,
+  type Revivers,
+  SerializationFormat,
+  STREAM_REF_TYPE,
+  truncateId,
+} from './serialization-format.js';
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+/** Create a v2 binary payload: "devl" prefix + devalue stringify */
+function makeDevlPayload(value: unknown, revivers?: Revivers): Uint8Array {
+  const text = stringify(value, revivers);
+  const textBytes = new TextEncoder().encode(text);
+  const prefix = new TextEncoder().encode(SerializationFormat.DEVALUE_V1);
+  const result = new Uint8Array(prefix.length + textBytes.length);
+  result.set(prefix, 0);
+  result.set(textBytes, prefix.length);
+  return result;
+}
+
+/** Minimal revivers that handle basic types (no Node.js dependencies) */
+const testRevivers: Revivers = {
+  ...observabilityRevivers,
+  Date: (value) => new Date(value),
+  Error: (value) => {
+    const error = new Error(value.message);
+    error.name = value.name;
+    return error;
+  },
+  Map: (value) => new Map(value),
+  Set: (value) => new Set(value),
+  RegExp: (value) => new RegExp(value.source, value.flags),
+  URL: (value) => new URL(value),
+  URLSearchParams: (value) => new URLSearchParams(value === '.' ? '' : value),
+};
+
+// ---------------------------------------------------------------------------
+// encodeWithFormatPrefix / decodeFormatPrefix
+// ---------------------------------------------------------------------------
+
+describe('encodeWithFormatPrefix', () => {
+  it('should prepend the format prefix to a Uint8Array payload', () => {
+    const payload = new Uint8Array([1, 2, 3]);
+    const encoded = encodeWithFormatPrefix(
+      SerializationFormat.DEVALUE_V1,
+      payload
+    ) as Uint8Array;
+
+    expect(encoded).toBeInstanceOf(Uint8Array);
+    expect(encoded.length).toBe(4 + 3); // "devl" (4 bytes) + payload (3 bytes)
+
+    const prefix = new TextDecoder().decode(encoded.subarray(0, 4));
+    expect(prefix).toBe('devl');
+    expect(Array.from(encoded.subarray(4))).toEqual([1, 2, 3]);
+  });
+
+  it('should pass through non-Uint8Array values', () => {
+    const result = encodeWithFormatPrefix(
+      SerializationFormat.DEVALUE_V1,
+      'hello'
+    );
+    expect(result).toBe('hello');
+  });
+});
+
+describe('decodeFormatPrefix', () => {
+  it('should decode a valid devl-prefixed Uint8Array', () => {
+    const payload = new Uint8Array([10, 20, 30]);
+    const encoded = encodeWithFormatPrefix(
+      SerializationFormat.DEVALUE_V1,
+      payload
+    ) as Uint8Array;
+
+    const { format, payload: decoded } = decodeFormatPrefix(encoded);
+    expect(format).toBe('devl');
+    expect(Array.from(decoded)).toEqual([10, 20, 30]);
+  });
+
+  it('should throw for data shorter than the prefix length', () => {
+    expect(() => decodeFormatPrefix(new Uint8Array([1, 2]))).toThrow(
+      'Data too short'
+    );
+  });
+
+  it('should throw for unknown format prefix', () => {
+    const unknown = new TextEncoder().encode('zzzz1234');
+    expect(() => decodeFormatPrefix(unknown)).toThrow(
+      'Unknown serialization format'
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hydrateData
+// ---------------------------------------------------------------------------
+
+describe('hydrateData', () => {
+  it('should parse a devl-prefixed Uint8Array with devalue', () => {
+    const original = { greeting: 'hello', count: 42 };
+    const encoded = makeDevlPayload(original);
+
+    const result = hydrateData(encoded, testRevivers);
+    expect(result).toEqual(original);
+  });
+
+  it("leaves out a step input's internal state-records mark", () => {
+    expect(STATE_REFS_FIELD).toBe('stateRefs');
+    const marked = makeDevlPayload({ args: [1], [STATE_REFS_FIELD]: 1 });
+    expect(hydrateData(marked, testRevivers)).toEqual({ args: [1] });
+    // Only on a step-input envelope.
+    const data = makeDevlPayload({ stateRefs: 1, other: true });
+    expect(hydrateData(data, testRevivers)).toEqual({
+      stateRefs: 1,
+      other: true,
+    });
+  });
+
+  it('should unflatten a legacy array (specVersion 1)', () => {
+    // Legacy format: the result of devalue's flatten()
+    // For a simple string, devalue produces [0, "hello"]
+    // But more commonly it's an array of values
+    const legacyArray = [{ greeting: 1 }, 'hello'];
+    const result = hydrateData(legacyArray, testRevivers);
+    expect(result).toEqual({ greeting: 'hello' });
+  });
+
+  it('should pass through plain values (string, number, null)', () => {
+    expect(hydrateData('hello', testRevivers)).toBe('hello');
+    expect(hydrateData(42, testRevivers)).toBe(42);
+    expect(hydrateData(null, testRevivers)).toBe(null);
+    expect(hydrateData(undefined, testRevivers)).toBe(undefined);
+  });
+
+  it('should apply custom revivers during parsing', () => {
+    // Create a devl payload containing a Date (devalue handles Date natively
+    // by using a "Date" type with the ISO string as the value)
+    const original = { timestamp: new Date('2026-01-15T12:00:00Z') };
+    const encoded = makeDevlPayload(original);
+
+    const result = hydrateData(encoded, testRevivers) as {
+      timestamp: Date;
+    };
+    expect(result.timestamp).toBeInstanceOf(Date);
+    expect(result.timestamp.toISOString()).toBe('2026-01-15T12:00:00.000Z');
+  });
+
+  it('should throw for unsupported format prefix', () => {
+    const fakePrefix = new TextEncoder().encode('fake');
+    const payload = new TextEncoder().encode('{}');
+    const data = new Uint8Array(fakePrefix.length + payload.length);
+    data.set(fakePrefix, 0);
+    data.set(payload, fakePrefix.length);
+
+    expect(() => hydrateData(data, testRevivers)).toThrow(
+      'Unknown serialization format'
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hydrateResourceIO
+// ---------------------------------------------------------------------------
+
+describe('hydrateResourceIO', () => {
+  it('should hydrate step input and output', () => {
+    const input = makeDevlPayload({ args: ['hello'] });
+    const output = makeDevlPayload({ result: 42 });
+
+    const step = {
+      stepId: 'step_123',
+      input,
+      output,
+    };
+
+    const hydrated = hydrateResourceIO(step, testRevivers);
+    expect(hydrated.stepId).toBe('step_123');
+    expect(hydrated.input).toEqual({ args: ['hello'] });
+    expect(hydrated.output).toEqual({ result: 42 });
+  });
+
+  it('should hydrate workflow run input and output', () => {
+    const input = makeDevlPayload('user@example.com');
+    const output = makeDevlPayload({ status: 'completed' });
+
+    const run = {
+      runId: 'wrun_123',
+      input,
+      output,
+    };
+
+    const hydrated = hydrateResourceIO(run, testRevivers);
+    expect(hydrated.runId).toBe('wrun_123');
+    expect(hydrated.input).toBe('user@example.com');
+    expect(hydrated.output).toEqual({ status: 'completed' });
+  });
+
+  it("should hydrate a dynamic run's workflow code alongside its input", () => {
+    const code = 'async function workflow() { "use workflow"; }';
+    const run = {
+      runId: 'wrun_dyn',
+      input: makeDevlPayload(['arg']),
+      dynamicWorkflowCode: makeDevlPayload(code),
+    };
+
+    const hydrated = hydrateResourceIO(run, testRevivers);
+    expect(hydrated.input).toEqual(['arg']);
+    expect(hydrated.dynamicWorkflowCode).toBe(code);
+  });
+
+  it('strips executionContext but keeps display-safe fields', () => {
+    const hydrated = hydrateResourceIO(
+      {
+        runId: 'wrun_ctx',
+        executionContext: {
+          workflowCoreVersion: '5.0.0',
+          workflowVm: 'quickjs',
+          snapshotThreshold: 1000,
+          traceCarrier: { traceparent: 'x' },
+        },
+      },
+      testRevivers
+    ) as Record<string, unknown>;
+    expect('executionContext' in hydrated).toBe(false);
+    expect(hydrated.workflowCoreVersion).toBe('5.0.0');
+    expect(hydrated.workflowVm).toBe('quickjs');
+    expect(hydrated.snapshotThreshold).toBe(1000);
+    expect('traceCarrier' in hydrated).toBe(false);
+  });
+
+  it('does not add VM fields when executionContext lacks them', () => {
+    const hydrated = hydrateResourceIO(
+      { runId: 'wrun_ctx', executionContext: { traceCarrier: {} } },
+      testRevivers
+    ) as Record<string, unknown>;
+    expect('executionContext' in hydrated).toBe(false);
+    expect('workflowCoreVersion' in hydrated).toBe(false);
+    expect('workflowVm' in hydrated).toBe(false);
+    expect('snapshotThreshold' in hydrated).toBe(false);
+  });
+
+  it('should not add dynamicWorkflowCode to a static run', () => {
+    const hydrated = hydrateResourceIO(
+      { runId: 'wrun_static', input: makeDevlPayload(['arg']) },
+      testRevivers
+    );
+    expect('dynamicWorkflowCode' in hydrated).toBe(false);
+  });
+
+  it('should hydrate event eventData.result', () => {
+    const resultPayload = makeDevlPayload({ key: 'value' });
+
+    const event = {
+      eventId: 'evt_123',
+      eventType: 'step_completed',
+      eventData: {
+        result: resultPayload,
+      },
+    };
+
+    const hydrated = hydrateResourceIO(event, testRevivers);
+    expect(hydrated.eventId).toBe('evt_123');
+    expect(hydrated.eventData.result).toEqual({ key: 'value' });
+  });
+
+  it('should hydrate event eventData.output', () => {
+    const outputPayload = makeDevlPayload({ message: 'done' });
+
+    const event = {
+      eventId: 'evt_456',
+      eventType: 'run_completed',
+      eventData: {
+        output: outputPayload,
+      },
+    };
+
+    const hydrated = hydrateResourceIO(event, testRevivers);
+    expect(hydrated.eventId).toBe('evt_456');
+    expect(hydrated.eventData.output).toEqual({ message: 'done' });
+  });
+
+  it.each([
+    'run_started',
+    'step_started',
+  ] as const)('should hydrate eventData.input for %s events', (eventType) => {
+    const event = {
+      eventId: `evt_${eventType}`,
+      eventType,
+      eventData: { input: makeDevlPayload({ value: eventType }) },
+    };
+
+    const hydrated = hydrateResourceIO(event, testRevivers);
+    expect(hydrated.eventData.input).toEqual({ value: eventType });
+  });
+
+  it('should hydrate event eventData.metadata for hook_created events', () => {
+    const metadataPayload = makeDevlPayload({ source: 'webhook', retries: 2 });
+
+    const event = {
+      eventId: 'evt_hook_created',
+      eventType: 'hook_created',
+      eventData: {
+        token: 'hook_tok_123',
+        metadata: metadataPayload,
+      },
+    };
+
+    const hydrated = hydrateResourceIO(event, testRevivers);
+    expect(hydrated.eventId).toBe('evt_hook_created');
+    expect(hydrated.eventData.metadata).toEqual({
+      source: 'webhook',
+      retries: 2,
+    });
+    expect(hydrated.eventData.token).toBe('hook_tok_123');
+  });
+
+  it('should hydrate event eventData.payload for hook_received events', () => {
+    const payload = makeDevlPayload({ hello: 'world', count: 7 });
+
+    const event = {
+      eventId: 'evt_hook_received',
+      eventType: 'hook_received',
+      eventData: {
+        payload,
+      },
+    };
+
+    const hydrated = hydrateResourceIO(event, testRevivers);
+    expect(hydrated.eventId).toBe('evt_hook_received');
+    expect(hydrated.eventData.payload).toEqual({ hello: 'world', count: 7 });
+  });
+
+  it('should hydrate event eventData.error for step_failed / run_failed events', () => {
+    const errorPayload = makeDevlPayload({
+      message: 'something blew up',
+      stack: 'Error: something blew up\n    at foo:1:1',
+    });
+
+    const event = {
+      eventId: 'evt_step_failed',
+      eventType: 'step_failed',
+      eventData: {
+        error: errorPayload,
+      },
+    };
+
+    const hydrated = hydrateResourceIO(event, testRevivers);
+    expect(hydrated.eventId).toBe('evt_step_failed');
+    expect(hydrated.eventData.error).toEqual({
+      message: 'something blew up',
+      stack: 'Error: something blew up\n    at foo:1:1',
+    });
+  });
+
+  it('should hydrate hook metadata', () => {
+    const metadata = makeDevlPayload({ token: 'abc123' });
+
+    const hook = {
+      hookId: 'hook_123',
+      metadata,
+    };
+
+    const hydrated = hydrateResourceIO(hook, testRevivers);
+    expect(hydrated.hookId).toBe('hook_123');
+    expect(hydrated.metadata).toEqual({ token: 'abc123' });
+  });
+
+  it('should handle null/undefined fields gracefully', () => {
+    const step = {
+      stepId: 'step_456',
+      input: null,
+      output: undefined,
+    };
+
+    const hydrated = hydrateResourceIO(step, testRevivers);
+    expect(hydrated.input).toBe(null);
+    expect(hydrated.output).toBe(undefined);
+  });
+
+  it('should strip executionContext and preserve workflowCoreVersion', () => {
+    const run = {
+      runId: 'wrun_789',
+      executionContext: {
+        workflowCoreVersion: '4.1.0',
+        otherStuff: 'should be removed',
+      },
+    };
+
+    const hydrated = hydrateResourceIO(run, testRevivers);
+    expect(hydrated.executionContext).toBeUndefined();
+    expect((hydrated as any).workflowCoreVersion).toBe('4.1.0');
+  });
+
+  it('should leave data un-hydrated on parse errors', () => {
+    // Create a Uint8Array with valid prefix but garbage devalue content
+    const prefix = new TextEncoder().encode('devl');
+    const garbage = new TextEncoder().encode('not valid devalue');
+    const data = new Uint8Array(prefix.length + garbage.length);
+    data.set(prefix, 0);
+    data.set(garbage, prefix.length);
+
+    const step = { stepId: 'step_err', input: data };
+    const hydrated = hydrateResourceIO(step, testRevivers);
+
+    // Should return the raw Uint8Array instead of crashing
+    expect(hydrated.input).toBeInstanceOf(Uint8Array);
+  });
+
+  it('should return null/undefined resources as-is', () => {
+    expect(hydrateResourceIO(null as any, testRevivers)).toBe(null);
+    expect(hydrateResourceIO(undefined as any, testRevivers)).toBe(undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// observabilityRevivers
+// ---------------------------------------------------------------------------
+
+describe('observabilityRevivers', () => {
+  it('should convert ReadableStream to StreamRef', () => {
+    const ref = observabilityRevivers.ReadableStream({
+      name: 'strm_abc123',
+    });
+    expect(isStreamRef(ref)).toBe(true);
+    expect(ref.streamId).toBe('strm_abc123');
+  });
+
+  it('should convert StepFunction to display string', () => {
+    const result = observabilityRevivers.StepFunction({
+      stepId: 'step_xyz',
+    });
+    expect(result).toBe('<step:step_xyz>');
+  });
+
+  it('should convert Instance to ClassInstanceRef', () => {
+    const result = observabilityRevivers.Instance({
+      classId: 'pkg//MyClass',
+      data: { x: 1 },
+    });
+    expect(isClassInstanceRef(result)).toBe(true);
+    expect((result as ClassInstanceRef).className).toBe('MyClass');
+    expect((result as ClassInstanceRef).data).toEqual({ x: 1 });
+  });
+
+  it('should convert Class to display string', () => {
+    const result = observabilityRevivers.Class({
+      classId: 'pkg//MyClass',
+    });
+    expect(result).toBe('<class:MyClass>');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isStreamRef / isStreamId / extractStreamIds / truncateId
+// (ported from observability.test.ts)
+// ---------------------------------------------------------------------------
+
+describe('isStreamRef', () => {
+  it('should return true for valid StreamRef', () => {
+    const streamRef = {
+      __type: STREAM_REF_TYPE,
+      streamId: 'strm_123',
+    };
+    expect(isStreamRef(streamRef)).toBe(true);
+  });
+
+  it('should return false for null', () => {
+    expect(isStreamRef(null)).toBe(false);
+  });
+
+  it('should return false for wrong __type', () => {
+    expect(isStreamRef({ __type: 'wrong', streamId: 'strm_123' })).toBe(false);
+  });
+});
+
+describe('isStreamId', () => {
+  it('should return true for valid stream ID', () => {
+    expect(isStreamId('strm_abc123')).toBe(true);
+  });
+
+  it('should return false for non-stream strings', () => {
+    expect(isStreamId('not_a_stream')).toBe(false);
+  });
+
+  it('should return false for non-strings', () => {
+    expect(isStreamId(123)).toBe(false);
+    expect(isStreamId(null)).toBe(false);
+    expect(isStreamId({})).toBe(false);
+  });
+});
+
+describe('extractStreamIds', () => {
+  it('should extract stream IDs from flat objects', () => {
+    const obj = { stream: 'strm_123', other: 'not_stream' };
+    expect(extractStreamIds(obj)).toEqual(['strm_123']);
+  });
+
+  it('should extract stream IDs from nested objects', () => {
+    const obj = {
+      level1: {
+        level2: {
+          stream: 'strm_abc',
+        },
+      },
+    };
+    expect(extractStreamIds(obj)).toEqual(['strm_abc']);
+  });
+
+  it('should extract stream IDs from arrays', () => {
+    const arr = ['strm_1', 'strm_2', 'not_stream'];
+    expect(extractStreamIds(arr)).toEqual(['strm_1', 'strm_2']);
+  });
+
+  it('should deduplicate stream IDs', () => {
+    const obj = { a: 'strm_same', b: 'strm_same' };
+    expect(extractStreamIds(obj)).toEqual(['strm_same']);
+  });
+
+  it('should return empty array for no streams', () => {
+    expect(extractStreamIds({ foo: 'bar' })).toEqual([]);
+  });
+
+  it('should handle circular references without overflowing the stack', () => {
+    // devalue (which produces the hydrated o11y data this walks) supports
+    // circular references, so a step result containing a cycle reaches here.
+    const obj: Record<string, unknown> = { stream: 'strm_cycle' };
+    obj.self = obj;
+    expect(extractStreamIds(obj)).toEqual(['strm_cycle']);
+  });
+
+  it('should handle circular references through arrays', () => {
+    const arr: unknown[] = ['strm_in_arr'];
+    arr.push(arr);
+    expect(extractStreamIds(arr)).toEqual(['strm_in_arr']);
+  });
+});
+
+describe('truncateId', () => {
+  it('should not truncate short IDs', () => {
+    expect(truncateId('short', 12)).toBe('short');
+  });
+
+  it('should truncate long IDs', () => {
+    expect(truncateId('verylongidentifier', 12)).toBe('verylongiden...');
+  });
+
+  it('should use default max length of 12', () => {
+    expect(truncateId('123456789012')).toBe('123456789012');
+    expect(truncateId('1234567890123')).toBe('123456789012...');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hydrateResourceIO with custom class instances
+// (ported from observability.test.ts)
+// ---------------------------------------------------------------------------
+
+describe('hydrateResourceIO with custom class instances', () => {
+  it('should preserve ClassInstanceRef through JSON roundtrip', () => {
+    const ref = new ClassInstanceRef('Point', 'class//Point', { x: 1, y: 2 });
+    const json = JSON.stringify(ref);
+    const parsed = JSON.parse(json);
+
+    // After parsing, it's a plain object but still recognized
+    expect(isClassInstanceRef(parsed)).toBe(true);
+    expect(parsed.className).toBe('Point');
+    expect(parsed.classId).toBe('class//Point');
+    expect(parsed.data).toEqual({ x: 1, y: 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Encrypted data detection and placeholder handling
+// ---------------------------------------------------------------------------
+
+describe('encrypted data handling', () => {
+  /** Create a fake encrypted payload: "encr" prefix + random bytes */
+  function makeEncryptedPayload(): Uint8Array {
+    const prefix = new TextEncoder().encode('encr');
+    const fakeEncryptedBody = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const result = new Uint8Array(prefix.length + fakeEncryptedBody.length);
+    result.set(prefix, 0);
+    result.set(fakeEncryptedBody, prefix.length);
+    return result;
+  }
+
+  /** Create a fake sealed cross-run payload: "encp" prefix + random bytes */
+  function makeSealedPayload(): Uint8Array {
+    const prefix = new TextEncoder().encode('encp');
+    const fakeSealedBody = new Uint8Array(60).fill(9);
+    const result = new Uint8Array(prefix.length + fakeSealedBody.length);
+    result.set(prefix, 0);
+    result.set(fakeSealedBody, prefix.length);
+    return result;
+  }
+
+  describe('isEncryptedData', () => {
+    it('should detect encr-prefixed Uint8Array', () => {
+      expect(isEncryptedData(makeEncryptedPayload())).toBe(true);
+    });
+
+    it('should not detect devl-prefixed Uint8Array', () => {
+      const devlPayload = makeDevlPayload('hello');
+      expect(isEncryptedData(devlPayload)).toBe(false);
+    });
+
+    it('should return false for non-Uint8Array values', () => {
+      expect(isEncryptedData('hello')).toBe(false);
+      expect(isEncryptedData(42)).toBe(false);
+      expect(isEncryptedData(null)).toBe(false);
+      expect(isEncryptedData(undefined)).toBe(false);
+      expect(isEncryptedData({ foo: 'bar' })).toBe(false);
+    });
+
+    it('should return false for Uint8Array shorter than 4 bytes', () => {
+      expect(isEncryptedData(new Uint8Array([1, 2, 3]))).toBe(false);
+    });
+
+    it('should detect encp-prefixed (sealed) Uint8Array as ciphertext', () => {
+      // Display layers treat both schemes identically — a sealed cross-run
+      // payload is just as opaque as a symmetrically encrypted one.
+      expect(isEncryptedData(makeSealedPayload())).toBe(true);
+    });
+  });
+
+  describe('isSealedData', () => {
+    it('should detect encp-prefixed Uint8Array', () => {
+      expect(isSealedData(makeSealedPayload())).toBe(true);
+    });
+
+    it('should not detect encr-prefixed Uint8Array', () => {
+      expect(isSealedData(makeEncryptedPayload())).toBe(false);
+    });
+
+    it('should not detect devl-prefixed Uint8Array', () => {
+      expect(isSealedData(makeDevlPayload('hello'))).toBe(false);
+    });
+
+    it('should return false for non-Uint8Array and short values', () => {
+      expect(isSealedData('hello')).toBe(false);
+      expect(isSealedData(null)).toBe(false);
+      expect(isSealedData(new Uint8Array([1, 2, 3]))).toBe(false);
+    });
+  });
+
+  describe('hydrateData with encrypted values', () => {
+    it('should pass through encr-prefixed data as Uint8Array', () => {
+      const encrypted = makeEncryptedPayload();
+      const result = hydrateData(encrypted, {});
+      expect(result).toBeInstanceOf(Uint8Array);
+      expect(result).toBe(encrypted);
+      expect(isEncryptedData(result)).toBe(true);
+    });
+
+    it('should still hydrate devl-prefixed data normally', () => {
+      const payload = makeDevlPayload('hello');
+      const result = hydrateData(payload, {});
+      expect(result).toBe('hello');
+    });
+  });
+
+  describe('hydrateResourceIO with encrypted fields', () => {
+    it('should pass through encrypted run input/output as Uint8Array', () => {
+      const run = {
+        runId: 'wrun_test',
+        input: makeEncryptedPayload(),
+        output: makeEncryptedPayload(),
+      };
+      const result = hydrateResourceIO(run, {});
+      expect(isEncryptedData(result.input)).toBe(true);
+      expect(isEncryptedData(result.output)).toBe(true);
+    });
+
+    it('should pass through encrypted step input/output as Uint8Array', () => {
+      const step = {
+        stepId: 'step_test',
+        input: makeEncryptedPayload(),
+        output: makeEncryptedPayload(),
+      };
+      const result = hydrateResourceIO(step, {});
+      expect(isEncryptedData(result.input)).toBe(true);
+      expect(isEncryptedData(result.output)).toBe(true);
+    });
+
+    it('should hydrate normal data alongside encrypted Uint8Array', () => {
+      const run = {
+        runId: 'wrun_test',
+        input: makeDevlPayload({ greeting: 'hello' }),
+        output: makeEncryptedPayload(),
+      };
+      const result = hydrateResourceIO(run, {});
+      expect(result.input).toEqual({ greeting: 'hello' });
+      expect(isEncryptedData(result.output)).toBe(true);
+    });
+  });
+
+  describe('hydrateDataWithKey', () => {
+    // Real 32-byte AES-256 test key
+    const testKeyRaw = new Uint8Array([
+      0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+      0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+      0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    ]);
+
+    async function getTestKey() {
+      const { importKey } = await import('./encryption.js');
+      return importKey(testKeyRaw);
+    }
+
+    async function encryptPayload(value: unknown) {
+      const { encrypt, importKey } = await import('./encryption.js');
+      const key = await importKey(testKeyRaw);
+      const inner = makeDevlPayload(value);
+      const encrypted = await encrypt(key, inner);
+      return encodeWithFormatPrefix(
+        SerializationFormat.ENCRYPTED,
+        encrypted
+      ) as Uint8Array;
+    }
+
+    it('should decrypt and hydrate encrypted payload with correct key', async () => {
+      const original = { message: 'secret', count: 42 };
+      const encrypted = await encryptPayload(original);
+      const key = await getTestKey();
+
+      const result = await hydrateDataWithKey(
+        encrypted,
+        observabilityRevivers,
+        key
+      );
+      expect(result).toEqual(original);
+    });
+
+    it('should return original Uint8Array when key is undefined', async () => {
+      const original = { data: 'test' };
+      const encrypted = await encryptPayload(original);
+
+      const result = await hydrateDataWithKey(
+        encrypted,
+        observabilityRevivers,
+        undefined
+      );
+      // Without a key, encrypted data is returned as-is
+      expect(result).toBeInstanceOf(Uint8Array);
+      expect(isEncryptedData(result)).toBe(true);
+    });
+
+    it('should hydrate non-encrypted payloads normally', async () => {
+      const original = { hello: 'world' };
+      const payload = makeDevlPayload(original);
+      const key = await getTestKey();
+
+      const result = await hydrateDataWithKey(
+        payload,
+        observabilityRevivers,
+        key
+      );
+      expect(result).toEqual(original);
+    });
+
+    it('rejects a write-only seal target at the type level', async () => {
+      // A seal target holds only a public key, so it can open neither scheme.
+      // Accepting it here would compile into a guaranteed runtime failure, so
+      // the signature takes a read capability instead.
+      const { sealTo, deriveRunPayloadKeys } = await import(
+        './serialization/encryption.js'
+      );
+      const target = sealTo(new Uint8Array(32).fill(1));
+
+      // @ts-expect-error - SealTarget is write-only and must not be accepted
+      void hydrateDataWithKey(
+        makeSealedPayload(),
+        observabilityRevivers,
+        target
+      );
+
+      // Both read capabilities remain accepted: the run's full key bundle...
+      const keys = await deriveRunPayloadKeys(testKeyRaw);
+      await expect(
+        hydrateDataWithKey(makeSealedPayload(), observabilityRevivers, keys)
+      ).rejects.toThrow(); // fake ciphertext, but it type-checks and is attempted
+      // ...and a bare symmetric key (which simply cannot open sealed data).
+      await expect(
+        hydrateDataWithKey(
+          makeSealedPayload(),
+          observabilityRevivers,
+          await getTestKey()
+        )
+      ).resolves.toBeInstanceOf(Uint8Array);
+    });
+
+    it('should pass sealed payloads through untouched even when a key is present', async () => {
+      // A sealed payload is encrypted to the run's X25519 public key, so the
+      // symmetric key this function receives cannot open it. Attempting an
+      // AES-GCM decrypt would fail the auth tag and surface a spurious
+      // decryption error, so it must fall through as ciphertext instead.
+      const sealed = makeSealedPayload();
+      const key = await getTestKey();
+
+      const result = await hydrateDataWithKey(
+        sealed,
+        observabilityRevivers,
+        key
+      );
+      expect(result).toBe(sealed);
+      expect(isEncryptedData(result)).toBe(true);
+    });
+
+    it('should open a real sealed payload when given the run keypair', async () => {
+      // The o11y decrypt path must handle payloads that other runs sealed to
+      // this one — a cross-deployment hook resumption, say. Without this the
+      // dashboard and CLI would show a lock icon on data the user is entitled
+      // to read and has supplied the key for.
+      const { deriveRunKeyPair, seal } = await import('./sealed-box.js');
+      const { deriveRunPayloadKeys } = await import(
+        './serialization/encryption.js'
+      );
+
+      const original = { approved: true, note: 'sealed by another run' };
+      const keyPair = await deriveRunKeyPair(testKeyRaw);
+      const sealed = encodeWithFormatPrefix(
+        SerializationFormat.SEALED,
+        await seal(keyPair.publicKey, makeDevlPayload(original))
+      ) as Uint8Array;
+
+      const keys = await deriveRunPayloadKeys(testKeyRaw);
+      await expect(
+        hydrateDataWithKey(sealed, observabilityRevivers, keys)
+      ).resolves.toEqual(original);
+    });
+
+    it('should still open symmetric payloads when given the run keypair', async () => {
+      // The same resolved key must serve both schemes — a run's event log
+      // mixes its own 'encr' payloads with 'encp' payloads written to it.
+      const { deriveRunPayloadKeys } = await import(
+        './serialization/encryption.js'
+      );
+      const original = { message: 'own payload' };
+      const encrypted = await encryptPayload(original);
+      const keys = await deriveRunPayloadKeys(testKeyRaw);
+
+      await expect(
+        hydrateDataWithKey(encrypted, observabilityRevivers, keys)
+      ).resolves.toEqual(original);
+    });
+
+    it('should not throw "Unsupported serialization format" for sealed payloads', async () => {
+      // Regression guard: before `encp` was recognized, o11y hydration hit the
+      // unknown-format branch and threw, breaking the CLI/dashboard entirely
+      // for any run that received a sealed cross-run write.
+      const sealed = makeSealedPayload();
+      await expect(
+        hydrateDataWithKey(sealed, observabilityRevivers, undefined)
+      ).resolves.toBe(sealed);
+      expect(() => hydrateData(sealed, {})).not.toThrow();
+    });
+
+    it('should handle non-Uint8Array values (legacy specVersion 1 data)', async () => {
+      // Legacy specVersion 1 stored data as plain JSON (not binary).
+      // hydrateData passes these through devalue unflatten.
+      const legacyValue = 'plain string value';
+
+      const result = await hydrateDataWithKey(
+        legacyValue,
+        observabilityRevivers,
+        undefined
+      );
+      expect(result).toBe(legacyValue);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // isExpiredStub
+  // ---------------------------------------------------------------------------
+
+  describe('isExpiredStub', () => {
+    it('should detect unwrapped expired stub', () => {
+      expect(isExpiredStub({ expiredAt: '2025-03-18T00:00:00.000Z' })).toBe(
+        true
+      );
+    });
+
+    it('should detect array-wrapped expired stub (devalue unflatten format)', () => {
+      expect(isExpiredStub([{ expiredAt: '2025-03-18T00:00:00.000Z' }])).toBe(
+        true
+      );
+    });
+
+    it('should return false for objects with extra keys', () => {
+      expect(
+        isExpiredStub({ expiredAt: '2025-03-18T00:00:00.000Z', other: 'data' })
+      ).toBe(false);
+    });
+
+    it('should return false for non-string expiredAt', () => {
+      expect(isExpiredStub({ expiredAt: 12345 })).toBe(false);
+      expect(isExpiredStub({ expiredAt: null })).toBe(false);
+      expect(isExpiredStub({ expiredAt: new Date() })).toBe(false);
+    });
+
+    it('should return false for non-object values', () => {
+      expect(isExpiredStub(null)).toBe(false);
+      expect(isExpiredStub(undefined)).toBe(false);
+      expect(isExpiredStub('hello')).toBe(false);
+      expect(isExpiredStub(42)).toBe(false);
+      expect(isExpiredStub([])).toBe(false);
+    });
+
+    it('should return false for empty objects', () => {
+      expect(isExpiredStub({})).toBe(false);
+    });
+
+    it('should return false for objects with different single key', () => {
+      expect(isExpiredStub({ input: 'hello' })).toBe(false);
+    });
+
+    it('should return false for array with non-expired object', () => {
+      expect(isExpiredStub([{ input: 'hello' }])).toBe(false);
+    });
+
+    it('should return false for array with multiple elements', () => {
+      expect(
+        isExpiredStub([
+          { expiredAt: '2025-03-18T00:00:00.000Z' },
+          { expiredAt: '2025-03-18T00:00:00.000Z' },
+        ])
+      ).toBe(false);
+    });
+  });
+
+  describe('hydrateData with expired stubs', () => {
+    it('should unflatten server expired stub into array-wrapped form', () => {
+      // Server format: makeExpiredStub produces [[1], { expiredAt: 2 }, isoString]
+      // After unflatten: [{ expiredAt: "..." }] (array-wrapped due to devalue encoding)
+      const serverStub = [[1], { expiredAt: 2 }, '2025-03-18T00:00:00.000Z'];
+      const result = hydrateData(serverStub, observabilityRevivers);
+      expect(isExpiredStub(result)).toBe(true);
+      expect(result).toEqual([{ expiredAt: '2025-03-18T00:00:00.000Z' }]);
+    });
+  });
+});
+
+describe('observabilityRevivers', () => {
+  it('should render WorkflowFunction as <workflow:workflowId>', () => {
+    const result = observabilityRevivers.WorkflowFunction({
+      workflowId: 'workflow//./workflows/example//myWorkflow',
+    });
+    expect(result).toBe('<workflow:workflow//./workflows/example//myWorkflow>');
+  });
+});
+
+describe('state records in observability hydration', () => {
+  it('shows sources and whole values as values, and references as placeholders', () => {
+    const { StateRefV1, StateSrcV1 } = observabilityRevivers;
+    expect(
+      StateRefV1({ kind: 'source', id: 'hook:1', value: { message: 'hi' } })
+    ).toEqual({ message: 'hi' });
+    expect(
+      StateRefV1({ kind: 'full', logId: 'l', version: 'v1', value: [1] })
+    ).toEqual([1]);
+    expect(StateRefV1({ kind: 'ref', logId: 'l', version: 'v2' })).toBe(
+      '<state v2>'
+    );
+    expect(
+      StateRefV1({
+        kind: 'patch',
+        logId: 'l',
+        base: 'v1',
+        version: 'v2',
+        ops: [],
+      })
+    ).toEqual({
+      '<state change from v1>': [],
+    });
+    expect(StateSrcV1(['hook:1', ['message']])).toBe(
+      '<same as hook:1.message>'
+    );
+  });
+});

@@ -40,10 +40,7 @@ export async function fetchTeamInfo(
           '\nPlease ensure you are logged in and have access to the team:'
         )
       );
-      logger.warn(chalk.yellow('  1. Run `vercel login` to authenticate'));
-      logger.warn(
-        chalk.yellow('  2. Run `vercel env pull` to sync environment variables')
-      );
+      logger.warn(chalk.yellow('  Run `vercel login` to authenticate'));
       return null;
     }
 
@@ -71,56 +68,28 @@ export async function fetchTeamInfo(
   }
 }
 
-// /**
-//  * Check if the Vercel dashboard workflows page is available
-//  */
-// export async function checkVercelDashboardAvailable(
-//   teamSlug: string,
-//   projectName: string,
-//   authToken: string
-// ): Promise<boolean> {
-//   try {
-//     const dashboardUrl = `https://vercel.com/${teamSlug}/${projectName}/ai/workflows`;
-//     logger.debug(`Checking Vercel dashboard availability: ${dashboardUrl}`);
-
-//     const response = await fetch(dashboardUrl, {
-//       method: 'HEAD',
-//       redirect: 'follow',
-//       headers: {
-//         Authorization: `Bearer ${authToken}`,
-//       },
-//     });
-
-//     // Consider 2xx and 3xx as success
-//     const isAvailable = response.status >= 200 && response.status < 400;
-//     logger.debug(
-//       `Dashboard check result: ${response.status} - ${isAvailable ? 'available' : 'not available'}`
-//     );
-
-//     return isAvailable;
-//   } catch (error) {
-//     logger.debug(`Error checking dashboard availability: ${error}`);
-//     return false;
-//   }
-// }
-
 /**
- * Get the Vercel dashboard URL for workflows
+ * Get the Vercel dashboard URL for workflows.
+ *
+ * Format: https://vercel.com/<teamSlug>/<projectSlug>/workflows/runs/<runId>?environment=<env>
+ * (the older `/observability/workflows` route is no longer used).
  */
 export function getVercelDashboardUrl(
   teamSlug: string,
   projectName: string,
   resource: string,
-  id?: string
+  id?: string,
+  environment = 'production'
 ): string {
-  let url = `https://vercel.com/${teamSlug}/${projectName}/ai/workflows`;
+  const base = `https://vercel.com/${teamSlug}/${projectName}/workflows`;
+  const env = `environment=${environment}`;
 
-  // Add resource-specific path segments if needed
-  if (id) {
-    // For specific resources with IDs, we can add them to the URL
-    // The dashboard should handle these
-    url += `?${resource}Id=${id}`;
+  // Add resource-specific path segments
+  if (resource === 'run' && id) {
+    return `${base}/runs/${id}?${env}`;
   }
-
-  return url;
+  if (id) {
+    return `${base}?${resource}Id=${id}&${env}`;
+  }
+  return `${base}?${env}`;
 }

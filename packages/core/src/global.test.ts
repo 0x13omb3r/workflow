@@ -2,9 +2,15 @@ import { FatalError } from '@workflow/errors';
 import { describe, expect, it } from 'vitest';
 import {
   type HookInvocationQueueItem,
+  type QueueItem,
   type StepInvocationQueueItem,
   WorkflowSuspension,
 } from './global.js';
+
+// Helper to convert array of queue items to Map keyed by correlationId
+function toQueueMap(items: QueueItem[]): Map<string, QueueItem> {
+  return new Map(items.map((item) => [item.correlationId, item]));
+}
 
 describe('FatalError', () => {
   it('should create a FatalError instance', () => {
@@ -43,12 +49,12 @@ describe('WorkflowSuspension', () => {
         correlationId: 'inv-1',
       },
     ];
-    const error = new WorkflowSuspension(steps, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(steps), globalThis);
 
     expect(error).toBeInstanceOf(WorkflowSuspension);
     expect(error).toBeInstanceOf(Error);
     expect(error.name).toBe('WorkflowSuspension');
-    expect(error.steps).toEqual(steps);
+    expect(error.items).toEqual(steps);
   });
 
   it('should generate correct error message for single step', () => {
@@ -60,7 +66,7 @@ describe('WorkflowSuspension', () => {
         correlationId: 'inv-1',
       },
     ];
-    const error = new WorkflowSuspension(steps, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(steps), globalThis);
 
     expect(error.message).toBe('1 step has not been run yet');
   });
@@ -80,16 +86,16 @@ describe('WorkflowSuspension', () => {
         correlationId: 'inv-2',
       },
     ];
-    const error = new WorkflowSuspension(steps, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(steps), globalThis);
 
     expect(error.message).toBe('2 steps have not been run yet');
   });
 
   it('should handle empty steps array', () => {
     const steps: StepInvocationQueueItem[] = [];
-    const error = new WorkflowSuspension(steps, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(steps), globalThis);
 
-    expect(error.steps).toEqual([]);
+    expect(error.items).toEqual([]);
     expect(error.message).toBe('0 steps have not been run yet');
   });
 
@@ -115,20 +121,20 @@ describe('WorkflowSuspension', () => {
         correlationId: 'another-inv',
       },
     ];
-    const error = new WorkflowSuspension(complexSteps, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(complexSteps), globalThis);
 
-    expect(error.steps).toEqual(complexSteps);
+    expect(error.items).toEqual(complexSteps);
     expect(error.message).toBe('2 steps have not been run yet');
-    expect((error.steps[0] as StepInvocationQueueItem).stepName).toBe(
+    expect((error.items[0] as StepInvocationQueueItem).stepName).toBe(
       'complex-step'
     );
-    expect((error.steps[0] as StepInvocationQueueItem).correlationId).toBe(
+    expect((error.items[0] as StepInvocationQueueItem).correlationId).toBe(
       'complex-inv'
     );
-    expect((error.steps[1] as StepInvocationQueueItem).stepName).toBe(
+    expect((error.items[1] as StepInvocationQueueItem).stepName).toBe(
       'another-step'
     );
-    expect((error.steps[1] as StepInvocationQueueItem).correlationId).toBe(
+    expect((error.items[1] as StepInvocationQueueItem).correlationId).toBe(
       'another-inv'
     );
   });
@@ -142,7 +148,7 @@ describe('WorkflowSuspension', () => {
         correlationId: 'inv-1',
       },
     ];
-    const error = new WorkflowSuspension(steps, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(steps), globalThis);
 
     expect(error instanceof Error).toBe(true);
     expect(error instanceof WorkflowSuspension).toBe(true);
@@ -158,7 +164,7 @@ describe('WorkflowSuspension', () => {
         correlationId: 'inv-1',
       },
     ];
-    const error = new WorkflowSuspension(steps, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(steps), globalThis);
 
     expect(error.stack).toBeDefined();
     expect(error.stack).toContain('WorkflowSuspension');
@@ -179,27 +185,27 @@ describe('WorkflowSuspension', () => {
         correlationId: 'email-456',
       },
     ];
-    const error = new WorkflowSuspension(steps, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(steps), globalThis);
 
-    expect(error.steps).toHaveLength(2);
-    expect((error.steps[0] as StepInvocationQueueItem).stepName).toBe(
+    expect(error.items).toHaveLength(2);
+    expect((error.items[0] as StepInvocationQueueItem).stepName).toBe(
       'database-query'
     );
-    expect((error.steps[0] as StepInvocationQueueItem).args).toEqual([
+    expect((error.items[0] as StepInvocationQueueItem).args).toEqual([
       'SELECT * FROM users',
       { limit: 10 },
     ]);
-    expect((error.steps[0] as StepInvocationQueueItem).correlationId).toBe(
+    expect((error.items[0] as StepInvocationQueueItem).correlationId).toBe(
       'db-query-123'
     );
-    expect((error.steps[1] as StepInvocationQueueItem).stepName).toBe(
+    expect((error.items[1] as StepInvocationQueueItem).stepName).toBe(
       'send-email'
     );
-    expect((error.steps[1] as StepInvocationQueueItem).args).toEqual([
+    expect((error.items[1] as StepInvocationQueueItem).args).toEqual([
       'user@example.com',
       'Welcome!',
     ]);
-    expect((error.steps[1] as StepInvocationQueueItem).correlationId).toBe(
+    expect((error.items[1] as StepInvocationQueueItem).correlationId).toBe(
       'email-456'
     );
   });
@@ -212,7 +218,7 @@ describe('WorkflowSuspension', () => {
         token: 'webhook-token',
       },
     ];
-    const error = new WorkflowSuspension(hooks, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(hooks), globalThis);
 
     expect(error.message).toBe('1 hook has not been created yet');
     expect(error.hookCount).toBe(1);
@@ -231,7 +237,7 @@ describe('WorkflowSuspension', () => {
         token: 'webhook-token-2',
       },
     ];
-    const error = new WorkflowSuspension(hooks, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(hooks), globalThis);
 
     expect(error.message).toBe('2 hooks have not been created yet');
     expect(error.hookCount).toBe(2);
@@ -245,7 +251,7 @@ describe('WorkflowSuspension', () => {
         token: 'my-token',
       },
     ];
-    const error = new WorkflowSuspension(hooks, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(hooks), globalThis);
 
     expect(error.message).toBe('1 hook has not been created yet');
     expect(error.hookCount).toBe(1);
@@ -264,7 +270,7 @@ describe('WorkflowSuspension', () => {
         token: 'token-2',
       },
     ];
-    const error = new WorkflowSuspension(hooks, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(hooks), globalThis);
 
     expect(error.message).toBe('2 hooks have not been created yet');
     expect(error.hookCount).toBe(2);
@@ -289,9 +295,11 @@ describe('WorkflowSuspension', () => {
         token: 'my-token',
       },
     ];
-    const error = new WorkflowSuspension(items, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(items), globalThis);
 
-    expect(error.message).toBe('1 step and 2 hooks have not been run yet');
+    expect(error.message).toBe(
+      '1 step and 2 hooks have not been processed yet'
+    );
     expect(error.stepCount).toBe(1);
     expect(error.hookCount).toBe(2);
   });
@@ -316,9 +324,11 @@ describe('WorkflowSuspension', () => {
         token: 'webhook-token',
       },
     ];
-    const error = new WorkflowSuspension(items, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(items), globalThis);
 
-    expect(error.message).toBe('2 steps and 1 hook have not been run yet');
+    expect(error.message).toBe(
+      '2 steps and 1 hook have not been processed yet'
+    );
     expect(error.stepCount).toBe(2);
     expect(error.hookCount).toBe(1);
   });
@@ -337,10 +347,10 @@ describe('WorkflowSuspension', () => {
         token: 'my-token',
       },
     ];
-    const error = new WorkflowSuspension(items, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(items), globalThis);
 
-    // When there are steps, the action should be "run" not "created"
-    expect(error.message).toBe('1 step and 1 hook have not been run yet');
+    // When there are mixed types, the action should be "processed"
+    expect(error.message).toBe('1 step and 1 hook have not been processed yet');
   });
 
   it('should use "created" action when only webhooks are present', () => {
@@ -351,7 +361,7 @@ describe('WorkflowSuspension', () => {
         token: 'webhook-token',
       },
     ];
-    const error = new WorkflowSuspension(hooks, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(hooks), globalThis);
 
     expect(error.message).toBe('1 hook has not been created yet');
   });
@@ -364,8 +374,69 @@ describe('WorkflowSuspension', () => {
         token: 'my-token',
       },
     ];
-    const error = new WorkflowSuspension(hooks, globalThis);
+    const error = new WorkflowSuspension(toQueueMap(hooks), globalThis);
 
     expect(error.message).toBe('1 hook has not been created yet');
+  });
+
+  it('should count disposed hooks separately from active hooks', () => {
+    const items: HookInvocationQueueItem[] = [
+      {
+        type: 'hook',
+        correlationId: 'hook_123',
+        token: 'token-1',
+        disposed: true,
+      },
+    ];
+    const error = new WorkflowSuspension(toQueueMap(items), globalThis);
+
+    expect(error.hookCount).toBe(0);
+    expect(error.hookDisposedCount).toBe(1);
+    expect(error.message).toBe('1 hook disposal has not been processed yet');
+  });
+
+  it('should count multiple disposed hooks correctly', () => {
+    const items: HookInvocationQueueItem[] = [
+      {
+        type: 'hook',
+        correlationId: 'hook_123',
+        token: 'token-1',
+        disposed: true,
+      },
+      {
+        type: 'hook',
+        correlationId: 'hook_456',
+        token: 'token-2',
+        disposed: true,
+      },
+    ];
+    const error = new WorkflowSuspension(toQueueMap(items), globalThis);
+
+    expect(error.hookCount).toBe(0);
+    expect(error.hookDisposedCount).toBe(2);
+    expect(error.message).toBe('2 hook disposals have not been processed yet');
+  });
+
+  it('should count mix of active and disposed hooks correctly', () => {
+    const items: HookInvocationQueueItem[] = [
+      {
+        type: 'hook',
+        correlationId: 'hook_123',
+        token: 'token-1',
+      },
+      {
+        type: 'hook',
+        correlationId: 'hook_456',
+        token: 'token-2',
+        disposed: true,
+      },
+    ];
+    const error = new WorkflowSuspension(toQueueMap(items), globalThis);
+
+    expect(error.hookCount).toBe(1);
+    expect(error.hookDisposedCount).toBe(1);
+    expect(error.message).toBe(
+      '1 hook and 1 hook disposal have not been processed yet'
+    );
   });
 });

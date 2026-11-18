@@ -1,9 +1,14 @@
-export const validBuildTargets = [
-  'standalone',
-  'vercel-build-output-api',
-  'next',
-] as const;
-export type BuildTarget = (typeof validBuildTargets)[number];
+// Re-export builder types for backwards compatibility
+import type { WorkflowRunStatus } from '@workflow/world';
+
+export type {
+  BuildTarget,
+  WorkflowConfig,
+} from '@workflow/builders';
+export {
+  isValidBuildTarget,
+  validBuildTargets,
+} from '@workflow/builders';
 
 export type InspectCLIOptions = {
   json?: boolean;
@@ -15,31 +20,25 @@ export type InspectCLIOptions = {
   sort?: 'asc' | 'desc';
   limit?: number;
   workflowName?: string;
+  status?: WorkflowRunStatus;
+  /** Attribute prefilter for run listings, from repeated `--attribute k=v` */
+  attributes?: Record<string, string>;
+  /**
+   * Listing window start: relative duration (12h, 7d) or timestamp.
+   * Applies to the runs and attribute-key listings.
+   */
+  since?: string;
+  /** Listing window end: relative duration or timestamp; requires --since */
+  until?: string;
   withData?: boolean;
   backend?: string;
+  disableRelativeDates?: boolean;
+  interactive?: boolean;
+  /**
+   * Follow cursors to the last page and print every row (`--all`). Applies
+   * to the steps, events, and sleeps listings.
+   */
+  all?: boolean;
+  /** When true, decrypt encrypted values (triggers audit-logged key retrieval) */
+  decrypt?: boolean;
 };
-
-export interface WorkflowConfig {
-  watch?: boolean;
-  dirs: string[];
-  workingDir: string;
-  buildTarget: BuildTarget;
-  stepsBundlePath: string;
-  workflowsBundlePath: string;
-  webhookBundlePath: string;
-
-  // Optionally generate a client library for workflow execution. The preferred
-  // method of using workflow is to use a loader within a framework (like
-  // NextJS) that resolves client bindings on the fly.
-  clientBundlePath?: string;
-
-  externalPackages?: string[];
-
-  workflowManifestPath?: string;
-}
-
-export function isValidBuildTarget(
-  target: string | undefined
-): target is BuildTarget {
-  return target === 'standalone' || target === 'vercel-build-output-api';
-}

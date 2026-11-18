@@ -1,17 +1,38 @@
 {
   "name": "@workflow/world",
-  "version": "4.0.1-beta.2",
+  "version": "5.2.2",
   "description": "The Workflows World interface",
   "type": "module",
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "!dist/**/*.d.ts.map"
+  ],
   "main": "dist/index.js",
   "exports": {
     ".": "./dist/index.js",
+    "./attributes-validation": {
+      "types": "./dist/attributes-validation.d.ts",
+      "default": "./dist/attributes-validation.js"
+    },
+    "./env-config": {
+      "types": "./dist/env-config.d.ts",
+      "default": "./dist/env-config.js"
+    },
+    "./event-metadata": {
+      "types": "./dist/event-metadata.d.ts",
+      "default": "./dist/event-metadata.js"
+    },
+    "./spec-version": {
+      "types": "./dist/spec-version.d.ts",
+      "default": "./dist/spec-version.js"
+    },
     "./*": "./dist/*"
   },
   "publishConfig": {
     "access": "public"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/vercel/workflow.git",
@@ -20,17 +41,20 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "clean": "tsc --build --clean && rm -rf dist"
+    "clean": "tsc --build --clean && rm -rf dist",
+    "test": "vitest run --config=../../vitest.config.ts src"
   },
-  "peerDependencies": {
+  "dependencies": {
+    "ulid": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {
     "@types/node": "catalog:",
-    "zod": "catalog:",
-    "@workflow/tsconfig": "workspace:*"
+    "@workflow/tsconfig": "workspace:*",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
   },
   "keywords": [],
   "author": "",
-  "packageManager": "pnpm@10.15.1"
+  "packageManager": "pnpm@11.28.11"
 }

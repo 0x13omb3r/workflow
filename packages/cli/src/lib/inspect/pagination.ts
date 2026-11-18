@@ -118,7 +118,130 @@ export interface PageData<T> {
   data: T[];
   cursor: string | null | undefined;
   hasMore: boolean;
+  pageInfo?: AnalyticsPageInfo;
+  /**
+   * False when `--cursor` on a new invocation would not reach the read path
+   * that produced this cursor, so printing it would hand back a cursor the
+   * next call sends to the wrong backend. That is the case for a page served
+   * by the storage fallback of a listing that otherwise reads analytics: a
+   * new call given a cursor goes to analytics. Omitted means reusable.
+   */
+  cursorReusable?: boolean;
 }
+
+/**
+ * Quote a value for a POSIX shell when it holds anything beyond the
+ * characters a shell passes through unchanged. Cursors are opaque, and
+ * world-local's contain `|`, which would turn a copied hint into a pipe.
+ */
+const shellQuote = (value: string): string =>
+  /^[A-Za-z0-9_\-.:=/+@,%]+$/.test(value)
+    ? value
+    : `'${value.replace(/'/g, `'\\''`)}'`;
+
+const joinAlternatives = (items: string[]): string => {
+  if (items.length <= 1) return items.join('');
+  if (items.length === 2) return `${items[0]} or ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')}, or ${items.at(-1)}`;
+};
+
+/**
+ * The line a listing prints when it stopped with more rows behind it.
+ *
+ * It names the next page's cursor, since `--interactive` needs a TTY and
+ * `--json` ignores it: without the cursor, a script had no way past the
+ * first page of a listing whose JSON output is a bare array.
+ */
+export const moreResultsMessage = (
+  page: Pick<PageData<unknown>, 'cursor' | 'cursorReusable'>,
+  options: { supportsAll?: boolean; json?: boolean } = {}
+): string => {
+  const ways: string[] = [];
+  if (page.cursor && page.cursorReusable !== false) {
+    ways.push(`--cursor ${shellQuote(page.cursor)} for the next page`);
+  }
+  if (options.supportsAll) {
+    ways.push('--all for every page');
+  }
+  if (!options.json) {
+    ways.push('--interactive (-i) to page through them');
+  }
+  return ways.length > 0
+    ? `More results available. Pass ${joinAlternatives(ways)}.`
+    : 'More results available.';
+};
+
+/**
+ * Follow cursors from `initialCursor` until the backend reports no more
+ * rows, and return every row as one page.
+ *
+ * Throws rather than return a short answer: a backend that claims more rows
+ * but gives no cursor would end the read early while looking complete, and
+ * one that repeats a cursor would loop forever.
+ */
+export async function fetchAllPages<TData>(
+  fetchPage: (cursor: string | undefined) => Promise<PageData<TData>>,
+  initialCursor?: string
+): Promise<PageData<TData>> {
+  const data: TData[] = [];
+  const seen = new Set<string>();
+  let cursor = initialCursor || undefined;
+  if (cursor) seen.add(cursor);
+  for (;;) {
+    const page = await fetchPage(cursor);
+    data.push(...page.data);
+    if (!page.hasMore) {
+      return {
+        data,
+        cursor: page.cursor,
+        hasMore: false,
+        pageInfo: page.pageInfo,
+      };
+    }
+    if (!page.cursor) {
+      throw new Error(
+        'The backend reported more results but returned no cursor to fetch them with.'
+      );
+    }
+    if (seen.has(page.cursor)) {
+      throw new Error(
+        `The backend returned cursor ${JSON.stringify(page.cursor)} twice; stopping rather than reading the same page again.`
+      );
+    }
+    seen.add(page.cursor);
+    cursor = page.cursor;
+  }
+}
+
+export interface AnalyticsPageInfo {
+  currentLookbackDays: number;
+  maxLookbackDays: number;
+  currentWindowStart: Date | string;
+  maxWindowStart: Date | string;
+  upgradeAvailable: boolean;
+}
+
+export const getPageInfoUpgradeHint = (
+  pageInfo: AnalyticsPageInfo | undefined
+): string | undefined => {
+  if (
+    !pageInfo?.upgradeAvailable ||
+    pageInfo.currentLookbackDays >= pageInfo.maxLookbackDays
+  ) {
+    return undefined;
+  }
+
+  return `Showing the last ${pageInfo.currentLookbackDays} days of workflow observability data. Upgrade Observability Plus to query up to ${pageInfo.maxLookbackDays} days.`;
+};
+
+const showPageInfoUpgradeHint = (
+  pageInfo: AnalyticsPageInfo | undefined
+): void => {
+  const hint = getPageInfoUpgradeHint(pageInfo);
+  if (hint) {
+    logger.info(hint);
+  }
+};
 
 /**
  * Generic pagination handler for list operations
@@ -137,12 +260,33 @@ export interface ListPaginationOptions<TData> {
   /**
    * Display function that renders the current page
    */
-  displayPage: (data: TData[], pageIndex: number) => void | Promise<void>;
+  displayPage: (
+    data: TData[],
+    pageIndex: number,
+    page: PageData<TData>
+  ) => void | Promise<void>;
 
   /**
    * Optional callback for when fetching starts
    */
   onFetchStart?: (pageIndex: number) => void;
+
+  /**
+   * Enable interactive pagination with keyboard controls
+   */
+  interactive?: boolean;
+
+  /**
+   * Read every page from `initialCursor` on and display them as one page
+   * (`--all`). Never combined with `interactive`; the command rejects that.
+   */
+  all?: boolean;
+
+  /**
+   * Whether this listing accepts `--all`, so the more-results hint can
+   * offer it.
+   */
+  supportsAll?: boolean;
 }
 
 /**
@@ -151,7 +295,22 @@ export interface ListPaginationOptions<TData> {
 export async function setupListPagination<TData>(
   options: ListPaginationOptions<TData>
 ): Promise<void> {
-  const { initialCursor, fetchPage, displayPage, onFetchStart } = options;
+  const {
+    initialCursor,
+    fetchPage: fetchOnePage,
+    displayPage,
+    onFetchStart,
+    interactive,
+    all,
+    supportsAll,
+  } = options;
+
+  const fetchPage = all
+    ? () => fetchAllPages(fetchOnePage, initialCursor)
+    : fetchOnePage;
+
+  // Interactive mode requires both TTY support and explicit --interactive flag
+  const enableInteractive = !all && interactive && isInteractive();
 
   // Pages stack - stores all fetched pages
   const pages: PageData<TData>[] = [];
@@ -172,18 +331,23 @@ export async function setupListPagination<TData>(
     pageIndex = index;
 
     // Clear screen for subsequent pages in interactive mode
-    if (isInteractive()) {
+    if (enableInteractive) {
       console.clear();
     }
 
-    await displayPage(page.data, index);
+    await displayPage(page.data, index, page);
+    showPageInfoUpgradeHint(page.pageInfo);
     return page;
   };
 
   // Fetch and display first page
   const firstPage = await showPage(0, initialCursor);
 
-  if (!isInteractive()) {
+  // In non-interactive mode, show info if there are more pages
+  if (!enableInteractive) {
+    if (firstPage.hasMore) {
+      logger.info(`\n${moreResultsMessage(firstPage, { supportsAll })}`);
+    }
     return;
   }
 
@@ -208,11 +372,12 @@ export async function setupListPagination<TData>(
         pageIndex = newPageIndex;
         const cachedPage = pages[newPageIndex];
 
-        if (isInteractive()) {
+        if (enableInteractive) {
           console.clear();
         }
 
-        await displayPage(cachedPage.data, pageIndex);
+        await displayPage(cachedPage.data, pageIndex, cachedPage);
+        showPageInfoUpgradeHint(cachedPage.pageInfo);
 
         paginationState.cursor = cachedPage.cursor;
         paginationState.hasMore = cachedPage.hasMore;
@@ -257,11 +422,12 @@ export async function setupListPagination<TData>(
         pageIndex--;
         const prevPage = pages[pageIndex];
 
-        if (isInteractive()) {
+        if (enableInteractive) {
           console.clear();
         }
 
-        await displayPage(prevPage.data, pageIndex);
+        await displayPage(prevPage.data, pageIndex, prevPage);
+        showPageInfoUpgradeHint(prevPage.pageInfo);
 
         paginationState.cursor = prevPage.cursor;
         paginationState.hasMore = prevPage.hasMore;

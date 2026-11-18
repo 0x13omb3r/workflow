@@ -1,0 +1,3930 @@
+/**
+ * QuickJS WebAssembly (WASM) workflow VM.
+ *
+ * An alternative engine for the event-replay execution model: the workflow
+ * code runs inside a QuickJS WASM VM (via quickjs-wasi) instead of a
+ * `node:vm` context. Every invocation creates a fresh VM, re-executes the
+ * workflow function from the top, and replays the recorded event log to
+ * resolve awaited primitives: the same replay semantics as the `node:vm`
+ * engine.
+ *
+ * The workflow primitives (useStep, sleep, createHook) are implemented as
+ * JavaScript code running inside the QuickJS VM. The host communicates with
+ * the VM by evaluating small JS snippets to read pending operations and
+ * resolve/reject promises.
+ *
+ * The VM bootstrap is deliberately split into two phases:
+ *   1. Static initialization (`initWorkflowVM`): run-independent setup:
+ *      VM creation and the workflow primitives. (Serialization lives on
+ *      the host (see quickjs-serde.ts) so no serde code is evaluated
+ *      in the VM.)
+ *   2. Per-run initialization (inline in `runQuickJSWorkflow`): seeded
+ *      PRNG/ULID host functions, workflow bundle evaluation, run metadata,
+ *      workflow input, and start.
+ * Keeping the phases separate is groundwork for VM-memory snapshotting:
+ * a follow-up can persist/restore the VM at the phase boundary (e.g. a
+ * build-time initial snapshot) without restructuring this module. Note
+ * that bundle evaluation currently sits in the per-run phase so that
+ * module-scope user code observes the seeded `Math.random`, matching the
+ * `node:vm` engine's replay determinism.
+ */
+
+import { SerializationError } from '@workflow/errors';
+import { globalSingleton } from '@workflow/utils';
+import {
+  classifyEntityEvent,
+  type Event,
+  isRunCreationEvent,
+  isSealedNoopEvent,
+  type RunInput,
+  type SnapshotMetadata,
+  TERMINAL_EVENT_CLASSES,
+  type WorkflowRun,
+  type WorldCapabilities,
+} from '@workflow/world';
+import {
+  type AttributeChange,
+  AttributeValidationError,
+  validateAttributeEventDataSize,
+} from '@workflow/world/attributes-validation';
+import {
+  type ExtensionDescriptor,
+  JSException,
+  QuickJS,
+  type Snapshot,
+  type WasiOptions,
+} from 'quickjs-wasi';
+import seedrandom from 'seedrandom';
+import { monotonicFactory } from 'ulid';
+import { runtimeLogger } from '../logger.js';
+import { createSeededNanoid } from '../seeded-nanoid.js';
+import { decompress } from '../serialization/compression.js';
+import type { DecryptionKey } from '../serialization/encryption.js';
+import { decrypt } from '../serialization/encryption.js';
+import { formatSerializationError } from '../serialization/errors.js';
+import {
+  getReplayTimeoutMs,
+  isQuickJSBaselineSnapshotEnabled,
+} from './constants.js';
+import {
+  quickjsExtensions,
+  quickjsWasiVersion,
+  quickjsWasm,
+} from './quickjs-assets.generated.js';
+import { getPrecompiledQuickJSModules } from './quickjs-precompiled.js';
+import {
+  adoptSerdeRoot,
+  captureSerdeRoot,
+  createQuickJSSerde,
+  exportSerdeRoot,
+  type QuickJSSerde,
+} from './quickjs-serde.js';
+import { runIdCreatedAt } from './run-id-time.js';
+import {
+  type RunStartHook,
+  resolveRunStartHook,
+} from './start-hook-binding.js';
+
+// ---- Host -> VM payload preparation ----
+
+/**
+ * Prepare persisted payload bytes for consumption inside the VM: decrypt
+ * (when an encryption key is configured) and decompress (specVersion >= 5
+ * payloads may be gzip/zstd-compressed). The VM only understands plain
+ * format-prefixed 'devl' bytes: it has neither the key material nor zlib.
+ * The key is the run's full DecryptionKey capability (symmetric AES key +
+ * X25519 keypair) so sealed `encp` hook payloads from cross-deployment
+ * resumeHook() calls open here too, not just symmetric `encr` ones.
+ * Both stages are format-prefix dispatched, so plaintext/uncompressed
+ * data passes through unchanged. Mirrors `prepareReplayPayload` in
+ * serialization.ts (the node:vm engine's equivalent host-side stage).
+ */
+async function prepareBytesForVM(
+  data: Uint8Array,
+  key?: DecryptionKey
+): Promise<Uint8Array> {
+  return (await decompress(await decrypt(data, key))) as Uint8Array;
+}
+
+// ---- Types ----
+
+export interface PendingStep {
+  type: 'step';
+  correlationId: string;
+  stepId: string;
+  /**
+   * Format-prefixed devalue-serialized step input (args + closureVars).
+   * Absent when {@link serializationError} is set: the input is precisely
+   * what refused to serialize.
+   */
+  input?: Uint8Array;
+  /** Whether a step_created event already exists for this step */
+  hasCreatedEvent: boolean;
+  /**
+   * Set when host-side serialization of the step's raw input failed while
+   * dumping the VM's pending ops (see `dumpPendingOps`). The failure is
+   * deterministic (replaying re-derives the same unserializable value), so
+   * instead of failing the whole collection the op is surfaced with the
+   * reframed error and no `input`; the entrypoint finalizes the step as
+   * `step_created` (placeholder input) + `step_failed`, mirroring the
+   * node:vm engine's `finalizeUnserializableStep`, so a try/catch around
+   * the step call observes the SerializationError.
+   */
+  serializationError?: SerializationError;
+}
+
+export interface PendingWait {
+  type: 'wait';
+  correlationId: string;
+  /** ISO string of when to resume */
+  resumeAt: string;
+  /** Whether a wait_created event already exists for this wait */
+  hasCreatedEvent: boolean;
+}
+
+export interface PendingHook {
+  type: 'hook';
+  correlationId: string;
+  token: string;
+  /** Earliest token reuse time, as milliseconds since the Unix epoch. */
+  tokenRetentionUntil?: number;
+  isWebhook: boolean;
+  /** `createHook({ experimental_force })`: take the token over if held. */
+  force?: boolean;
+  metadata?: unknown;
+  hasCreatedEvent: boolean;
+  /**
+   * The run's start Hook, opened by `createHook({ token })` with the start
+   * token. Created by the run's admission, so `hasCreatedEvent` is true from
+   * the start and no `hook_created` is written for it.
+   */
+  startHook?: true;
+  /**
+   * True for SDK-internal hooks (the AbortController hook, the child-run
+   * completion hook). Recorded on `hook_created`; such hooks are resumed by
+   * writers outside this run, and need not be created at terminal drain.
+   */
+  isSystem?: boolean;
+  /** True for an AbortController's hook (VM-only; not recorded). */
+  isAbortSignal?: boolean;
+  /**
+   * Set when the workflow called AbortController.abort() during this
+   * invocation. The host must record the abort: create a hook_received
+   * event carrying `abortPayload` and write/close the abort stream.
+   */
+  abortRequested?: boolean;
+  /** VM-serialized `{ aborted: true, reason }` payload for the abort. */
+  abortPayload?: Uint8Array;
+  /** Set by the completion drain when a system hook is implicitly disposed. */
+  disposed?: boolean;
+  /**
+   * True when the workflow is awaiting hook.getConflict() for this hook.
+   * The entrypoint re-invokes the workflow right after writing
+   * hook_created so replay can confirm creation and resolve the awaiter.
+   */
+  hasGetConflictAwaiter?: boolean;
+}
+
+export interface PendingAttribute {
+  type: 'attribute';
+  correlationId: string;
+  /** Normalized attribute changes (plain JSON-able objects) */
+  changes: AttributeChange[];
+  allowReservedAttributes?: boolean;
+  /** Whether an attr_set event already exists for this write */
+  hasCreatedEvent: boolean;
+}
+
+export interface PendingHookDispose {
+  type: 'hook_dispose';
+  correlationId: string;
+  /**
+   * Token of the hook being disposed. Used by the entrypoint to order
+   * same-token hook operations sequentially in code order.
+   */
+  token?: string;
+  hasCreatedEvent: boolean;
+}
+
+export type PendingOperation =
+  | PendingStep
+  | PendingWait
+  | PendingHook
+  | PendingAttribute
+  | PendingHookDispose;
+
+export interface QuickJSRuntimeResult {
+  /** The workflow completed: result is format-prefixed devalue bytes */
+  completed?: {
+    result: Uint8Array;
+    /**
+     * Leftover pending operations that still need durable side effects at
+     * completion: abort recordings, fire-and-forget attribute/hook/step events,
+     * and disposals needed by later hook registrations. Mirrors the node:vm engine's
+     * drainPendingQueueItems. The entrypoint dispatches these WITHOUT
+     * queueing steps or requeuing the run.
+     */
+    drainOperations?: PendingOperation[];
+  };
+  /** The workflow suspended with pending operations */
+  suspended?: {
+    pendingOperations: PendingOperation[];
+  };
+  /** The workflow failed */
+  failed?: {
+    message: string;
+    stack?: string;
+    name?: string;
+    /** See completed.drainOperations: same semantics on failure. */
+    drainOperations?: PendingOperation[];
+    /**
+     * Format-prefixed devalue bytes of the original thrown value
+     * (Error subclass with cause chain, plain object, primitive, etc.).
+     * Set when the VM-side rejection handler successfully serializes
+     * the thrown value. The host uses these bytes to reconstruct the
+     * original value through the standard error hydration pipeline,
+     * preserving type identity (TypeError, FatalError) and non-Error
+     * throws verbatim. Falls back to the message/stack/name fields
+     * when this is undefined (e.g. extractError pseudo-failures).
+     */
+    valueBytes?: Uint8Array;
+  };
+}
+
+export interface QuickJSRuntimeOptions {
+  /** The compiled workflow bundle code (workflow mode output from SWC) */
+  workflowCode: string;
+  /** The workflow ID (e.g. "workflow//./workflows/1_simple//simple") */
+  workflowId: string;
+  /** The workflow run entity */
+  workflowRun: WorkflowRun;
+  /** Features supported by the World executing this workflow. */
+  worldCapabilities?: WorldCapabilities;
+  /**
+   * The event log to process. Without a snapshot this is the FULL log and
+   * every invocation replays it from the start (same replay semantics as
+   * the `node:vm` engine). With `existingSnapshot`, this is the delta of
+   * events recorded at/after the snapshot's `eventsCursor` — feeding
+   * already-consumed events is harmless (consumed resolvers are gone and
+   * hook deliveries are deduped in the VM heap), so an imprecise cursor
+   * only costs redundant scanning.
+   */
+  events: Event[];
+  /**
+   * A previously persisted VM-memory snapshot to restore from, or
+   * null/undefined for a fresh boot + full replay. Restoring skips VM
+   * bootstrap, bundle evaluation, and pre-snapshot re-execution entirely:
+   * the WASM heap resumes at the exact suspension point it was captured
+   * at, and only `events` are processed on top.
+   */
+  existingSnapshot?: {
+    data: Uint8Array;
+    metadata: SnapshotMetadata;
+  } | null;
+  /** Encryption key for decrypting event payloads (undefined if unencrypted) */
+  encryptionKey?: DecryptionKey;
+  /**
+   * The local port the workflow server is listening on, used to populate
+   * `workflowMetadata.url`. Resolved at call time on the host side so the
+   * VM doesn't have to probe the filesystem. Ignored on Vercel, where
+   * VERCEL_URL takes precedence.
+   */
+  port?: number;
+  /**
+   * Fallback workflow input from the queue message's resilient-start
+   * payload. Used when the fetched event log lacks a `run_created` event
+   * (eventually-consistent read after the parent's start() wrote it).
+   */
+  runInput?: RunInput;
+  /**
+   * The run's start Hook. Resolved from `events`, `runInput` and
+   * `workflowRun` (see `resolveRunStartHook`) when omitted; `null` for none.
+   * Fixed at the fresh boot: a restored heap keeps the value it booted with.
+   */
+  startHook?: RunStartHook | null;
+}
+
+// ---- VM Bootstrap Code ----
+
+/**
+ * JavaScript code that runs inside the QuickJS VM to set up the workflow
+ * primitives. This sets up:
+ * - globalThis.__private_workflows (Map) - workflow registry
+ * - globalThis.__resolvers (Object) - pending promise resolve/reject functions
+ * - globalThis.__pending (Map) - metadata about pending operations, released
+ *   once settled
+ * - globalThis[Symbol.for("WORKFLOW_USE_STEP")] - step proxy factory
+ * - globalThis[Symbol.for("WORKFLOW_SLEEP")] - sleep function
+ */
+const VM_BOOTSTRAP = `
+// Symbol.dispose / Symbol.asyncDispose polyfills for QuickJS
+if (typeof Symbol.dispose === "undefined") {
+  Symbol.dispose = Symbol.for("Symbol.dispose");
+}
+if (typeof Symbol.asyncDispose === "undefined") {
+  Symbol.asyncDispose = Symbol.for("Symbol.asyncDispose");
+}
+
+globalThis.__private_workflows = new Map();
+globalThis.__resolvers = {};
+globalThis.__pending = new Map();
+
+// ---- Pending-op bookkeeping ----
+// Every primitive call (step, sleep, hook, attribute, AbortController)
+// records an op in __pending, a Map keyed by __pendingKey and iterated in
+// insertion (creation) order. Ops must not outlive their usefulness: a VM
+// whose heap is persisted by snapshotting carries every retained op (and
+// the raw step arguments it references) for the rest of the run, and event
+// lookups used to scan every op the run ever created, making replay
+// quadratic.
+//
+// An op is RELEASED (deleted) once nothing can ever read it again: a step,
+// wait or attribute that is durably created and whose promise has settled,
+// or a hook once this run's own disposal is durably recorded.
+// __releasedCids lists released ids until the host drains it at the next
+// collection, so it can evict their cached serialized bytes.
+globalThis.__releasedCids = [];
+// A hook and its hook_dispose op share a correlationId; every other op
+// owns its id.
+globalThis.__pendingKey = function(correlationId, type) {
+  return type === "hook_dispose" ? "hook_dispose:" + correlationId : correlationId;
+};
+globalThis.__pushPending = function(op) {
+  globalThis.__pending.set(globalThis.__pendingKey(op.correlationId, op.type), op);
+  return op;
+};
+globalThis.__pendingList = function() {
+  return Array.from(globalThis.__pending.values());
+};
+globalThis.__findPending = function(correlationId, type) {
+  var op = globalThis.__pending.get(globalThis.__pendingKey(correlationId, type));
+  return op && (type === undefined || op.type === type) ? op : undefined;
+};
+globalThis.__releasePending = function(op) {
+  if (!globalThis.__pending.delete(globalThis.__pendingKey(op.correlationId, op.type))) return;
+  globalThis.__releasedCids.push(op.correlationId);
+};
+// Releases a step, wait or attribute op once it is durably created and its
+// promise has settled: it is excluded from every collection from then on,
+// and no later event can reach it (its resolver is gone, and re-scanned
+// terminals are dropped: see isConsumedTerminal on the host).
+globalThis.__releaseIfSettled = function(op) {
+  if (
+    op.hasCreatedEvent &&
+    (op.type === "step" || op.type === "wait" || op.type === "attribute") &&
+    !globalThis.__resolvers[op.correlationId]
+  ) {
+    globalThis.__releasePending(op);
+  }
+};
+globalThis.__markCreated = function(correlationId, type) {
+  var op = globalThis.__findPending(correlationId, type);
+  if (!op) return false;
+  op.hasCreatedEvent = true;
+  globalThis.__releaseIfSettled(op);
+  return true;
+};
+// This run's own disposal of a hook is durably recorded: the hook can no
+// longer be awaited, created, or conflicted, so release both of its ops and
+// its lifecycle state (the hook object's closures keep their own reference
+// to it). Payloads buffered before the disposal stay in
+// __hookPayloadBuffer, so the hook can still drain them.
+globalThis.__releaseDisposedHook = function(correlationId) {
+  var dispose = globalThis.__findPending(correlationId, "hook_dispose");
+  if (dispose) globalThis.__releasePending(dispose);
+  var hook = globalThis.__findPending(correlationId, "hook");
+  // An AbortController's hook keeps its op: abort() finds it by
+  // correlationId to request the abort later.
+  if (
+    hook &&
+    !hook.isAbortSignal &&
+    !hook.abortRequested &&
+    !globalThis.__resolvers[correlationId]
+  ) {
+    globalThis.__releasePending(hook);
+  }
+  if (globalThis.__hooks) delete globalThis.__hooks[correlationId];
+  var buf = globalThis.__hookPayloadBuffer[correlationId];
+  if (buf && buf.length === 0) delete globalThis.__hookPayloadBuffer[correlationId];
+};
+globalThis.__workflowResult = undefined;
+globalThis.__workflowError = undefined;
+// Buffer for hook_received payloads that arrive before the hook is awaited.
+// Keyed by correlationId → array of payloads (preserves delivery order).
+// This mirrors the event-replay runtime's payloadsQueue in hook.ts.
+globalThis.__hookPayloadBuffer = {};
+// A buffered payload that failed to decrypt or deserialize: the failure is
+// held at the payload's place in the buffer and only rejects the await that
+// takes it, so a payload nothing reads (a start Hook the workflow never opens)
+// cannot fail the run. Mirrors the node:vm engine's buffered outcome.
+globalThis.__HydrationFailure = function(error) { this.error = error; };
+
+// Buffer for step/wait/attr terminal outcomes that arrive before this VM
+// has constructed the corresponding awaiting promise. In fresh-VM replay
+// the multi-pass event scan makes this unreachable (awaits are
+// reconstructed before their terminals are re-scanned), but the live
+// continuation path (continueWithEvents) scans each delta exactly once —
+// a concurrent invocation's terminal arriving before this VM reaches the
+// await would otherwise be dropped on the floor and the await would
+// never settle (the feed's seen-set means it is never re-delivered).
+// Mirrors __hookPayloadBuffer, which exists for exactly this reason on
+// the hook path. Keyed by correlationId → single terminal (steps, waits
+// and attrs settle exactly once).
+globalThis.__terminalBuffer = {};
+
+// Registers a resolver for an awaited primitive, first draining any
+// buffered terminal recorded for the correlationId. Entries are prepared
+// host-side: bytes are decrypted AND deserialized into VM values by the
+// host serde before buffering (the VM has no in-guest deserializer on
+// the host-serde engine), so draining only forwards the stored value.
+globalThis.__registerResolver = function(correlationId, resolve, reject) {
+  var buffered = globalThis.__terminalBuffer[correlationId];
+  if (buffered) {
+    delete globalThis.__terminalBuffer[correlationId];
+    if (buffered.kind === "resolve_value") {
+      resolve(buffered.value);
+    } else if (buffered.kind === "reject_value") {
+      reject(buffered.value);
+    } else if (buffered.kind === "reject_error") {
+      var e = new Error(buffered.message);
+      e.name = "FatalError";
+      e.fatal = true;
+      if (buffered.stack) e.stack = buffered.stack;
+      reject(e);
+    } else {
+      resolve(undefined);
+    }
+    return;
+  }
+  globalThis.__resolvers[correlationId] = { resolve: resolve, reject: reject };
+};
+
+// Stubs for Web APIs that the workflow bundle may reference but are not
+// available in QuickJS. Native C extensions (encoding, headers, url,
+// structured-clone) provide the real implementations; these are minimal
+// stubs for APIs that don't have native extensions yet. (btoa/atob and
+// the Uint8Array base64/hex methods are built into quickjs-wasi >= 3.)
+
+if (typeof ReadableStream === "undefined") {
+  // Minimal ReadableStream that stores body data for Response.json()/text()
+  globalThis.ReadableStream = function() {};
+  globalThis.ReadableStream.prototype.__bodyData = null;
+  // Reading a body as a stream is not supported in workflow functions; match
+  // the node:vm engine's error instead of failing with "not a function".
+  var streamNotSupported = function() {
+    throw new Error("This API is not available inside a workflow function. Workflow functions run in a deterministic VM; move the call to a step function for full Node.js access.");
+  };
+  ["cancel", "getReader", "pipeThrough", "pipeTo", "tee", "values"].forEach(function(name) {
+    globalThis.ReadableStream.prototype[name] = streamNotSupported;
+  });
+  globalThis.ReadableStream.prototype[Symbol.asyncIterator] = streamNotSupported;
+}
+
+if (typeof WritableStream === "undefined") {
+  globalThis.WritableStream = function() {};
+}
+
+if (typeof TransformStream === "undefined") {
+  globalThis.TransformStream = function() {};
+}
+
+if (typeof console === "undefined") {
+  globalThis.console = { log: function(){}, error: function(){}, warn: function(){}, info: function(){} };
+}
+// Stub exports/module for CJS bundle format
+globalThis.exports = {};
+globalThis.module = { exports: globalThis.exports };
+// NOTE: TextEncoder/TextDecoder are provided by the native encoding extension.
+
+// ---- Deterministic \`crypto\` (parity with the node:vm engine) ----
+// getRandomValues / randomUUID draw from Math.random, which the host
+// replaces with the run's seeded PRNG before any user code runs — so the
+// values replay deterministically and match the node engine, whose
+// implementations draw from the same seeded sequence (see vm/index.ts).
+// Every crypto.subtle method throws with the same guidance as the node
+// engine's non-replayable methods; unlike node, \`digest\` is also
+// unavailable here (no native hash in the VM yet).
+(function() {
+  function getRandomValues(array) {
+    for (var i = 0; i < array.length; i++) {
+      array[i] = Math.floor(Math.random() * 256);
+    }
+    return array;
+  }
+  // Mirrors vm/uuid.ts createRandomUUID: identical draw pattern from the
+  // seeded PRNG, so both engines produce the same UUID at the same point
+  // in a replay.
+  function randomUUID() {
+    var chars = "0123456789abcdef";
+    var uuid = "";
+    for (var i = 0; i < 36; i++) {
+      if (i === 8 || i === 13 || i === 18 || i === 23) {
+        uuid += "-";
+      } else if (i === 14) {
+        uuid += "4";
+      } else if (i === 19) {
+        uuid += chars[Math.floor(Math.random() * 4) + 8];
+      } else {
+        uuid += chars[Math.floor(Math.random() * 16)];
+      }
+    }
+    return uuid;
+  }
+  function subtleThrow(name) {
+    return function() {
+      var err = new Error("\`crypto.subtle." + name + "()\` is not available inside a workflow function. Move it to a step function where full Node.js crypto is available.");
+      err.name = "WorkflowRuntimeError";
+      throw err;
+    };
+  }
+  var subtle = {};
+  ["encrypt","decrypt","sign","verify","digest","generateKey","deriveKey","deriveBits","importKey","exportKey","wrapKey","unwrapKey"].forEach(function(m) {
+    subtle[m] = subtleThrow(m);
+  });
+  globalThis.crypto = {
+    getRandomValues: getRandomValues,
+    randomUUID: randomUUID,
+    subtle: subtle,
+  };
+})();
+
+// ---- Loud Intl / locale guards ----
+// QuickJS has no ICU: \`Intl\` is absent and toLocaleString-family methods
+// silently ignore their locale argument. Silent divergence from the node
+// engine would write different values into a durable event log with no
+// error anywhere — so make the gap loud instead: Intl constructors throw,
+// and toLocale* methods throw ONLY when called with an explicit locale
+// (the no-argument forms keep QuickJS's default behavior).
+(function() {
+  function intlThrow(name) {
+    return function() {
+      var err = new Error("\`Intl." + name + "\` is not available in the QuickJS workflow engine (no ICU). Perform locale-sensitive formatting in a step function, or use WORKFLOW_VM=node.");
+      err.name = "WorkflowRuntimeError";
+      throw err;
+    };
+  }
+  if (typeof Intl === "undefined") {
+    var intl = {};
+    ["Collator","DateTimeFormat","DisplayNames","DurationFormat","ListFormat","Locale","NumberFormat","PluralRules","RelativeTimeFormat","Segmenter"].forEach(function(n) {
+      intl[n] = intlThrow(n);
+    });
+    intl.getCanonicalLocales = intlThrow("getCanonicalLocales");
+    globalThis.Intl = intl;
+  }
+  function guardLocale(proto, method) {
+    var original = proto[method];
+    if (typeof original !== "function") return;
+    proto[method] = function(locales) {
+      if (locales !== undefined) {
+        var err = new Error("\`" + method + "(locales, ...)\` with an explicit locale is not supported in the QuickJS workflow engine (no ICU) — it would silently ignore the locale. Format in a step function, or call without arguments for the engine default.");
+        err.name = "WorkflowRuntimeError";
+        throw err;
+      }
+      return original.call(this);
+    };
+  }
+  guardLocale(Number.prototype, "toLocaleString");
+  guardLocale(Date.prototype, "toLocaleString");
+  guardLocale(Date.prototype, "toLocaleDateString");
+  guardLocale(Date.prototype, "toLocaleTimeString");
+  guardLocale(String.prototype, "toLocaleLowerCase");
+  guardLocale(String.prototype, "toLocaleUpperCase");
+  // localeCompare's locales argument is the SECOND parameter.
+  (function() {
+    var original = String.prototype.localeCompare;
+    String.prototype.localeCompare = function(that, locales) {
+      if (locales !== undefined) {
+        var err = new Error("\`localeCompare(that, locales, ...)\` with an explicit locale is not supported in the QuickJS workflow engine (no ICU). Compare in a step function, or call without a locale.");
+        err.name = "WorkflowRuntimeError";
+        throw err;
+      }
+      return original.call(this, that);
+    };
+  })();
+})();
+
+globalThis[Symbol.for("WORKFLOW_USE_STEP")] = function(stepId, closureVarsFn) {
+  var fn = function() {
+    var args = Array.prototype.slice.call(arguments);
+    var correlationId = "step_" + globalThis.__generateUlid();
+    // Capture 'this' for method invocations (e.g., MyClass.method())
+    var thisVal = (this !== undefined && this !== null && this !== globalThis) ? this : undefined;
+    // The RAW input value. Serialization happens on the host, which reads
+    // this through a handle when it collects the pending op — no
+    // serializer code runs inside the VM.
+    var input = {
+      args: args,
+      closureVars: closureVarsFn ? closureVarsFn() : undefined,
+      thisVal: thisVal,
+    };
+    globalThis.__pushPending({
+      type: "step",
+      correlationId: correlationId,
+      stepId: stepId,
+      input: input,
+      hasCreatedEvent: false,
+    });
+    return new Promise(function(resolve, reject) {
+      globalThis.__registerResolver(correlationId, resolve, reject);
+    });
+  };
+  // Set stepId on the proxy so the StepFunction reducer can detect and
+  // serialize step function references (e.g. when passed as arguments).
+  fn.stepId = stepId;
+  if (closureVarsFn) fn.__closureVarsFn = closureVarsFn;
+  // Override .bind so a bound step proxy (e.g. the SWC plugin's
+  // useStep(...).bind(this) for lexical-this arrow steps) keeps its
+  // stepId and records the bound receiver / prefilled args — the native
+  // bind drops own properties, which would make the StepFunction
+  // reducer fail to recognize the proxy when it crosses a serialization
+  // boundary. Mirrors the node:vm engine's override in step.ts.
+  fn.bind = function(thisArg) {
+    var partialArgs = Array.prototype.slice.call(arguments, 1);
+    var bound = Function.prototype.bind.apply(this, [thisArg].concat(partialArgs));
+    bound.stepId = stepId;
+    if (closureVarsFn) bound.__closureVarsFn = closureVarsFn;
+    bound.__boundThis = thisArg;
+    if (partialArgs.length > 0) bound.__boundArgs = partialArgs;
+    return bound;
+  };
+  return fn;
+};
+
+// Parses an "ms" library style duration string into milliseconds.
+// Supports the same units as the replay runtime (which uses the "ms"
+// package): ms / s / m / h / d / w / y, with verbose aliases
+// (seconds, minutes, ...).
+globalThis.__parseDurationMs = function(str) {
+  str = String(str);
+  if (str.length > 100) return undefined;
+  var match = str.match(
+    /^(-?(?:\\d+)?\\.?\\d+) *(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|years?|yrs?|y)?$/i
+  );
+  if (!match) return undefined;
+  var n = parseFloat(match[1]);
+  var type = (match[2] || "ms").toLowerCase();
+  var s = 1000, m = 60 * s, h = 60 * m, d = 24 * h, w = 7 * d, y = 365.25 * d;
+  switch (type) {
+    case "years": case "year": case "yrs": case "yr": case "y": return n * y;
+    case "weeks": case "week": case "w": return n * w;
+    case "days": case "day": case "d": return n * d;
+    case "hours": case "hour": case "hrs": case "hr": case "h": return n * h;
+    case "minutes": case "minute": case "mins": case "min": case "m": return n * m;
+    case "seconds": case "second": case "secs": case "sec": case "s": return n * s;
+    case "milliseconds": case "millisecond": case "msecs": case "msec": case "ms": return n;
+    default: return undefined;
+  }
+};
+
+globalThis[Symbol.for("WORKFLOW_SLEEP")] = function(param) {
+  var correlationId = "wait_" + globalThis.__generateUlid();
+  var resumeAt;
+  if (typeof param === "number") {
+    resumeAt = new Date(Date.now() + param).toISOString();
+  } else if (typeof param === "string") {
+    var ms = globalThis.__parseDurationMs(param);
+    if (typeof ms === "number" && isFinite(ms)) {
+      resumeAt = new Date(Date.now() + ms).toISOString();
+    } else {
+      // Not a duration string — try as an absolute date string.
+      var date = new Date(param);
+      if (isNaN(date.getTime())) {
+        throw new Error("Invalid sleep parameter: " + param);
+      }
+      resumeAt = date.toISOString();
+    }
+  } else if (param instanceof Date) {
+    if (isNaN(param.getTime())) {
+      throw new Error("Invalid sleep parameter: " + param);
+    }
+    resumeAt = param.toISOString();
+  } else {
+    throw new Error("Invalid sleep parameter: " + param);
+  }
+  globalThis.__pushPending({
+    type: "wait",
+    correlationId: correlationId,
+    resumeAt: resumeAt,
+    hasCreatedEvent: false,
+  });
+  return new Promise(function(resolve, reject) {
+    globalThis.__registerResolver(correlationId, resolve, reject);
+  });
+};
+
+// Response/Request polyfills — .json()/.text()/.arrayBuffer() are useStep
+// proxies that execute on the host side. The proxies are assigned directly
+// to the prototypes so that 'this' (the Response/Request instance) is
+// serialized as thisVal by WORKFLOW_USE_STEP, matching the event-replay
+// runtime's approach (commit dcb0761).
+if (typeof Response === "undefined") {
+  var __BODY_INIT = Symbol.for("BODY_INIT");
+
+  globalThis.Response = function(body, init) {
+    init = init || {};
+    this.status = init.status || 200;
+    this.statusText = init.statusText || "";
+    this.headers = new globalThis.Headers(init.headers || []);
+    this.type = "default";
+    this.url = "";
+    this.redirected = false;
+    if (body !== null && body !== undefined) {
+      this.body = Object.create(globalThis.ReadableStream.prototype);
+      this.body[__BODY_INIT] = body;
+    } else {
+      this.body = null;
+    }
+  };
+  Object.defineProperty(globalThis.Response.prototype, "ok", {
+    get: function() { return this.status >= 200 && this.status < 300; }
+  });
+  Object.defineProperty(globalThis.Response.prototype, "bodyUsed", {
+    get: function() { return false; }
+  });
+  // Assign useStep proxies directly — 'this' binding provides the
+  // Response instance, which gets serialized as thisVal by the proxy.
+  Object.defineProperties(globalThis.Response.prototype, {
+    arrayBuffer: { value: globalThis[Symbol.for("WORKFLOW_USE_STEP")]("__builtin_response_array_buffer"), writable: true, configurable: true },
+    json: { value: globalThis[Symbol.for("WORKFLOW_USE_STEP")]("__builtin_response_json"), writable: true, configurable: true },
+    text: { value: globalThis[Symbol.for("WORKFLOW_USE_STEP")]("__builtin_response_text"), writable: true, configurable: true },
+  });
+  globalThis.Response.prototype.bytes = function() {
+    return this.arrayBuffer().then(function(buf) { return new Uint8Array(buf); });
+  };
+  globalThis.Response.prototype.clone = function() {
+    var r = Object.create(globalThis.Response.prototype);
+    r.status = this.status; r.statusText = this.statusText;
+    r.headers = this.headers; r.type = this.type;
+    r.url = this.url; r.redirected = this.redirected; r.body = this.body;
+    return r;
+  };
+  globalThis.Response.json = function(data, init) {
+    var body = JSON.stringify(data);
+    var headers = new globalThis.Headers(init ? init.headers : []);
+    if (!headers.has("content-type")) { headers.set("content-type", "application/json"); }
+    return new globalThis.Response(body, { status: (init && init.status) || 200, statusText: (init && init.statusText) || "", headers: headers });
+  };
+}
+if (typeof Request === "undefined") {
+  globalThis.Request = function(input, init) {
+    init = init || {};
+    if (typeof input === "string") { this.url = input; }
+    else if (input && typeof input === "object") {
+      this.url = input.url || ""; this.method = input.method;
+      this.headers = input.headers; this.body = input.body;
+    }
+    if (init.method) this.method = init.method.toUpperCase();
+    if (!this.method) this.method = "GET";
+    if (init.headers) this.headers = new globalThis.Headers(init.headers);
+    if (!this.headers) this.headers = new globalThis.Headers();
+    if (init.body !== undefined) this.body = init.body;
+    if (!this.body) this.body = null;
+    this.duplex = init.duplex || "half";
+  };
+  Object.defineProperty(globalThis.Request.prototype, "bodyUsed", {
+    get: function() { return false; }
+  });
+  Object.defineProperties(globalThis.Request.prototype, {
+    arrayBuffer: { value: globalThis[Symbol.for("WORKFLOW_USE_STEP")]("__builtin_response_array_buffer"), writable: true, configurable: true },
+    json: { value: globalThis[Symbol.for("WORKFLOW_USE_STEP")]("__builtin_response_json"), writable: true, configurable: true },
+    text: { value: globalThis[Symbol.for("WORKFLOW_USE_STEP")]("__builtin_response_text"), writable: true, configurable: true },
+  });
+}
+
+// The error createHook throws when it opens the start Hook with options only
+// a write could apply. Same text as startHookOptionsError in workflow/hook.ts.
+globalThis.__startHookOptionsError = function(rejected) {
+  return "\`createHook()\` was called with this run's start token and " +
+    rejected.map(function(name) { return "\`" + name + "\`"; }).join(", ") +
+    ", but the start Hook was already created by \`start()\`, so they cannot apply. Set \`metadata\` and \`experimental_minRetention\` on \`start(workflow, args, { experimental_hook })\` instead; \`isWebhook\` and \`experimental_force\` are not available for a start Hook.";
+};
+// Hook correlation ids are minted from the run's ULID sequence, skipping the
+// one id a run must never mint: its start Hook's (see __startHook). A redraw is
+// a pure function of the sequence, so every replay makes it. Mirrors
+// mintHookCorrelationId in start-hook-binding.ts.
+globalThis.__mintHookCorrelationId = function() {
+  var id = "hook_" + globalThis.__generateUlid();
+  var startHook = globalThis.__startHook;
+  while (startHook && id === startHook.hookId) {
+    id = "hook_" + globalThis.__generateUlid();
+  }
+  return id;
+};
+
+// createHook — returns a Hook object that is both a Thenable and AsyncIterable.
+// Each await/yield creates a new promise keyed by the same correlationId.
+// The promise is resolved when a hook_received event arrives.
+globalThis[Symbol.for("WORKFLOW_CREATE_HOOK")] = function(options) {
+  options = options || {};
+  // The run's start Hook (start(workflow, args, { experimental_hook })), injected by the
+  // host as __startHook, was created by the run's admission: the first
+  // createHook with its token opens it (no hook_created, no suspension).
+  // Mirrors workflow/hook.ts.
+  var startHook = globalThis.__startHook;
+  var bindsStartHook = !!startHook && !startHook.bound &&
+    typeof options.token === "string" && options.token === startHook.token;
+  if (bindsStartHook) {
+    var rejectedStartHookOptions = [];
+    if (options.metadata !== undefined) rejectedStartHookOptions.push("metadata");
+    if (options.experimental_minRetention !== undefined) rejectedStartHookOptions.push("experimental_minRetention");
+    if (options.isWebhook === true) rejectedStartHookOptions.push("isWebhook");
+    if (options.experimental_force === true) rejectedStartHookOptions.push("experimental_force");
+    if (rejectedStartHookOptions.length > 0) {
+      throw new Error(globalThis.__startHookOptionsError(rejectedStartHookOptions));
+    }
+  }
+  if (options.isWebhook === true && options.experimental_minRetention !== undefined) {
+    throw new Error('Webhook hooks do not support \`experimental_minRetention\`. Use a non-webhook \`createHook()\` with \`resumeHook()\`.');
+  }
+  if (options.experimental_minRetention !== undefined && globalThis.__worldCapabilities?.hookRetention?.active !== true) {
+    var unsupportedRetentionError = new Error('The configured World does not support \`experimental_minRetention\` for Hooks.');
+    unsupportedRetentionError.name = "FatalError";
+    unsupportedRetentionError.fatal = true;
+    throw unsupportedRetentionError;
+  }
+  if (options.experimental_force === true) {
+    if (options.token === undefined || options.token === null) {
+      throw new Error('\`createHook()\` was called with \`experimental_force: true\` but no \`token\`. Force-claiming only applies to an explicit token another run may hold.');
+    }
+    if (options.isWebhook === true) {
+      throw new Error('Webhook hooks do not support \`experimental_force\`. Use a non-webhook \`createHook()\` with an explicit token.');
+    }
+    if (globalThis.__worldCapabilities?.hookForceClaim !== true) {
+      var unsupportedForceError = new Error('The configured World does not support \`experimental_force\` for Hooks.');
+      unsupportedForceError.name = "FatalError";
+      unsupportedForceError.fatal = true;
+      throw unsupportedForceError;
+    }
+  }
+  var token = options.token || globalThis.__generateNanoid();
+  var correlationId;
+  if (bindsStartHook) {
+    // Still draw one ULID, so later ids do not depend on whether this bound.
+    globalThis.__generateUlid();
+    correlationId = startHook.hookId;
+    startHook.bound = true;
+  } else {
+    correlationId = globalThis.__mintHookCorrelationId();
+  }
+  var isDisposed = false;
+  var hasCreatedEvent = false;
+  var tokenRetentionUntil;
+  if (options.experimental_minRetention !== undefined) {
+    var minRetention = options.experimental_minRetention;
+    if (typeof minRetention === "number") {
+      if (minRetention < 0 || !isFinite(minRetention)) {
+        throw new Error("Invalid duration: " + minRetention + ". Expected a non-negative finite number of milliseconds.");
+      }
+      tokenRetentionUntil = Date.now() + minRetention;
+    } else if (typeof minRetention === "string") {
+      var retentionMs = globalThis.__parseDurationMs(minRetention);
+      if (typeof retentionMs !== "number" || retentionMs < 0 || !isFinite(retentionMs)) {
+        throw new Error('Invalid duration: "' + minRetention + '". Expected a valid duration string like "1s", "1m", "1h", etc.');
+      }
+      tokenRetentionUntil = Date.now() + retentionMs;
+    } else if (minRetention instanceof Date || (minRetention && typeof minRetention.getTime === "function")) {
+      // Accept Date-like objects (anything with getTime), matching
+      // parseDurationToDate: values that crossed the serde boundary may
+      // not be realm-native Date instances.
+      tokenRetentionUntil = minRetention.getTime();
+    } else {
+      throw new Error("Invalid duration parameter. Expected a duration string, number (milliseconds), or Date object.");
+    }
+  }
+
+  // Register in pending operations. Metadata stays a RAW value; the host
+  // serializes it through a handle when it collects the pending op.
+  // The start Hook's creation is run_created itself, so its op is created
+  // from the start and nothing writes hook_created for it.
+  var pendingOp = bindsStartHook ? {
+    type: "hook",
+    correlationId: correlationId,
+    token: token,
+    tokenRetentionUntil: startHook.tokenRetentionUntil,
+    isWebhook: false,
+    force: false,
+    metadata: undefined,
+    hasCreatedEvent: true,
+    startHook: true,
+  } : {
+    type: "hook",
+    correlationId: correlationId,
+    token: token,
+    tokenRetentionUntil: tokenRetentionUntil,
+    isWebhook: !!options.isWebhook,
+    force: options.experimental_force === true,
+    metadata: options.metadata,
+    hasCreatedEvent: false,
+  };
+  // SDK-internal hooks (e.g. the child-run completion hook); see
+  // SystemHookOptions on the host.
+  if (options.isSystem === true && !options.isWebhook) pendingOp.isSystem = true;
+  globalThis.__pushPending(pendingOp);
+
+  // Per-hook lifecycle state backing hook.getConflict(): resolves null
+  // once creation is confirmed (hook_created), or resolves with the
+  // conflicting Run handle / rejects with HookConflictError on
+  // hook_conflict. State transitions are driven by the host during event
+  // processing (see processEvents).
+  // The hook's own closures hold this object directly: the host releases
+  // the __hooks entry once the hook's disposal is durably recorded (see
+  // __releaseDisposedHook), and a later getConflict() must still answer.
+  globalThis.__hooks = globalThis.__hooks || {};
+  var hookState = globalThis.__hooks[correlationId] = {
+    token: token,
+    created: bindsStartHook,
+    conflict: null,
+    // Set by the host on a hook_disposed{forceClaimedBy}: another run took
+    // the token. Buffered payloads (delivered before the takeover) are still
+    // drained; every await after them rejects with this error. For the start
+    // Hook the takeover may precede this call (__startHookForceClaimed).
+    forceClaimed: bindsStartHook ? (globalThis.__startHookForceClaimed || null) : null,
+    force: options.experimental_force === true,
+    getConflictResolvers: [],
+  };
+
+  // Each await creates a new promise for the next payload.
+  // The correlationId stays the same — the resolver is replaced each time.
+  function createHookPromise() {
+    // Check the payload buffer first — if a hook_received event arrived
+    // before this hook was awaited, the payload was buffered in the VM
+    // heap. Drain it immediately (matching event-replay payloadsQueue).
+    var buf = globalThis.__hookPayloadBuffer[correlationId];
+    if (buf && buf.length > 0) {
+      var next = buf.shift();
+      return next instanceof globalThis.__HydrationFailure
+        ? Promise.reject(next.error)
+        : Promise.resolve(next);
+    }
+    if (hookState.forceClaimed) {
+      return Promise.reject(hookState.forceClaimed);
+    }
+    return new Promise(function(resolve, reject) {
+      globalThis.__resolvers[correlationId] = { resolve: resolve, reject: reject };
+    });
+  }
+
+  function disposeHook() {
+    if (isDisposed) return;
+    isDisposed = true;
+    // A conflicted hook was never created (the world rejected its claim
+    // — the token belongs to another run), so there is no entity to
+    // dispose. Mirrors the node:vm engine, where hook_conflict removes
+    // the invocation-queue item before dispose can mark it. Emitting a
+    // hook_disposed here would be rejected by the world's
+    // hook-existence validation.
+    // A force-claimed hook is already disposed — the takeover journaled
+    // its hook_disposed — so there is nothing left to dispose either.
+    if (!hookState.conflict && !hookState.forceClaimed) {
+      // Signal to the entrypoint to create a hook_disposed event. The
+      // token is carried so the entrypoint can order same-token hook
+      // operations sequentially (a dispose must release the token before
+      // a later same-token hook's creation is validated).
+      globalThis.__pushPending({
+        type: "hook_dispose",
+        correlationId: correlationId,
+        token: token,
+        hasCreatedEvent: false,
+      });
+    }
+    // If there's a pending resolver, resolve it with undefined to break the iterator
+    if (globalThis.__resolvers[correlationId]) {
+      globalThis.__resolvers[correlationId].resolve(undefined);
+      delete globalThis.__resolvers[correlationId];
+    }
+  }
+
+  function getConflict() {
+    var state = hookState;
+    if (state.conflict) {
+      return state.conflict.run
+        ? Promise.resolve(state.conflict.run)
+        : Promise.reject(state.conflict.error);
+    }
+    if (state.created) {
+      return Promise.resolve(null);
+    }
+    // Creation not yet confirmed by the event log — park the awaiter and
+    // flag the pending op so the entrypoint re-invokes the workflow right
+    // after writing hook_created (nothing external resumes a getConflict
+    // awaiter; confirmation only comes from replaying the new event).
+    pendingOp.hasGetConflictAwaiter = true;
+    return new Promise(function(resolve, reject) {
+      state.getConflictResolvers.push({ resolve: resolve, reject: reject });
+    });
+  }
+
+  var hook = {
+    token: token,
+    then: function(onFulfilled, onRejected) {
+      return createHookPromise().then(onFulfilled, onRejected);
+    },
+    getConflict: getConflict,
+    dispose: disposeHook,
+  };
+
+  // Symbol.dispose for explicit resource management
+  hook[Symbol.dispose] = disposeHook;
+
+  // SDK-internal (the child-run completion dispatcher): stop waiting for the
+  // next payload without disposing the hook, so one landing later is
+  // buffered for the next then() instead. See workflow/hook.ts.
+  hook[Symbol.for("WORKFLOW_HOOK_RELEASE_AWAITER")] = function() {
+    delete globalThis.__resolvers[correlationId];
+  };
+
+  // AsyncIterable — yields payloads until disposed
+  hook[Symbol.asyncIterator] = function() {
+    return {
+      next: function() {
+        if (isDisposed) {
+          return Promise.resolve({ done: true, value: undefined });
+        }
+        return createHookPromise().then(function(value) {
+          // If disposed while waiting, signal done
+          if (isDisposed) return { done: true, value: undefined };
+          return { done: false, value: value };
+        });
+      },
+      return: function() {
+        disposeHook();
+        return Promise.resolve({ done: true, value: undefined });
+      },
+    };
+  };
+
+  return hook;
+};
+
+// setAttributes — attaches plaintext metadata to the current run.
+// Per-change validation happens in library code (normalizeAttributeChanges) before
+// this dispatcher is invoked, so "changes" is already normalized. The
+// returned promise resolves when the matching attr_set event is
+// observed during event processing — mirroring the node:vm engine's
+// createSetAttributes (attribute-dispatcher.ts).
+// Baseline hydrate placeholder; module-scope calls draw a ULID and disable snapshots.
+globalThis.__validateAttributeWrite = function() {};
+globalThis[Symbol.for("WORKFLOW_SET_ATTRIBUTES")] = function(changes, options) {
+  var correlationId = "attr_" + globalThis.__generateUlid();
+  var allowReservedAttributes = !!(options && options.allowReservedAttributes);
+  var validationError = globalThis.__validateAttributeWrite(correlationId, changes, allowReservedAttributes);
+  if (validationError !== undefined) {
+    var error = new Error(validationError);
+    error.name = "FatalError";
+    error.fatal = true;
+    return Promise.reject(error);
+  }
+  globalThis.__pushPending({
+    type: "attribute",
+    correlationId: correlationId,
+    changes: changes,
+    allowReservedAttributes: allowReservedAttributes,
+    hasCreatedEvent: false,
+  });
+  return new Promise(function(resolve, reject) {
+    globalThis.__registerResolver(correlationId, resolve, reject);
+  });
+};
+
+// ---- AbortController / AbortSignal (hook-backed) ----
+// Port of workflow/abort-controller.ts to the VM pending-op model:
+// the controller registers a system hook; abort() flips the signal
+// synchronously and marks the pending op so the host records the abort
+// (hook_received event + stream packet). On replay, the recorded
+// hook_received event calls _setAborted during event processing and the
+// workflow's own abort() call becomes a no-op.
+var __ABORT_STREAM_NAME = Symbol.for("WORKFLOW_ABORT_STREAM_NAME");
+var __ABORT_HOOK_TOKEN = Symbol.for("WORKFLOW_ABORT_HOOK_TOKEN");
+var __ABORT_HOOK_CID = Symbol.for("WORKFLOW_ABORT_HOOK_CID");
+
+function __makeAbortError() {
+  if (typeof DOMException !== "undefined") {
+    return new DOMException("The operation was aborted.", "AbortError");
+  }
+  var e = new Error("The operation was aborted.");
+  e.name = "AbortError";
+  return e;
+}
+
+function WorkflowAbortSignal(streamName, hookToken) {
+  this.aborted = false;
+  this.reason = undefined;
+  this[__ABORT_STREAM_NAME] = streamName;
+  this[__ABORT_HOOK_TOKEN] = hookToken;
+  this.__listeners = [];
+  this.__onabort = null;
+}
+Object.defineProperty(WorkflowAbortSignal.prototype, "onabort", {
+  get: function() { return this.__onabort; },
+  set: function(handler) {
+    this.__onabort = handler;
+    if (handler && this.aborted) handler.call(this);
+  },
+});
+WorkflowAbortSignal.prototype._setAborted = function(reason) {
+  if (this.aborted) return;
+  this.aborted = true;
+  this.reason = reason;
+  if (this.__onabort) this.__onabort.call(this);
+  var listeners = this.__listeners;
+  this.__listeners = [];
+  for (var i = 0; i < listeners.length; i++) listeners[i]();
+};
+WorkflowAbortSignal.prototype.addEventListener = function(type, listener) {
+  if (type !== "abort") return;
+  if (this.aborted) {
+    // Fire synchronously (not on a microtask) for deterministic replay —
+    // matches the node:vm engine's WorkflowAbortSignal.
+    listener();
+    return;
+  }
+  this.__listeners.push(listener);
+};
+WorkflowAbortSignal.prototype.removeEventListener = function(type, listener) {
+  if (type !== "abort") return;
+  this.__listeners = this.__listeners.filter(function(l) { return l !== listener; });
+};
+WorkflowAbortSignal.prototype.throwIfAborted = function() {
+  if (this.aborted) {
+    throw this.reason !== undefined && this.reason !== null
+      ? this.reason
+      : __makeAbortError();
+  }
+};
+// Expose for the host serde's revivers (they look the class up lazily,
+// through a handle, at revive time).
+globalThis.__WorkflowAbortSignal = WorkflowAbortSignal;
+
+// Registry of live abort signals keyed by their hook correlationId. The
+// host delivers hook_received events for these ids as _setAborted calls.
+globalThis.__abortSignals = {};
+
+globalThis.AbortController = function WorkflowAbortController() {
+  var id = globalThis.__generateUlid();
+  var streamName = "strm_" + id + "_system_abort";
+  var hookToken = "abrt_" + id;
+  this[__ABORT_STREAM_NAME] = streamName;
+  this[__ABORT_HOOK_TOKEN] = hookToken;
+  this.signal = new WorkflowAbortSignal(streamName, hookToken);
+  var correlationId = globalThis.__mintHookCorrelationId();
+  this[__ABORT_HOOK_CID] = correlationId;
+  // Register an internal system hook. Its token is unique by construction.
+  globalThis.__pushPending({
+    type: "hook",
+    correlationId: correlationId,
+    token: hookToken,
+    isWebhook: false,
+    isSystem: true,
+    isAbortSignal: true,
+    hasCreatedEvent: false,
+  });
+  globalThis.__abortSignals[correlationId] = this.signal;
+};
+globalThis.AbortController.prototype.abort = function(reason) {
+  if (this.signal.aborted) return; // already aborted (e.g. from replay)
+  this.signal._setAborted(reason);
+  // Mark the pending hook op so the host records the abort. The payload
+  // stays a RAW value; the host serializes it through a handle with full
+  // type fidelity (Errors, DOMException, custom values).
+  var item = globalThis.__findPending(this[__ABORT_HOOK_CID], "hook");
+  if (item) {
+    item.abortRequested = true;
+    item.abortPayload = {
+      aborted: true,
+      reason: reason,
+    };
+  }
+};
+
+globalThis.AbortSignal = {
+  abort: function(reason) {
+    var s = new WorkflowAbortSignal("", "");
+    s._setAborted(reason !== undefined ? reason : __makeAbortError());
+    return s;
+  },
+  any: function(signals) {
+    var composite = new WorkflowAbortSignal("", "");
+    var arr = Array.from(signals);
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i].aborted) {
+        composite._setAborted(arr[i].reason);
+        return composite;
+      }
+    }
+    var listeners = [];
+    var cleanup = function() {
+      for (var j = 0; j < listeners.length; j++) {
+        if (listeners[j].signal.removeEventListener) {
+          listeners[j].signal.removeEventListener("abort", listeners[j].listener);
+        }
+      }
+      listeners.length = 0;
+    };
+    arr.forEach(function(signal) {
+      if (!signal.addEventListener) return;
+      var listener = function() {
+        if (!composite.aborted) {
+          composite._setAborted(signal.reason);
+          cleanup();
+        }
+      };
+      listeners.push({ signal: signal, listener: listener });
+      signal.addEventListener("abort", listener);
+    });
+    return composite;
+  },
+  timeout: function() {
+    throw new Error(
+      "AbortSignal.timeout() is not supported in workflow functions. " +
+        "Use sleep() with an AbortController instead. " +
+        "See: /docs/errors/abort-signal-timeout-in-workflow"
+    );
+  },
+};
+
+// WORKFLOW_GET_STREAM_ID — generates a stream ID for a workflow run.
+// Replicates getWorkflowRunStreamId() from util.ts inside the QuickJS VM.
+// Uses the built-in btoa() for base64url encoding.
+globalThis[Symbol.for("WORKFLOW_GET_STREAM_ID")] = function(namespace) {
+  var runId = globalThis[Symbol.for("WORKFLOW_CONTEXT")]
+    ? globalThis[Symbol.for("WORKFLOW_CONTEXT")].workflowRunId
+    : "";
+  var streamId = runId.replace("wrun_", "strm_") + "_user";
+  if (!namespace) return streamId;
+  // base64url: btoa then replace + with -, / with _, strip =
+  var b64 = btoa(namespace).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+  return streamId + "_" + b64;
+};
+`;
+
+// ---- Runtime ----
+
+/**
+ * Phase 1: static (run-independent) VM initialization.
+ *
+ * Creates a QuickJS VM and loads everything that does not depend on a
+ * specific workflow run: the workflow-primitive bootstrap (useStep /
+ * sleep / createHook / Response-Request polyfills). Serialization is
+ * host-side (quickjs-serde.ts) and captures its intrinsics from the VM
+ * right after this returns.
+ *
+ * `getNowMs` backs the VM's WASI clock (`Date.now()` / `new Date()`
+ * inside the VM). The callback itself is static: the per-run state it
+ * reads lives on the host and is advanced as events are consumed,
+ * matching the node:vm engine's deterministic replay clock.
+ *
+ * This phase is the future boundary for VM-memory snapshotting: a
+ * build-time snapshot can capture the VM right after this function and
+ * new runs can restore from it instead of paying VM creation + eval cost
+ * (`QuickJS.restore` accepts the same wasi override).
+ */
+/**
+ * Loosely-typed accessor for the `WebAssembly` global. The package
+ * tsconfig's `lib: ["es2022"]` does not include the DOM lib where the
+ * `WebAssembly` namespace types live; the runtime global is available on
+ * every WASM-capable platform this engine targets.
+ */
+const WebAssemblyGlobal = (globalThis as any).WebAssembly as {
+  compile(bytes: Uint8Array): Promise<object>;
+};
+
+type CompiledExtension = Omit<ExtensionDescriptor, 'wasm'> & {
+  wasm: ExtensionDescriptor['wasm'];
+};
+
+/**
+ * Process-wide cache of the compiled `WebAssembly.Module`s for the main
+ * QuickJS runtime and its native extensions. `WebAssembly.compile` of the
+ * ~600 KB runtime binary is the most expensive part of VM creation and is
+ * pure (no per-VM state: instantiation binds the per-VM memory), so it
+ * only needs to happen once per process. The promise is cached (not the
+ * result) so concurrent first invocations share a single compilation.
+ */
+// On `globalThis` (see `globalSingleton`): the comment above says once per
+// process, and module scope would make it once per bundler layer, recompiling
+// the ~600 KB runtime binary for each.
+const quickjsAssets = globalSingleton(
+  '@workflow/core//quickjsCompiledAssets',
+  1,
+  () => ({
+    promise: undefined as
+      | Promise<{
+          wasm: object;
+          extensions: CompiledExtension[];
+        }>
+      | undefined,
+  })
+);
+
+function getCompiledAssets() {
+  if (!quickjsAssets.promise) {
+    const precompiled = getPrecompiledQuickJSModules();
+    if (precompiled) {
+      // The host compiled the modules at deploy time (runtimes that forbid
+      // compiling WebAssembly from bytes). See `quickjs-precompiled.ts`.
+      quickjsAssets.promise = Promise.resolve({
+        wasm: precompiled.quickjs,
+        extensions: quickjsExtensions.map((ext) => {
+          const wasm = precompiled.extensions[ext.name];
+          if (!wasm) {
+            throw new Error(
+              `setPrecompiledQuickJSModules() is missing the "${ext.name}" QuickJS extension`
+            );
+          }
+          return { ...ext, wasm: wasm as ExtensionDescriptor['wasm'] };
+        }),
+      });
+      return quickjsAssets.promise;
+    }
+    quickjsAssets.promise = (async () => {
+      const [wasm, ...extensionModules] = await Promise.all([
+        WebAssemblyGlobal.compile(quickjsWasm),
+        ...quickjsExtensions.map((ext) =>
+          WebAssemblyGlobal.compile(ext.wasm as Uint8Array)
+        ),
+      ]);
+      return {
+        wasm,
+        extensions: quickjsExtensions.map((ext, i) => ({
+          ...ext,
+          wasm: extensionModules[i] as ExtensionDescriptor['wasm'],
+        })),
+      };
+    })();
+    // On failure, clear the cache so a later invocation can retry rather
+    // than being stuck with a rejected promise forever.
+    quickjsAssets.promise.catch(() => {
+      quickjsAssets.promise = undefined;
+    });
+  }
+  return quickjsAssets.promise;
+}
+
+/**
+ * WASI clock override reading the given accessor — shared between fresh
+ * boots (initWorkflowVM), baseline-snapshot restores, and per-run
+ * VM-memory snapshot restores (restoreWorkflowVM), so the paths cannot
+ * drift on rounding/encoding.
+ *
+ * Deterministic replay clock: Date.now() / new Date() inside the VM
+ * read the host-controlled clock instead of wall time. Replay
+ * re-executes the workflow from the top (or resumes a restored heap)
+ * against the event log, so the clock must be derived from the log —
+ * not real time — for the workflow to observe stable timestamps across
+ * invocations.
+ */
+function makeDeterministicClockWasi(getNowMs: () => number): WasiOptions {
+  return (memory) => ({
+    clock_time_get(_clockId: number, _precision: bigint, resultPtr: number) {
+      const timeNs = BigInt(Math.round(getNowMs())) * 1_000_000n;
+      new DataView(memory.buffer).setBigUint64(resultPtr, timeNs, true);
+      return 0;
+    },
+  });
+}
+
+async function initWorkflowVM(
+  getNowMs: () => number,
+  interruptBudget: InterruptBudget
+): Promise<QuickJS> {
+  const assets = await getCompiledAssets();
+  const vm = await QuickJS.create({
+    wasm: assets.wasm as never,
+    memoryLimit: 256 * 1024 * 1024,
+    interruptHandler: createInterruptHandler(interruptBudget),
+    extensions: assets.extensions,
+    wasi: makeDeterministicClockWasi(getNowMs),
+  });
+
+  // Bootstrap workflow primitives
+  vm.evalCode(VM_BOOTSTRAP, 'bootstrap.js').dispose();
+
+  return vm;
+}
+
+// ---- Baseline snapshot (startup optimization) --------------------------
+//
+// Evaluating the workflow bundle dominates VM startup (~74ms of a ~77ms
+// boot for a 1.3MB bundle), and full event replay pays it on EVERY
+// invocation. The bundle is identical across all runs of a deployment, so
+// the engine hydrates one VM per function instance (bootstrap + bundle
+// eval), snapshots its memory, and starts every invocation by restoring
+// the snapshot (~3ms) instead of re-evaluating.
+//
+// Determinism: replay requires module-scope user code to observe the
+// run-seeded PRNG and the run's deterministic clock. A restored heap
+// carries whatever module scope computed at HYDRATE time, so the
+// optimization is only sound when module scope consumed neither
+// randomness nor time. Both are detected during hydrate (the placeholder
+// host fns count draws, the hydrate clock counts reads) and a bundle
+// that used either is marked ineligible: every invocation falls back to
+// fresh evaluation, preserving exact node:vm-parity semantics. When the
+// gate passes, restore is byte-equivalent to fresh eval (verified by the
+// parity tests): the per-run host fns are re-registered by name on the
+// restored VM (quickjs-wasi restore semantics) before the workflow body
+// runs, so the seeded draw sequence (and every correlationId) is
+// identical.
+//
+// The cache is per function instance and keyed on the bundle string
+// (reference-stable: the generated flow route holds it in a module-level
+// const). Capped at a few entries so tests with many distinct bundles
+// don't accumulate 16MB snapshots.
+
+/**
+ * Eval filename used when hydrating the baseline VM. The baseline is
+ * shared by EVERY workflow in the bundle, so the filename baked into
+ * its compiled code (and therefore into snapshot-path stack frames)
+ * must be workflow-independent: hydrating under the first caller's
+ * workflowId would break `remapErrorStack`'s filename matching for
+ * every other workflow in the bundle. Remap call sites match this
+ * constant IN ADDITION to the run's module specifier (which covers
+ * fresh-path frames).
+ */
+export const BASELINE_BUNDLE_FILENAME = 'workflow-bundle.js';
+
+type BaselineEntry =
+  | {
+      state: 'ready';
+      snapshot: Snapshot;
+      /**
+       * Raw box pointer of the serde capture root created BEFORE the
+       * bundle evaluated (see captureSerdeRoot). The box lives in the
+       * snapshot's memory image at this offset; every restored VM
+       * re-adopts it so serde initialization executes no guest code
+       * after user code has run: capture-before-user-code semantics,
+       * identical to the fresh path.
+       */
+      serdeRootPtr: number;
+    }
+  | { state: 'ineligible'; reason: string };
+
+// On `globalThis` (see `globalSingleton`): a snapshot is expensive to build and
+// is keyed by bundle, so per-copy caches would build the same baseline once per
+// bundler layer while each enforcing its own bound.
+const baselines = globalSingleton(
+  '@workflow/core//quickjsBaselines',
+  1,
+  () => ({
+    byKey: new Map<string, Promise<BaselineEntry>>(),
+  })
+);
+const BASELINE_CACHE_MAX_ENTRIES = 4;
+
+/** Test-only: reset the baseline cache between test cases. */
+export function __clearBaselineSnapshotCacheForTests(): void {
+  baselines.byKey.clear();
+}
+
+/** Test-only: observe how a bundle was classified. */
+export async function __peekBaselineEntryForTests(
+  workflowCode: string
+): Promise<BaselineEntry | undefined> {
+  return baselines.byKey.get(workflowCode);
+}
+
+/**
+ * Hydrate a VM with the workflow bundle and snapshot it, gating on
+ * module-scope nondeterminism (see the section comment above). Returns an
+ * `ineligible` entry instead of throwing on eval failure: the fresh path
+ * re-evaluates and produces the real, source-mapped error.
+ */
+async function prepareBaselineSnapshot(
+  workflowCode: string,
+  workflowId: string
+): Promise<BaselineEntry> {
+  const hydrateStart = Date.now();
+  let clockReads = 0;
+  const budget: InterruptBudget = { start: Date.now() };
+  const assets = await getCompiledAssets();
+  const vm = await QuickJS.create({
+    wasm: assets.wasm as never,
+    memoryLimit: 256 * 1024 * 1024,
+    interruptHandler: createInterruptHandler(budget),
+    extensions: assets.extensions,
+    wasi: ((memory) => ({
+      clock_time_get(_clockId: number, _precision: bigint, resultPtr: number) {
+        clockReads++;
+        const timeNs = BigInt(hydrateStart) * 1_000_000n;
+        new DataView(memory.buffer).setBigUint64(resultPtr, timeNs, true);
+        return 0;
+      },
+    })) satisfies WasiOptions,
+  });
+  try {
+    vm.evalCode(VM_BOOTSTRAP, 'bootstrap.js').dispose();
+
+    // Placeholder host fns under the SAME NAMES the per-run phase uses.
+    // They exist so module-scope code can execute at hydrate time, and to
+    // detect that it did: any draw means the heap would bake
+    // hydrate-seeded values that per-run fresh eval would compute
+    // differently. runWorkflowInVM re-registers all three names with the
+    // run-seeded closures after restore.
+    let draws = 0;
+    {
+      using randomFn = vm.newFunction('random', () => {
+        draws++;
+        return vm.newNumber(Math.random());
+      });
+      using math = vm.global.getProp('Math');
+      math.setProp('random', randomFn);
+      using nanoidFn = vm.newFunction('__generateNanoid', () => {
+        draws++;
+        return vm.newString('baseline-placeholder');
+      });
+      vm.setProp(vm.global, '__generateNanoid', nanoidFn);
+      using ulidFn = vm.newFunction('__generateUlid', () => {
+        draws++;
+        return vm.newString('00000000000000000000000000');
+      });
+      vm.setProp(vm.global, '__generateUlid', ulidFn);
+    }
+
+    // Serde capture root: created BEFORE the bundle evaluates, exactly
+    // like the fresh path's capture. Its box pointer rides the
+    // BaselineEntry and each restored VM re-adopts it, so serde
+    // initialization never executes guest code after user code has run.
+    // This is what makes module-scope intrinsic patching (polyfills,
+    // stateful wrappers around Object.getOwnPropertyDescriptor, …)
+    // HARMLESS on the snapshot path rather than merely detectable: the
+    // serde uses the pristine pre-eval captures on both paths, and no
+    // post-eval probe exists whose side effects could bake into the
+    // snapshot. The handle is deliberately NOT disposed before the
+    // snapshot: the box must stay live in the memory image (the
+    // baseline VM's dispose below tears down the whole instance without
+    // freeing individual boxes).
+    const serdeRoot = captureSerdeRoot(vm);
+
+    clockReads = 0; // only count reads made by the bundle itself
+    try {
+      // Workflow-independent filename. See BASELINE_BUNDLE_FILENAME.
+      vm.evalCode(workflowCode, BASELINE_BUNDLE_FILENAME).dispose();
+    } catch {
+      // Let the fresh path re-evaluate and surface the real error with
+      // proper filename / source-map handling.
+      return {
+        state: 'ineligible',
+        reason: 'module scope threw during hydrate',
+      };
+    }
+
+    if (draws > 0 || clockReads > 0) {
+      runtimeLogger.info(
+        'QuickJS baseline snapshot disabled for this bundle: module scope consumed nondeterministic inputs; every invocation will evaluate the bundle fresh',
+        { workflowId, draws, clockReads }
+      );
+      return {
+        state: 'ineligible',
+        reason: `module scope consumed ${draws} PRNG draw(s) and ${clockReads} clock read(s)`,
+      };
+    }
+
+    const snapshot = vm.snapshot();
+    runtimeLogger.debug('QuickJS baseline snapshot prepared', {
+      workflowId,
+      hydrateMs: Date.now() - hydrateStart,
+    });
+    return {
+      state: 'ready',
+      snapshot,
+      serdeRootPtr: exportSerdeRoot(vm, serdeRoot),
+    };
+  } finally {
+    vm.dispose();
+  }
+}
+
+/**
+ * Cached baseline entry for a bundle, preparing it on first access.
+ * Concurrent first invocations share one hydrate via the cached promise;
+ * a hydrate that REJECTS (infrastructure failure, not bundle eval, which
+ * returns `ineligible`) is evicted so a later invocation can retry.
+ */
+function getBaselineEntry(
+  workflowCode: string,
+  workflowId: string
+): Promise<BaselineEntry> {
+  let entry = baselines.byKey.get(workflowCode);
+  if (!entry) {
+    if (baselines.byKey.size >= BASELINE_CACHE_MAX_ENTRIES) {
+      const oldest = baselines.byKey.keys().next().value;
+      if (oldest !== undefined) baselines.byKey.delete(oldest);
+    }
+    entry = prepareBaselineSnapshot(workflowCode, workflowId);
+    baselines.byKey.set(workflowCode, entry);
+    entry.catch(() => baselines.byKey.delete(workflowCode));
+  }
+  return entry;
+}
+
+/**
+ * Continue a monotonic ULID sequence from a persisted last value:
+ * re-implements the `ulid` package's same-timestamp step (Crockford
+ * base32 +1 on the 16-char random part, carrying left; the 10-char time
+ * prefix is preserved — the run's seed timestamp is constant, so the
+ * package would never re-encode it). Byte-for-byte equivalent to what
+ * `monotonicFactory` returns for the same draw position, which is what
+ * keeps correlation ids identical between a snapshot-restored invocation
+ * and a full replay. Exported for tests (equivalence is asserted against
+ * the package itself).
+ */
+export function incrementUlidRandom(prev: string): string {
+  const ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+  const TIME_LEN = 10;
+  const time = prev.slice(0, TIME_LEN);
+  const chars = prev.slice(TIME_LEN).split('');
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const index = ENCODING.indexOf(chars[i]);
+    if (index === -1) {
+      throw new Error(`Incorrectly encoded ULID: ${prev}`);
+    }
+    if (index === ENCODING.length - 1) {
+      chars[i] = ENCODING[0];
+      continue;
+    }
+    chars[i] = ENCODING[index + 1];
+    return time + chars.join('');
+  }
+  // 80 bits of randomness all at max — unreachable in practice, and the
+  // ulid package throws here too.
+  throw new Error(`Cannot increment ULID random part beyond maximum: ${prev}`);
+}
+
+/**
+ * Restore a VM from persisted snapshot bytes. The restored WASM heap
+ * resumes at the exact suspension point it was captured at — the serde
+ * bundle, workflow bundle, and all workflow state are already inside it,
+ * so no bootstrap or bundle evaluation happens here. Host callbacks are
+ * name-registered by the caller (they live host-side and do not survive
+ * serialization).
+ */
+async function restoreWorkflowVM(
+  data: Uint8Array,
+  getNowMs: () => number,
+  interruptBudget: InterruptBudget
+): Promise<QuickJS> {
+  const assets = await getCompiledAssets();
+  const snapshot = QuickJS.deserializeSnapshot(data);
+  return QuickJS.restore(snapshot, {
+    wasm: assets.wasm as never,
+    memoryLimit: 256 * 1024 * 1024,
+    interruptHandler: createInterruptHandler(interruptBudget),
+    extensions: assets.extensions,
+    wasi: makeDeterministicClockWasi(getNowMs),
+  });
+}
+
+/**
+ * A live QuickJS workflow invocation. When the initial `result` is
+ * `suspended`, the VM is kept alive so the caller can feed newly recorded
+ * events (e.g. terminal events of inline-executed steps) into the SAME VM
+ * via `continueWithEvents`, resuming execution exactly where it left off
+ * without a fresh-VM re-replay. Terminal results dispose the VM
+ * automatically; `dispose()` must be called when abandoning a suspended
+ * session (idempotent).
+ */
+export interface QuickJSWorkflowSession {
+  result: QuickJSRuntimeResult;
+  /**
+   * Process newly recorded events in the live VM and re-evaluate the
+   * workflow state. Only valid while the last result was `suspended`.
+   * Resets the VM's interrupt budget for the new execution burst.
+   */
+  continueWithEvents(newEvents: Event[]): Promise<QuickJSRuntimeResult>;
+  /**
+   * Capture and serialize the live VM's memory. Only valid while the
+   * last result was `suspended`. The returned bytes restore via
+   * `existingSnapshot` on a later invocation (pair them with the events
+   * cursor at capture time). `rngDraws` is the seeded PRNG's draw count
+   * at capture — persisted in the snapshot metadata so a restore
+   * fast-forwards the base seed to the same position. `lastUlid` is the
+   * monotonic correlation-id factory's last output (undefined if the
+   * run has drawn none) — persisted so a restore continues the exact
+   * ULID sequence instead of drawing fresh randomness. `serdeRootPtr`
+   * is the host-serde capture root's snapshot-portable token — the
+   * restore path re-adopts it so serde initialization executes no guest
+   * code after user code has run.
+   */
+  snapshot(): {
+    data: Uint8Array;
+    rngDraws: number;
+    lastUlid: string | undefined;
+    serdeRootPtr: number;
+    /** Deterministic clock high-water mark at capture (ms since epoch). */
+    clockMs: number;
+    /** Exact engine build (quickjs-wasi version) that captured the heap. */
+    engineVersion: string;
+  };
+  /**
+   * The live QuickJS heap's allocation counters. Only valid while the last
+   * result was `suspended`. Unlike a snapshot's byte length (the WASM linear
+   * memory, a high-water mark that never shrinks), `memoryUsedSize` falls
+   * when the VM frees memory, so it is the signal for heap growth.
+   */
+  memoryUsage(): QuickJSMemoryUsage;
+  /**
+   * The VM's open hooks, and whether workflow code is waiting on each one's
+   * next payload right now. Only valid while the last result was
+   * `suspended`. The suspension's `pendingOperations` leave out a created
+   * hook nothing awaits, so a run-ahead classification reads its hooks from
+   * here (see `runtime/out-of-band-observation.ts`).
+   */
+  openHooks(): QuickJSOpenHook[];
+  /**
+   * How many times code in the VM has read the clock so far (the WASI
+   * clock behind `Date.now()` and `new Date()`; QuickJS may read it on its
+   * own too, which only over-counts). This engine advances the clock to
+   * every event it reads, an unread hook payload included, so a run-ahead
+   * delivery uses this to tell whether a decision may depend on where
+   * another writer's event landed (see `spec9/quickjs-entrypoint.ts`).
+   */
+  clockReads(): number;
+  /** Dispose the VM if it is still alive. Safe to call multiple times. */
+  dispose(): void;
+}
+
+/** See {@link QuickJSWorkflowSession.memoryUsage}. */
+export type QuickJSMemoryUsage = ReturnType<QuickJS['getMemoryUsage']>;
+
+/** One open hook of a suspended VM (see {@link QuickJSWorkflowSession.openHooks}). */
+export interface QuickJSOpenHook {
+  correlationId: string;
+  token: string;
+  isSystem?: boolean;
+  /** A disposal of the hook is pending in this suspension. */
+  disposed?: boolean;
+  /**
+   * Workflow code is waiting on the hook's next payload: a resolver is
+   * registered for it. Over-reports for an awaiter a lost `Promise.race`
+   * abandoned, which only costs run-ahead; a payload landing for a hook with
+   * no resolver is buffered and changes nothing until something awaits.
+   */
+  observed: boolean;
+}
+
+/**
+ * Run a workflow invocation to its first settled state and dispose the
+ * VM. Convenience wrapper over {@link startQuickJSWorkflow} for callers
+ * (and tests) that don't use live-VM continuation.
+ */
+export async function runQuickJSWorkflow(
+  options: QuickJSRuntimeOptions
+): Promise<QuickJSRuntimeResult> {
+  const session = await startQuickJSWorkflow(options);
+  session.dispose();
+  return session.result;
+}
+
+export async function startQuickJSWorkflow(
+  options: QuickJSRuntimeOptions
+): Promise<QuickJSWorkflowSession> {
+  const { workflowCode, workflowId, workflowRun, events } = options;
+
+  const startedAt = workflowRun.startedAt ? +workflowRun.startedAt : Date.now();
+
+  // Deterministic PRNG seed, identical for EVERY invocation of the same
+  // run. Full event replay requires this: each invocation re-executes the
+  // workflow from the top and must regenerate the exact same correlationId
+  // sequence so that pending operations re-created by replay match the
+  // events recorded by earlier invocations. Sequential operations within
+  // one execution still get distinct ids because the PRNG advances as the
+  // workflow draws from it. Identical seeding across CONCURRENT invocations
+  // of the same run is also load-bearing: both produce the same ids, and
+  // the world's per-(runId, correlationId) uniqueness turns the duplicate
+  // `events.create` into an EntityConflictError that the entrypoint
+  // swallows.
+  //
+  // The seed inputs MUST be stable across invocations. Notably
+  // `startedAt` is NOT: under turbo the first invocation runs against a
+  // synthesized run object whose timestamps differ from the durably
+  // stored ones that later invocations load. Matches the node:vm
+  // engine's seed (workflow.ts).
+  //
+  // When restoring from a snapshot, the restored heap already consumed
+  // some number of PRNG draws. The seed stays the BASE seed and the
+  // runtime fast-forwards the recorded draw count (metadata.rngDraws)
+  // instead of mixing the snapshot cursor into the seed: a cursor-mixed
+  // seed made ids depend on WHICH snapshot generation an invocation
+  // restored from, so two overlapping invocations straddling a snapshot
+  // save (queue redelivery of an in-flight invocation) generated
+  // DIFFERENT ids for the same logical step and both step_created writes
+  // landed — the exact double-execution the seeding exists to prevent.
+  // Position-based fast-forward keeps ids identical across snapshot
+  // generations and identical to a no-snapshot run.
+  const seed = [
+    workflowRun.runId,
+    workflowRun.workflowName,
+    workflowRun.deploymentId,
+  ].join(':');
+  const baseRng = seedrandom(seed);
+  const restoredDraws = options.existingSnapshot?.metadata.rngDraws ?? 0;
+  for (let i = 0; i < restoredDraws; i++) baseRng();
+  // Every consumer (Math.random, nanoid, the VM ULID factory via
+  // Math.random) draws through this counter so the total is exact.
+  let rngDraws = restoredDraws;
+  const rng = () => {
+    rngDraws++;
+    return baseRng();
+  };
+
+  // Seeded nanoid generator: uses the same generator and seeded PRNG
+  // as the node:vm engine for consistent token generation.
+  const generateNanoid = createSeededNanoid(rng);
+
+  // Deterministic replay clock, mirroring the node:vm engine (see
+  // workflow.ts): the initial value is the run's creation time recovered
+  // from the ULID embedded in `runId` (falling back to `createdAt`), and
+  // it advances to each processed event's `createdAt` as the event log is
+  // replayed. Monotonic (Math.max) so the outer processEvents re-scan
+  // loop can't move the clock backwards mid-execution.
+  let vmNowMs =
+    runIdCreatedAt(workflowRun.runId) ?? (+workflowRun.createdAt || startedAt);
+  const advanceClock = (ms: number) => {
+    if (Number.isFinite(ms)) vmNowMs = Math.max(vmNowMs, ms);
+  };
+  // Every read of the clock by code in the VM (`Date.now()`, `new Date()`,
+  // a `sleep()` computing its deadline): see
+  // `QuickJSWorkflowSession.clockReads`.
+  let clockReads = 0;
+  const readClock = (): number => {
+    clockReads++;
+    return vmNowMs;
+  };
+
+  const interruptBudget: InterruptBudget = { start: Date.now() };
+
+  // The run's start Hook (start(workflow, args, { experimental_hook })), or undefined.
+  const runStartHook = (): RunStartHook | undefined =>
+    options.startHook === undefined
+      ? resolveRunStartHook({
+          events,
+          workflowRun,
+          runInput: options.runInput,
+        })
+      : (options.startHook ?? undefined);
+
+  // ---- Correlation-id ULID machinery ----
+  // Hoisted out of the per-run phase so BOTH the fresh-boot path and the
+  // snapshot-restore path share it (the `__generateUlid` host callback
+  // closes over it; see hostCallbacks below). Uses the same `ulid`
+  // package and monotonic factory as the node:vm engine, drawing from
+  // the SAME seeded PRNG instance as the VM's Math.random — so the
+  // interleaved draw sequence (and therefore every correlationId) is
+  // byte-identical to what the node:vm engine produces for the same
+  // run. The time prefix is derived from the runId's embedded ULID
+  // (stable across invocations by construction — unlike `startedAt`,
+  // which differs between turbo's synthesized run object and the
+  // durably stored run), so two concurrent invocations of the same run
+  // produce IDENTICAL correlationIds and the world's
+  // EntityConflictError on `events.create` dedups one of each pair.
+  //
+  // Snapshot interplay: the factory's monotonic state (the last ULID it
+  // returned) lives HOST-side and does not survive into a snapshot's
+  // memory image, so it is persisted in the snapshot metadata
+  // (`lastUlid`) and the restore path continues from it by re-applying
+  // the package's own same-timestamp increment step
+  // (incrementUlidRandom). The timestamp seed is constant for the run,
+  // so every post-first draw takes the increment path — a restored
+  // invocation therefore emits the exact ULID sequence a full replay
+  // would have reached. Without this, a restored invocation's first new
+  // correlation id would draw FRESH randomness while a concurrent
+  // full-replay invocation of the same run increments — different ids
+  // for the same logical operation, and both step_created writes land.
+  const ulidTimestamp =
+    runIdCreatedAt(workflowRun.runId) ?? (+workflowRun.createdAt || startedAt);
+  const ulidFactory = monotonicFactory(() => rng());
+  let lastUlid: string | undefined =
+    options.existingSnapshot?.metadata.lastUlid;
+  const generateUlid =
+    lastUlid !== undefined
+      ? () => {
+          // Restored with prior draws: continue the monotonic sequence
+          // exactly where the snapshot left off. Zero PRNG draws — same
+          // as the same-timestamp increment path in full replay.
+          lastUlid = incrementUlidRandom(lastUlid as string);
+          return lastUlid;
+        }
+      : () => {
+          lastUlid = ulidFactory(ulidTimestamp);
+          return lastUlid;
+        };
+
+  // Attribute-write validation: validate before enqueueing so promise
+  // races observe the same rejection order on replay. Existing attr_set
+  // IDs retain their original semantics. Seeded from the events this
+  // invocation replays (the full log on a fresh boot, the delta on a
+  // snapshot restore: pre-snapshot writes were validated before the
+  // snapshot and are never re-enqueued) and extended by makeLiveSession
+  // as events are fed.
+  const historicalAttributeIds = new Set<string>();
+  for (const event of events) {
+    if (event.eventType === 'attr_set' && event.correlationId !== undefined) {
+      historicalAttributeIds.add(event.correlationId);
+    }
+  }
+
+  // ---- Host callbacks ----
+  // ONE list drives both the fresh-boot path (newFunction + install) and
+  // the snapshot-restore path (registerHostCallback): host functions are
+  // referenced from the WASM heap by name and the host-side registry is
+  // empty in a fresh process, so a callback added to the boot path but
+  // not re-registered on restore resolves to nothing after a restore.
+  // Add new host callbacks HERE, never inline at either site.
+  const hostCallbacks: {
+    name: string;
+    fn: (vm: QuickJS) => Parameters<QuickJS['newFunction']>[1];
+    /** How the fresh-boot path exposes the function to guest code. */
+    install: (
+      vm: QuickJS,
+      fnHandle: ReturnType<QuickJS['newFunction']>
+    ) => void;
+  }[] = [
+    {
+      name: 'random',
+      fn: (vm) => () => vm.newNumber(rng()),
+      install: (vm, fnHandle) => {
+        using math = vm.global.getProp('Math');
+        math.setProp('random', fnHandle);
+      },
+    },
+    {
+      name: '__generateNanoid',
+      fn: (vm) => () => vm.newString(generateNanoid()) as never,
+      install: (vm, fnHandle) => {
+        vm.setProp(vm.global, '__generateNanoid', fnHandle);
+      },
+    },
+    {
+      name: '__generateUlid',
+      fn: (vm) => () => vm.newString(generateUlid()) as never,
+      install: (vm, fnHandle) => {
+        vm.setProp(vm.global, '__generateUlid', fnHandle);
+      },
+    },
+    {
+      name: '__validateAttributeWrite',
+      fn: (vm) => (correlationId, changes, allowReservedAttributes) => {
+        if (historicalAttributeIds.has(correlationId.toString())) {
+          return vm.undefined;
+        }
+        try {
+          validateAttributeEventDataSize({
+            changes: vm.dump(changes) as AttributeChange[],
+            writer: { type: 'workflow' },
+            ...(allowReservedAttributes.toBoolean()
+              ? { allowReservedAttributes: true }
+              : {}),
+          });
+        } catch (err) {
+          if (!(err instanceof AttributeValidationError)) throw err;
+          return vm.newString(err.message);
+        }
+        return vm.undefined;
+      },
+      install: (vm, fnHandle) => {
+        vm.setProp(vm.global, '__validateAttributeWrite', fnHandle);
+      },
+    },
+  ];
+
+  if (options.existingSnapshot) {
+    // ---- RESTORE from a persisted per-run VM snapshot ----
+    const restoredMeta = options.existingSnapshot.metadata;
+    // The entrypoint's format gate guarantees this; guard anyway so a
+    // caller skipping the gate gets a loud failure it can fall back on
+    // rather than a serde built from post-user-code captures.
+    if (restoredMeta.serdeRootPtr === undefined) {
+      throw new Error(
+        'QuickJS snapshot restore requires metadata.serdeRootPtr (snapshot predates host-side serde)'
+      );
+    }
+    // Restore the deterministic clock's high-water mark: the clock lives
+    // host-side, so without this the restored heap observes Date.now()
+    // regressed to the run-creation time until the first delta event
+    // advances it. advanceClock is monotonic (max), so a missing value
+    // (older metadata) degrades to the derived initial clock.
+    if (restoredMeta.clockMs !== undefined) {
+      advanceClock(restoredMeta.clockMs);
+    }
+    const vm = await restoreWorkflowVM(
+      options.existingSnapshot.data,
+      readClock,
+      interruptBudget
+    );
+    try {
+      // Host-side serde for the restored heap: re-adopt the capture
+      // root the ORIGINAL boot created before any user code ran — its
+      // box rides inside the memory image (same mechanism as the
+      // baseline-snapshot path; the per-run save re-exports the token,
+      // so this works across snapshot generations). The handle is kept
+      // so a follow-up save can export it again (see makeLiveSession's
+      // snapshot()).
+      const serdeRoot = adoptSerdeRoot(vm, restoredMeta.serdeRootPtr);
+      const serde = createQuickJSSerde(vm, serdeRoot);
+
+      // Re-register every host callback from the shared list — host
+      // functions are referenced from the WASM heap by name and the
+      // host-side registry is empty in a fresh process.
+      for (const callback of hostCallbacks) {
+        vm.registerHostCallback(callback.name, callback.fn(vm));
+      }
+
+      // A start({ experimental_hook }) run's heap must have booted with the start Hook
+      // binding (and the run's __startHook). One captured by an older engine
+      // build would mint a fresh id for the start token, so it is refused
+      // here and the entrypoint falls back to a full replay. Checked only for
+      // such runs: every other snapshot restores exactly as before.
+      if (
+        runStartHook() &&
+        !vm.dump(
+          vm.evalCode(
+            'typeof globalThis.__mintHookCorrelationId === "function" && !!globalThis.__startHook'
+          )
+        )
+      ) {
+        throw new Error(
+          'QuickJS snapshot predates start Hook binding for this run'
+        );
+      }
+
+      // `process.env` is a per-invocation copy of the host env (see the
+      // fresh-boot install), so replace the one the snapshot carried: a
+      // restored run must see the env of THIS invocation, the same as a
+      // full replay or the node:vm engine, not the one from whichever
+      // invocation started the snapshot chain (rotated secrets, changed
+      // config).
+      serde.installProcessEnv(process.env);
+
+      // Process the delta events and drain jobs.
+      {
+        const inert = beginTerminalInertBatch(vm, events, lastUlid);
+        let maxIterations = 100;
+        let madeProgress: boolean;
+        do {
+          madeProgress = await processEvents(
+            vm,
+            serde,
+            events,
+            advanceClock,
+            () => lastUlid,
+            inert,
+            options.encryptionKey
+          );
+          let batch: number;
+          do {
+            batch = vm.executePendingJobs();
+            if (batch > 0) madeProgress = true;
+          } while (batch > 0);
+        } while (madeProgress && --maxIterations > 0);
+        endTerminalInertBatch(vm, inert, lastUlid);
+      }
+
+      return makeLiveSession(
+        vm,
+        serde,
+        interruptBudget,
+        advanceClock,
+        () => ({
+          rngDraws,
+          lastUlid,
+          serdeRootPtr: exportSerdeRoot(vm, serdeRoot),
+          clockMs: vmNowMs,
+          engineVersion: quickjsWasiVersion,
+        }),
+        historicalAttributeIds,
+        () => lastUlid,
+        () => clockReads,
+        options.encryptionKey
+      );
+    } catch (err) {
+      // Any throw before the session takes ownership would leak the
+      // restored VM (and its WASM linear memory) for the lifetime of
+      // the reused compute instance. The entrypoint catches this and
+      // falls back to a fresh boot + full event replay.
+      try {
+        vm.dispose();
+      } catch {
+        // Already disposed — ignore.
+      }
+      throw err;
+    }
+  }
+
+  // ---- Phase 1: static initialization ----
+  //
+  // Baseline-snapshot fast path (default ON; see the section comment at
+  // prepareBaselineSnapshot): restore a bundle-hydrated VM instead of
+  // booting fresh and re-evaluating the bundle. `ineligible` bundles
+  // (module-scope nondeterminism, eval failure) take the fresh path with
+  // identical semantics.
+  let baselineSnapshot: Snapshot | undefined;
+  let baselineSerdeRootPtr: number | undefined;
+  if (isQuickJSBaselineSnapshotEnabled()) {
+    try {
+      const entry = await getBaselineEntry(workflowCode, workflowId);
+      if (entry.state === 'ready') {
+        baselineSnapshot = entry.snapshot;
+        baselineSerdeRootPtr = entry.serdeRootPtr;
+      }
+    } catch (err) {
+      // A rejection here is an infrastructure failure during hydrate
+      // (e.g. vm.snapshot() under memory pressure, QuickJS.create or
+      // getCompiledAssets() failing), NOT bundle eval, which returns
+      // an ineligible entry. getBaselineEntry has already evicted the
+      // cached promise so a later invocation can retry. This invocation
+      // must fall back to fresh evaluation (which would have succeeded)
+      // rather than fail the whole run for a snapshot-only failure mode.
+      runtimeLogger.warn(
+        'QuickJS baseline snapshot hydrate failed; falling back to fresh evaluation for this invocation',
+        { workflowId, error: err }
+      );
+    }
+  }
+  let vm: QuickJS;
+  if (baselineSnapshot) {
+    const assets = await getCompiledAssets();
+    vm = await QuickJS.restore(baselineSnapshot, {
+      wasm: assets.wasm as never,
+      memoryLimit: 256 * 1024 * 1024,
+      interruptHandler: createInterruptHandler(interruptBudget),
+      extensions: assets.extensions,
+      wasi: makeDeterministicClockWasi(readClock),
+    });
+  } else {
+    vm = await initWorkflowVM(readClock, interruptBudget);
+  }
+
+  // Host-side serde: captures the VM's intrinsics (bootstrap included)
+  // before any user code runs. All serialization now happens on the host
+  // through handles: no serializer code is evaluated inside the VM.
+  // Fresh path: capture now (no user code has run, as the bundle evaluates
+  // later in the per-run phase). Snapshot path: re-adopt the capture root
+  // the baseline hydrate created BEFORE the bundle evaluated, since the box
+  // lives in the restored memory image at the recorded offset. Both give
+  // the serde pristine capture-before-user-code intrinsics; neither
+  // executes guest code here.
+  // The root handle is kept (createQuickJSSerde owns it for the VM's
+  // lifetime) so a per-run snapshot save can export its token into the
+  // snapshot metadata — the restore path above re-adopts it by pointer.
+  const serdeRoot =
+    baselineSnapshot && baselineSerdeRootPtr !== undefined
+      ? adoptSerdeRoot(vm, baselineSerdeRootPtr)
+      : captureSerdeRoot(vm);
+  const serde = createQuickJSSerde(vm, serdeRoot);
+
+  // Any throw between here and the terminal paths (which dispose the VM
+  // inside checkWorkflowState / extractError before RETURNING) would leak
+  // a live QuickJS instance and its WASM linear memory for the lifetime
+  // of the compute instance, which is reused. Dispose on the way out of
+  // an exceptional exit and rethrow.
+  try {
+    return await runWorkflowInVM();
+  } catch (err) {
+    try {
+      vm.dispose();
+    } catch {
+      // Already disposed by a terminal path, so ignore.
+    }
+    throw err;
+  }
+
+  // ---- Phase 2: per-run initialization ----
+  async function runWorkflowInVM(): Promise<QuickJSWorkflowSession> {
+    vm.evalCode(
+      `globalThis.__worldCapabilities = ${JSON.stringify(options.worldCapabilities)};`
+    ).dispose();
+
+    // The run's start Hook (start(workflow, args, { experimental_hook })), for the guest's
+    // createHook binding. Not set at all for a run without one, which boots
+    // exactly as before.
+    const startHook = runStartHook();
+    if (startHook) {
+      vm.evalCode(
+        `globalThis.__startHook = ${JSON.stringify({
+          token: startHook.token,
+          hookId: startHook.hookId,
+          tokenRetentionUntil: startHook.tokenRetentionUntil?.getTime(),
+          bound: false,
+        })};`
+      ).dispose();
+    }
+
+    // Install every host callback from the shared list (see
+    // hostCallbacks above — the restore path re-registers from the same
+    // list, so the two can't drift). Covers the seeded Math.random, the
+    // seeded nanoid generator, the deterministic ULID generator for
+    // correlationIds (see the ULID machinery in the enclosing scope), and
+    // the attribute-write validator.
+    for (const callback of hostCallbacks) {
+      using fnHandle = vm.newFunction(callback.name, callback.fn(vm));
+      callback.install(vm, fnHandle);
+    }
+
+    // `process.env`: parity with the node:vm engine, which exposes a frozen
+    // copy of the host env (vm/index.ts). Injected per run so the snapshot of
+    // the env is taken at invocation time, same as node. Handle-based (no
+    // guest source evaluated): on the baseline-snapshot path this runs
+    // after user code, and a guest-source injection would execute through
+    // potentially patched globals (JSON.parse, Object.freeze), visible
+    // to module-scope wrappers only on the restore path, diverging
+    // replays.
+    serde.installProcessEnv(process.env);
+
+    // Execute the workflow bundle: use the workflowId as the eval filename
+    // so QuickJS stack traces reference the workflow name, enabling source map
+    // remapping by remapErrorStack (which matches frames by filename).
+    // Evaluated in the per-run phase (after Math.random seeding) so that
+    // module-scope user code draws from the seeded PRNG, matching the
+    // node:vm engine's replay determinism. Skipped on the
+    // baseline-snapshot path: the restored heap already carries the
+    // evaluated bundle, and the baseline gate guarantees module scope
+    // consumed no PRNG draws or clock reads, so skipping the eval is
+    // observationally identical to re-running it (the run-seeded host
+    // fns registered above rebind the SAME names the restored heap's
+    // function objects dispatch through).
+    if (!baselineSnapshot) {
+      try {
+        vm.evalCode(workflowCode, workflowId || 'workflow.js').dispose();
+      } catch (err) {
+        return makeSettledSession(
+          extractError(vm, err, 'Workflow evaluation failed')
+        );
+      }
+    }
+
+    // Extract workflow arguments. Prefer the run's creation event (its
+    // `run_created`, or on spec >= 9 the `run_started` that created it and
+    // holds the first slot: `isRunCreationEvent`); fall back to the queue
+    // message's runInput if the event log is incomplete
+    // (eventually-consistent read after start()). Failing to find input
+    // for a first invocation is fatal: running the workflow function
+    // with no args would silently turn typed arguments into `undefined`
+    // and, for recursive workflows, produce exponential fan-out.
+    const runCreatedEvent = events.find(isRunCreationEvent);
+    const runCreatedInput =
+      runCreatedEvent && 'eventData' in runCreatedEvent
+        ? (runCreatedEvent.eventData as Record<string, unknown>)?.input
+        : undefined;
+    const runInput: unknown =
+      runCreatedInput ?? (options.runInput?.input as unknown);
+
+    if (runInput instanceof Uint8Array) {
+      const decryptedInput = await prepareBytesForVM(
+        runInput,
+        options.encryptionKey
+      );
+      runtimeLogger.debug('QuickJS runtime: run input format', {
+        prefix: new TextDecoder().decode(decryptedInput.subarray(0, 4)),
+        byteLength: decryptedInput.byteLength,
+        source: runCreatedInput
+          ? runCreatedEvent?.eventType
+          : 'queueMessage.runInput',
+      });
+      // Build the argument value directly in the VM via the host-side
+      // serde (guest code never sees the wire bytes).
+      const inputHandle = serde.deserialize(decryptedInput);
+      vm.setProp(vm.global, '__wdk_input', inputHandle);
+      inputHandle.dispose();
+    } else if (runInput === undefined && events.length > 0) {
+      // The event log is non-empty (we got run_started or similar) but
+      // no creation event was found and no queue-provided runInput is
+      // available. This is the race condition observed during the fib
+      // incident: silently dropping arguments would turn `n` into
+      // `undefined` and, for recursive workflows, cause exponential
+      // fan-out. Fail loud: the throw escapes the entrypoint into the
+      // replay loop's catch in runtime.ts (the QuickJS dispatch runs
+      // inside that loop's try), which records run_failed. A visible
+      // terminal failure is
+      // preferred over silently executing with undefined arguments. The
+      // queue-provided runInput fallback above makes this path rare.
+      // Empty `events` is allowed because tests that bootstrap a workflow
+      // with no arguments rely on the old permissive behavior.
+      throw new Error(
+        `Cannot start workflow run "${workflowRun.runId}": no run_created event found and no runInput in the queue payload, but other events are present (likely a read-after-write race during start()).`
+      );
+    }
+
+    // Set workflow context metadata (for getWorkflowMetadata()).
+    // Must match the shape that the node:vm engine produces (see
+    // packages/core/src/workflow.ts: runWorkflow → ctx) so user code
+    // that compares `getWorkflowMetadata()` values between a step
+    // (server-side) and the workflow (VM-side) sees identical objects.
+    {
+      const metadata = {
+        workflowName: workflowRun.workflowName,
+        workflowRunId: workflowRun.runId,
+        workflowStartedAt: workflowRun.startedAt
+          ? new Date(+workflowRun.startedAt)
+          : new Date(),
+        url: process.env.VERCEL_URL
+          ? `https://${process.env.VERCEL_URL}`
+          : `http://localhost:${options.port ?? 3000}`,
+        features: { encryption: !!options.encryptionKey },
+      };
+      vm.evalCode(
+        `globalThis[Symbol.for("WORKFLOW_CONTEXT")] = ${JSON.stringify(metadata)};` +
+          `globalThis[Symbol.for("WORKFLOW_CONTEXT")].workflowStartedAt = new Date(${JSON.stringify(metadata.workflowStartedAt.toISOString())});`
+      ).dispose();
+    }
+
+    // Start the workflow function. If the workflow isn't registered,
+    // throw an error tagged with `name = "WorkflowNotRegisteredError"`
+    // so the host-side entrypoint can reconstruct a real
+    // WorkflowNotRegisteredError (a WorkflowRuntimeError subclass that
+    // classifies as WORKFLOW_NOT_REGISTERED) rather than a generic user error.
+    // See quickjs-entrypoint.ts's run_failed branch.
+    try {
+      vm.evalCode(`
+      var __wfn = globalThis.__private_workflows.get(${JSON.stringify(workflowId)});
+      if (!__wfn) {
+        var __wfnErr = new Error("Workflow \\"" + ${JSON.stringify(workflowId)} + "\\" is not registered in the current deployment.");
+        __wfnErr.name = "WorkflowNotRegisteredError";
+        throw __wfnErr;
+      }
+      var __args = globalThis.__wdk_input !== undefined
+        ? globalThis.__wdk_input
+        : [];
+      delete globalThis.__wdk_input;
+      if (!Array.isArray(__args)) __args = [__args];
+      __wfn.apply(null, __args).then(
+        function(result) {
+          // Store the RAW result; the host serializes it through a handle.
+          // A separate done flag distinguishes "completed with undefined"
+          // from "not completed".
+          globalThis.__workflowDone = true;
+          globalThis.__workflowResult = result;
+        },
+        function(error) {
+          // Preserve display info on the host-side failed object
+          // (matches the legacy host-visible shape) AND keep the RAW
+          // thrown value so the host can serialize the original
+          // type-identity, cause chain, or non-Error throws verbatim
+          // through the standard error pipeline.
+          globalThis.__workflowError = {
+            message: error && error.message != null ? String(error.message) : String(error),
+            stack: error && error.stack ? error.stack : "",
+            name: error && error.name ? error.name : (error instanceof Error ? "Error" : typeof error),
+            value: error,
+          };
+        }
+      );
+    `).dispose();
+    } catch (err) {
+      return makeSettledSession(
+        extractError(vm, err, 'Failed to start workflow')
+      );
+    }
+
+    // Process events and drain jobs in a loop. Events may resolve promises
+    // that unblock workflow code, which then creates NEW resolvers for
+    // subsequent events. Re-processing events matches these new resolvers
+    // against events that were already delivered.
+    {
+      const inert = beginTerminalInertBatch(vm, events, lastUlid);
+      let maxIterations = 100;
+      let madeProgress: boolean;
+      do {
+        // Propagate local rejections through async wrappers before replay can
+        // resolve a competing promise from history.
+        let batch: number;
+        do {
+          batch = vm.executePendingJobs();
+        } while (batch > 0);
+        madeProgress = await processEvents(
+          vm,
+          serde,
+          events,
+          advanceClock,
+          () => lastUlid,
+          inert,
+          options.encryptionKey
+        );
+        do {
+          batch = vm.executePendingJobs();
+          if (batch > 0) madeProgress = true;
+        } while (batch > 0);
+      } while (madeProgress && --maxIterations > 0);
+      endTerminalInertBatch(vm, inert, lastUlid);
+      if (madeProgress && maxIterations === 0) {
+        // The drain loop hit its bound while still making progress:
+        // proceeding as if it converged would present as a mysterious
+        // suspension or replay divergence. Make the giving-up visible so
+        // a wedge is attributable to this bound rather than a mystery.
+        runtimeLogger.warn(
+          'QuickJS runtime: event drain loop hit its iteration bound before reaching a fixed point',
+          {
+            workflowRunId: workflowRun.runId,
+            eventCount: events.length,
+          }
+        );
+      }
+    }
+
+    // ---- Check result ----
+    return makeLiveSession(
+      vm,
+      serde,
+      interruptBudget,
+      advanceClock,
+      () => ({
+        rngDraws,
+        lastUlid,
+        serdeRootPtr: exportSerdeRoot(vm, serdeRoot),
+        clockMs: vmNowMs,
+        engineVersion: quickjsWasiVersion,
+      }),
+      historicalAttributeIds,
+      () => lastUlid,
+      () => clockReads,
+      options.encryptionKey
+    );
+  }
+}
+
+/** Session wrapper for a result whose VM is already settled/disposed. */
+function makeSettledSession(
+  result: QuickJSRuntimeResult
+): QuickJSWorkflowSession {
+  return {
+    result,
+    continueWithEvents: () => {
+      throw new Error(
+        'QuickJS workflow session is settled — continueWithEvents is only valid while suspended'
+      );
+    },
+    snapshot: () => {
+      throw new Error(
+        'QuickJS workflow session is settled — snapshot is only valid while suspended'
+      );
+    },
+    memoryUsage: () => {
+      throw new Error(
+        'QuickJS workflow session is settled — memoryUsage is only valid while suspended'
+      );
+    },
+    clockReads: () => 0,
+    openHooks: () => {
+      throw new Error(
+        'QuickJS workflow session is settled — openHooks is only valid while suspended'
+      );
+    },
+    dispose: () => {},
+  };
+}
+
+/**
+ * Evaluate the VM's state and wrap it in a live session. While suspended,
+ * the VM stays alive so `continueWithEvents` can resume it in place;
+ * terminal states dispose the VM immediately (inside checkWorkflowState).
+ */
+function makeLiveSession(
+  vm: QuickJS,
+  serde: QuickJSSerde,
+  interruptBudget: InterruptBudget,
+  advanceClock: (ms: number) => void,
+  /**
+   * Deterministic-state accessor for snapshot saves: the PRNG draw
+   * count, the monotonic ULID factory's last output, and the serde
+   * capture root's export token (exported lazily — only snapshot saves
+   * pay for it). See {@link QuickJSWorkflowSession.snapshot}.
+   */
+  getSnapshotState: () => {
+    rngDraws: number;
+    lastUlid: string | undefined;
+    serdeRootPtr: number;
+    clockMs: number;
+    engineVersion: string;
+  },
+  historicalAttributeIds: Set<string>,
+  /** The last correlation-id ULID the VM drew (see isConsumedTerminal). */
+  getLastUlid: () => string | undefined,
+  /** See {@link QuickJSWorkflowSession.clockReads}. */
+  getClockReads: () => number,
+  encryptionKey?: DecryptionKey
+): QuickJSWorkflowSession {
+  const result = checkWorkflowState(vm, serde, { keepAliveOnSuspend: true });
+  let alive = !!result.suspended;
+
+  const session: QuickJSWorkflowSession = {
+    result,
+    async continueWithEvents(
+      newEvents: Event[]
+    ): Promise<QuickJSRuntimeResult> {
+      if (!alive) {
+        throw new Error(
+          'QuickJS workflow session is not alive — continueWithEvents is only valid while suspended'
+        );
+      }
+      // Fresh execution burst: the interrupt budget bounds VM compute,
+      // not wall time spent waiting on inline steps between bursts.
+      interruptBudget.start = Date.now();
+      for (const event of newEvents) {
+        if (
+          event.eventType === 'attr_set' &&
+          event.correlationId !== undefined
+        ) {
+          historicalAttributeIds.add(event.correlationId);
+        }
+      }
+
+      const inert = beginTerminalInertBatch(vm, newEvents, getLastUlid());
+      let maxIterations = 100;
+      let madeProgress: boolean;
+      do {
+        // Match initial replay: already-queued jobs precede event delivery.
+        let batch: number;
+        do {
+          batch = vm.executePendingJobs();
+        } while (batch > 0);
+        madeProgress = await processEvents(
+          vm,
+          serde,
+          newEvents,
+          advanceClock,
+          getLastUlid,
+          inert,
+          encryptionKey
+        );
+        do {
+          batch = vm.executePendingJobs();
+          if (batch > 0) madeProgress = true;
+        } while (batch > 0);
+      } while (madeProgress && --maxIterations > 0);
+      endTerminalInertBatch(vm, inert, getLastUlid());
+
+      const next = checkWorkflowState(vm, serde, {
+        keepAliveOnSuspend: true,
+      });
+      if (!next.suspended) alive = false;
+      session.result = next;
+      return next;
+    },
+    snapshot(): {
+      data: Uint8Array;
+      rngDraws: number;
+      lastUlid: string | undefined;
+      serdeRootPtr: number;
+      clockMs: number;
+      engineVersion: string;
+    } {
+      if (!alive) {
+        throw new Error(
+          'QuickJS workflow session is not alive — snapshot is only valid while suspended'
+        );
+      }
+      // Export the serde root BEFORE capturing memory: exporting pins
+      // the handle's box in a survival table that must be part of the
+      // image for a restore's adoptSerdeRoot to find it.
+      const state = getSnapshotState();
+      const snap = vm.snapshot();
+      return { data: QuickJS.serializeSnapshot(snap), ...state };
+    },
+    memoryUsage(): QuickJSMemoryUsage {
+      if (!alive) {
+        throw new Error(
+          'QuickJS workflow session is not alive — memoryUsage is only valid while suspended'
+        );
+      }
+      return vm.getMemoryUsage();
+    },
+    clockReads(): number {
+      return getClockReads();
+    },
+    openHooks(): QuickJSOpenHook[] {
+      if (!alive) {
+        throw new Error(
+          'QuickJS workflow session is not alive — openHooks is only valid while suspended'
+        );
+      }
+      using h = vm.evalCode(`(function(){
+        var list = globalThis.__pendingList();
+        var disposed = {};
+        list.forEach(function(p){
+          if (p.type === "hook_dispose") disposed[p.correlationId] = true;
+        });
+        return list.filter(function(p){ return p.type === "hook"; }).map(function(p){
+          return {
+            correlationId: p.correlationId,
+            token: String(p.token),
+            isSystem: p.isSystem === true,
+            disposed: disposed[p.correlationId] === true,
+            observed: !!globalThis.__resolvers[p.correlationId]
+          };
+        });
+      })()`);
+      return vm.dump(h) as QuickJSOpenHook[];
+    },
+    dispose(): void {
+      if (alive) {
+        alive = false;
+        try {
+          vm.dispose();
+        } catch {
+          // Already disposed, so ignore.
+        }
+      }
+    },
+  };
+  return session;
+}
+
+// ---- Event Processing ----
+
+async function processEvents(
+  vm: QuickJS,
+  serde: QuickJSSerde,
+  events: Event[],
+  advanceClock: (ms: number) => void,
+  /** The last correlation-id ULID this VM drew (see isConsumedTerminal). */
+  getLastUlid: () => string | undefined,
+  /** This batch's terminal-inert facts (see beginTerminalInertBatch). */
+  inert: TerminalInertBatch,
+  encryptionKey?: DecryptionKey
+): Promise<boolean> {
+  let resolved = false;
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    // A sealed-log noop occupies a slot whose writer died; the run never
+    // observed it. Step over it BEFORE the clock line below, not at the
+    // switch: its `createdAt` is the sealer's wall clock and can postdate
+    // every real event around it, so advancing to it would leak the sealer's
+    // schedule into replay. Because the clock is monotonic, every later
+    // Date.now() in the run with it. That would make a log whose hole was
+    // sealed replay differently from the same log whose hole its own writer
+    // filled, and differently from this log on the node:vm engine, whose
+    // `EventsConsumer` skips noops without ever delivering them. Same rule,
+    // both engines, one predicate.
+    if (isSealedNoopEvent(event)) continue;
+
+    // Advance the VM's deterministic clock to this event's creation time
+    // BEFORE resolving anything, so workflow code unblocked by this event
+    // observes Date.now() at (or after, since the clock is monotonic) the time
+    // the event was recorded. This engine processes events strictly in log
+    // order and drains the VM to quiescence after each one, so advancing per
+    // event is prefix-stable here. It is not the node:vm rule: that engine's
+    // consumer walks ahead of delivery, so it advances the clock only when a
+    // delivery (step result, hook payload, wait completion, registration
+    // outcome, abort) reaches the workflow, and a non-delivering event such as
+    // a `step_created` or an unread `hook_received` moves this engine's clock
+    // but not that one's. Aligning the two is a follow-up.
+    advanceClock(+event.createdAt);
+
+    const cid = event.correlationId;
+    if (!cid) continue;
+
+    // Terminal-inert, the rule `EventsConsumer` applies on the node:vm
+    // engine: once an entity's terminal event (step outcome, wait
+    // completion, hook disposal, workflow attribute write) is in the log,
+    // every event AFTER it under the same correlation id is inert. The test
+    // is a log position, not "this VM has seen the terminal": the fixed-point
+    // loop re-scans the same batch, and the entity's earlier events must
+    // still reach `markCreated` on a re-scan (a terminal buffered before the
+    // VM called the step leaves the step's pending op to be marked then).
+    const cidJs = JSON.stringify(cid);
+    const terminalIndex = inert.firstTerminalIndex.get(cid);
+    if (
+      inert.closedBefore.has(cid) ||
+      (terminalIndex !== undefined && index > terminalIndex)
+    ) {
+      // Inert for the workflow, but the pending-op bookkeeping still
+      // applies: an op under this id has its creation in the log either
+      // way.
+      markCreated(vm, cidJs);
+      if (event.eventType === 'hook_disposed') {
+        markCreated(vm, cidJs, 'hook_dispose');
+      }
+      continue;
+    }
+
+    // JSON.stringify (above) handles quotes, backslashes and control
+    // characters; correlation ids are host-generated ULIDs today, but the
+    // eval-string safety shouldn't depend on that invariant being asserted
+    // nowhere.
+    const eventData =
+      'eventData' in event
+        ? (event.eventData as Record<string, unknown>)
+        : undefined;
+
+    // Log the event and whether the resolver exists
+    switch (event.eventType) {
+      case 'step_completed': {
+        const hasResolver = vm.dump(
+          vm.evalCode(`!!globalThis.__resolvers[${cidJs}]`)
+        );
+        const rawOutput = eventData?.result ?? eventData?.output;
+        if (hasResolver) {
+          if (rawOutput instanceof Uint8Array) {
+            // Decrypt if encrypted: the VM only understands 'devl' format
+            runtimeLogger.debug('QuickJS runtime: step result raw', {
+              correlationId: cid,
+              rawPrefix: new TextDecoder().decode(rawOutput.subarray(0, 4)),
+              rawByteLength: rawOutput.byteLength,
+              isBuffer: Buffer.isBuffer(rawOutput),
+            });
+            const decryptedOutput = await prepareBytesForVM(
+              rawOutput,
+              encryptionKey
+            );
+            runtimeLogger.debug('QuickJS runtime: step result decrypted', {
+              correlationId: cid,
+              prefix: new TextDecoder().decode(decryptedOutput.subarray(0, 4)),
+              byteLength: decryptedOutput.byteLength,
+            });
+            const valueHandle = serde.deserialize(decryptedOutput);
+            vm.setProp(vm.global, '__tmp_result', valueHandle);
+            valueHandle.dispose();
+            vm.evalCode(
+              `globalThis.__resolvers[${cidJs}].resolve(globalThis.__tmp_result);` +
+                `delete globalThis.__resolvers[${cidJs}];` +
+                `delete globalThis.__tmp_result;`
+            ).dispose();
+          } else {
+            runtimeLogger.debug('QuickJS runtime: step result non-binary', {
+              correlationId: cid,
+              type: typeof rawOutput,
+              isNull: rawOutput === null,
+              isUndefined: rawOutput === undefined,
+              constructor: rawOutput?.constructor?.name,
+            });
+            const serialized =
+              rawOutput !== undefined ? JSON.stringify(rawOutput) : 'undefined';
+            vm.evalCode(
+              `globalThis.__resolvers[${cidJs}].resolve(${serialized});` +
+                `delete globalThis.__resolvers[${cidJs}];`
+            ).dispose();
+          }
+          // Drain ALL microtasks after resolve
+          {
+            resolved = true;
+            let b: number;
+            do {
+              b = vm.executePendingJobs();
+            } while (b > 0);
+          }
+        } else if (!isConsumedTerminal(cid, getLastUlid())) {
+          // No resolver yet, so buffer the prepared outcome so the promise
+          // settles the moment the VM constructs it (see __terminalBuffer
+          // in the bootstrap). Without this, the live-continuation path
+          // (which scans each delta exactly once) drops the terminal and
+          // the await never settles.
+          if (rawOutput instanceof Uint8Array) {
+            const decryptedOutput = await prepareBytesForVM(
+              rawOutput,
+              encryptionKey
+            );
+            // Host serde: deserialize into a VM value NOW (same path as
+            // the resolver branch above) and buffer the value itself.
+            const valueHandle = serde.deserialize(decryptedOutput);
+            vm.setProp(vm.global, '__tmp_buf', valueHandle);
+            valueHandle.dispose();
+            vm.evalCode(
+              `globalThis.__terminalBuffer[${cidJs}] = { kind: "resolve_value", value: globalThis.__tmp_buf };` +
+                `delete globalThis.__tmp_buf;`
+            ).dispose();
+          } else {
+            const serialized =
+              rawOutput !== undefined ? JSON.stringify(rawOutput) : 'undefined';
+            vm.evalCode(
+              `globalThis.__terminalBuffer[${cidJs}] = { kind: "resolve_value", value: ${serialized} };`
+            ).dispose();
+          }
+        }
+        markCreated(vm, cidJs);
+        break;
+      }
+      case 'step_failed': {
+        const hasResolver = vm.dump(
+          vm.evalCode(`!!globalThis.__resolvers[${cidJs}]`)
+        );
+        if (hasResolver) {
+          const errorData = eventData?.error;
+          if (errorData instanceof Uint8Array) {
+            // Modern path (post-#1851): the step handler dehydrated the
+            // thrown value through the first-class error pipeline. Decrypt
+            // (if encrypted) and pass the bytes to the VM-side deserializer
+            // so the workflow catch sees a properly typed Error subclass
+            // (TypeError, FatalError with original cause chain, etc.) with
+            // the original message and stack preserved.
+            const decrypted = await prepareBytesForVM(errorData, encryptionKey);
+            const errorHandle = serde.deserialize(decrypted);
+            vm.setProp(vm.global, '__tmp_error', errorHandle);
+            errorHandle.dispose();
+            vm.evalCode(
+              `(function(){` +
+                `globalThis.__resolvers[${cidJs}].reject(globalThis.__tmp_error);` +
+                `delete globalThis.__resolvers[${cidJs}];` +
+                `delete globalThis.__tmp_error;` +
+                `})()`
+            ).dispose();
+          } else {
+            // Legacy path: pre-pipeline events stored error as
+            // `{ message, stack, code }`. Reconstruct a FatalError so
+            // workflow catch can detect it via FatalError.is(), matching
+            // the original V1 step handler behavior.
+            const isErrorObject =
+              typeof errorData === 'object' && errorData !== null;
+            const msg = isErrorObject
+              ? (((errorData as Record<string, unknown>).message as string) ??
+                'Step failed')
+              : typeof errorData === 'string'
+                ? errorData
+                : 'Step failed';
+            const errorStack =
+              (isErrorObject
+                ? (errorData as Record<string, unknown>).stack
+                : undefined) ?? (eventData?.stack as string | undefined);
+            const stackAssignment = errorStack
+              ? `e.stack=${JSON.stringify(errorStack)};`
+              : '';
+            vm.evalCode(
+              `(function(){var e=new Error(${JSON.stringify(msg)});e.name="FatalError";e.fatal=true;${stackAssignment}` +
+                `globalThis.__resolvers[${cidJs}].reject(e);` +
+                `delete globalThis.__resolvers[${cidJs}];})()`
+            ).dispose();
+          }
+          {
+            resolved = true;
+            let b: number;
+            do {
+              b = vm.executePendingJobs();
+            } while (b > 0);
+          }
+        } else if (!isConsumedTerminal(cid, getLastUlid())) {
+          // No resolver yet, so buffer the prepared rejection (see the
+          // step_completed branch above for the rationale).
+          const errorData = eventData?.error;
+          if (errorData instanceof Uint8Array) {
+            const decrypted = await prepareBytesForVM(errorData, encryptionKey);
+            // Host serde: deserialize into the VM error value NOW (same
+            // path as the resolver branch above) and buffer it.
+            const errorHandle = serde.deserialize(decrypted);
+            vm.setProp(vm.global, '__tmp_buf', errorHandle);
+            errorHandle.dispose();
+            vm.evalCode(
+              `globalThis.__terminalBuffer[${cidJs}] = { kind: "reject_value", value: globalThis.__tmp_buf };` +
+                `delete globalThis.__tmp_buf;`
+            ).dispose();
+          } else {
+            const isErrorObject =
+              typeof errorData === 'object' && errorData !== null;
+            const msg = isErrorObject
+              ? (((errorData as Record<string, unknown>).message as string) ??
+                'Step failed')
+              : typeof errorData === 'string'
+                ? errorData
+                : 'Step failed';
+            const errorStack =
+              (isErrorObject
+                ? (errorData as Record<string, unknown>).stack
+                : undefined) ?? (eventData?.stack as string | undefined);
+            vm.evalCode(
+              `globalThis.__terminalBuffer[${cidJs}] = { kind: "reject_error", message: ${JSON.stringify(msg)}, stack: ${errorStack ? JSON.stringify(errorStack) : 'undefined'} };`
+            ).dispose();
+          }
+        }
+        markCreated(vm, cidJs);
+        break;
+      }
+      case 'wait_completed': {
+        const hasResolver = vm.dump(
+          vm.evalCode(`!!globalThis.__resolvers[${cidJs}]`)
+        );
+        if (hasResolver) {
+          vm.evalCode(
+            `globalThis.__resolvers[${cidJs}].resolve();` +
+              `delete globalThis.__resolvers[${cidJs}];`
+          ).dispose();
+          {
+            resolved = true;
+            let b: number;
+            do {
+              b = vm.executePendingJobs();
+            } while (b > 0);
+          }
+        } else if (!isConsumedTerminal(cid, getLastUlid())) {
+          // No resolver yet, so buffer (see step_completed above).
+          vm.evalCode(
+            `globalThis.__terminalBuffer[${cidJs}] = { kind: "resolve_undefined" };`
+          ).dispose();
+        }
+        markCreated(vm, cidJs);
+        break;
+      }
+      case 'attr_set': {
+        // Only workflow-written attribute events resolve a pending
+        // setAttributes() promise; step/system writers share no
+        // correlationIds with VM resolvers, so the guard is defensive.
+        const writer = (eventData?.writer as { type?: string } | undefined)
+          ?.type;
+        if (writer !== 'workflow') break;
+        const hasResolver = vm.dump(
+          vm.evalCode(`!!globalThis.__resolvers[${cidJs}]`)
+        );
+        if (!hasResolver && !isConsumedTerminal(cid, getLastUlid())) {
+          // No resolver yet, so buffer (see step_completed above).
+          vm.evalCode(
+            `globalThis.__terminalBuffer[${cidJs}] = { kind: "resolve_undefined" };`
+          ).dispose();
+        }
+        if (hasResolver) {
+          vm.evalCode(
+            `globalThis.__resolvers[${cidJs}].resolve();` +
+              `delete globalThis.__resolvers[${cidJs}];`
+          ).dispose();
+          {
+            resolved = true;
+            let b: number;
+            do {
+              b = vm.executePendingJobs();
+            } while (b > 0);
+          }
+        }
+        markCreated(vm, cidJs);
+        break;
+      }
+      case 'hook_received': {
+        // Check if this event was already processed (delivered or
+        // buffered) within this invocation. Prevents double-delivery when
+        // the outer loop re-scans events.
+        const alreadyProcessed = event.eventId
+          ? vm.dump(
+              vm.evalCode(
+                `!!(globalThis.__hookPayloadBuffer.__processedEventIds && globalThis.__hookPayloadBuffer.__processedEventIds[${JSON.stringify(event.eventId)}])`
+              )
+            )
+          : false;
+        if (alreadyProcessed) {
+          runtimeLogger.debug(
+            'QuickJS runtime: hook_received already processed',
+            {
+              correlationId: cid,
+              eventId: event.eventId,
+            }
+          );
+          markCreated(vm, cidJs);
+          break;
+        }
+
+        // Resilient-resume dedup (parity with the node engine's
+        // EventsConsumer in workflow/hook.ts): two hook_received rows for
+        // ONE resume attempt share a client-minted `resumeId` (a duplicate
+        // can be committed when the materialization fallback races a
+        // delayed direct write, since hook_received has no storage uniqueness
+        // constraint). Deliver only the first-in-log occurrence. The seen
+        // set lives in the VM heap so it is deterministic per replay and
+        // survives event re-scans within the invocation. Events without a
+        // resumeId (older SDKs) are never deduped.
+        {
+          // Top-level event.resumeId is the canonical location (the backend
+          // hoists it to a first-class column); the nested
+          // eventData.resumeId form is a deprecated legacy fallback.
+          // Mirrors the node engine's dedup in workflow/hook.ts.
+          const resumeId =
+            (event as { resumeId?: unknown }).resumeId ??
+            (eventData as { resumeId?: unknown } | undefined)?.resumeId;
+          if (typeof resumeId === 'string') {
+            const resumeIdJs = JSON.stringify(resumeId);
+            const duplicate = vm.dump(
+              vm.evalCode(
+                `(globalThis.__hookSeenResumeIds = globalThis.__hookSeenResumeIds || {})[${resumeIdJs}] === true`
+              )
+            );
+            if (duplicate) {
+              runtimeLogger.debug(
+                'QuickJS runtime: duplicate hook_received for the same resume attempt, dropping',
+                { correlationId: cid, eventId: event.eventId, resumeId }
+              );
+              if (event.eventId) {
+                vm.evalCode(
+                  `(globalThis.__hookPayloadBuffer.__processedEventIds = globalThis.__hookPayloadBuffer.__processedEventIds || {})[${JSON.stringify(event.eventId)}] = true;`
+                ).dispose();
+              }
+              markCreated(vm, cidJs);
+              break;
+            }
+            vm.evalCode(
+              `globalThis.__hookSeenResumeIds[${resumeIdJs}] = true;`
+            ).dispose();
+          }
+        }
+
+        // Abort delivery: hook_received for an AbortController's system
+        // hook flips the registered signal instead of resolving a promise.
+        // The payload is the dehydrated `{ aborted: true, reason }` object.
+        const isAbortHook = vm.dump(
+          vm.evalCode(
+            `!!(globalThis.__abortSignals && globalThis.__abortSignals[${cidJs}])`
+          )
+        );
+        if (isAbortHook) {
+          const rawAbortPayload = eventData?.payload;
+          if (rawAbortPayload instanceof Uint8Array) {
+            const decrypted = await prepareBytesForVM(
+              rawAbortPayload,
+              encryptionKey
+            );
+            const payloadHandle = serde.deserialize(decrypted);
+            vm.setProp(vm.global, '__tmp_abort', payloadHandle);
+            payloadHandle.dispose();
+            vm.evalCode(
+              `(function(){` +
+                `var p=globalThis.__tmp_abort;` +
+                `delete globalThis.__tmp_abort;` +
+                `globalThis.__abortSignals[${cidJs}]._setAborted(p&&typeof p==="object"?p.reason:undefined);` +
+                `})()`
+            ).dispose();
+          } else {
+            vm.evalCode(
+              `globalThis.__abortSignals[${cidJs}]._setAborted(undefined);`
+            ).dispose();
+          }
+          // The abort is durably recorded, so clear the pending op's
+          // abortRequested marker so the host doesn't re-record it (the
+          // workflow's own abort() call can set the flag before this
+          // event is processed when it happens later in replay order,
+          // and hook_received events are not unique per correlationId).
+          vm.evalCode(
+            `(function(){` +
+              `var p=globalThis.__findPending(${cidJs},"hook");` +
+              `if(p)p.abortRequested=false;` +
+              `})()`
+          ).dispose();
+          if (event.eventId) {
+            vm.evalCode(
+              `(globalThis.__hookPayloadBuffer.__processedEventIds = globalThis.__hookPayloadBuffer.__processedEventIds || {})[${JSON.stringify(event.eventId)}] = true;`
+            ).dispose();
+          }
+          {
+            resolved = true;
+            let b: number;
+            do {
+              b = vm.executePendingJobs();
+            } while (b > 0);
+          }
+          markCreated(vm, cidJs);
+          break;
+        }
+
+        const hasResolver = vm.dump(
+          vm.evalCode(`!!globalThis.__resolvers[${cidJs}]`)
+        );
+        const rawPayload = eventData?.payload ?? eventData?.result;
+        runtimeLogger.debug('QuickJS runtime: processing hook_received', {
+          correlationId: cid,
+          eventId: event.eventId,
+          hasResolver,
+          payloadType: typeof rawPayload,
+          payloadIsUint8Array: rawPayload instanceof Uint8Array,
+          payloadKeys:
+            rawPayload && typeof rawPayload === 'object'
+              ? Object.keys(rawPayload)
+              : undefined,
+        });
+        // A payload that cannot be decrypted or deserialized becomes an
+        // error in the VM (`globalThis.__tmp_err`) for the await that takes
+        // it, never an exception out of replay.
+        const setHydrationError = (error: unknown) => {
+          const name = error instanceof Error ? error.name : 'Error';
+          const message =
+            error instanceof Error ? error.message : String(error);
+          vm.evalCode(
+            `globalThis.__tmp_err = new Error(${JSON.stringify(message)});` +
+              `globalThis.__tmp_err.name = ${JSON.stringify(name)};`
+          ).dispose();
+        };
+        const hydrateIntoTmp = async (bytes: Uint8Array): Promise<boolean> => {
+          try {
+            // Decrypt if encrypted: the VM only understands 'devl' format
+            const decryptedPayload = await prepareBytesForVM(
+              bytes,
+              encryptionKey
+            );
+            const payloadHandle = serde.deserialize(decryptedPayload);
+            vm.setProp(vm.global, '__tmp_result', payloadHandle);
+            payloadHandle.dispose();
+            return true;
+          } catch (error) {
+            setHydrationError(error);
+            return false;
+          }
+        };
+        if (hasResolver) {
+          if (rawPayload instanceof Uint8Array) {
+            const hydrated = await hydrateIntoTmp(rawPayload);
+            vm.evalCode(
+              (hydrated
+                ? `globalThis.__resolvers[${cidJs}].resolve(globalThis.__tmp_result);`
+                : `globalThis.__resolvers[${cidJs}].reject(globalThis.__tmp_err);`) +
+                `delete globalThis.__resolvers[${cidJs}];` +
+                `delete globalThis.__tmp_result;` +
+                `delete globalThis.__tmp_err;`
+            ).dispose();
+          } else {
+            const serialized =
+              rawPayload !== undefined
+                ? JSON.stringify(rawPayload)
+                : 'undefined';
+            vm.evalCode(
+              `globalThis.__resolvers[${cidJs}].resolve(${serialized});` +
+                `delete globalThis.__resolvers[${cidJs}];`
+            ).dispose();
+          }
+          // Mark this event as processed in the VM heap to prevent
+          // double-delivery when the outer loop re-scans events.
+          if (event.eventId) {
+            vm.evalCode(
+              `(globalThis.__hookPayloadBuffer.__processedEventIds = globalThis.__hookPayloadBuffer.__processedEventIds || {})[${JSON.stringify(event.eventId)}] = true;`
+            ).dispose();
+          }
+          {
+            resolved = true;
+            let b: number;
+            do {
+              b = vm.executePendingJobs();
+            } while (b > 0);
+          }
+        } else {
+          // No resolver yet, so buffer the payload in the VM heap. When
+          // createHookPromise() is called later, it will drain this buffer
+          // first (matching the node:vm engine's payloadsQueue behavior).
+          const eventIdJs = event.eventId
+            ? JSON.stringify(event.eventId)
+            : 'null';
+          const bufferAndTrack =
+            `(globalThis.__hookPayloadBuffer[${cidJs}] = globalThis.__hookPayloadBuffer[${cidJs}] || [])` +
+            `.push(%PAYLOAD%);` +
+            (event.eventId
+              ? `(globalThis.__hookPayloadBuffer.__processedEventIds = globalThis.__hookPayloadBuffer.__processedEventIds || {})[${eventIdJs}] = true;`
+              : '');
+          if (rawPayload instanceof Uint8Array) {
+            const hydrated = await hydrateIntoTmp(rawPayload);
+            // NOTE: replacement is a function so `$`-sequences in the
+            // substituted JS never get interpreted as String.replace
+            // special replacement patterns.
+            vm.evalCode(
+              bufferAndTrack.replace('%PAYLOAD%', () =>
+                hydrated
+                  ? 'globalThis.__tmp_result'
+                  : 'new globalThis.__HydrationFailure(globalThis.__tmp_err)'
+              ) + 'delete globalThis.__tmp_result;delete globalThis.__tmp_err;'
+            ).dispose();
+          } else {
+            const serialized =
+              rawPayload !== undefined
+                ? JSON.stringify(rawPayload)
+                : 'undefined';
+            // Function replacement: a JSON-serialized payload can contain
+            // `$&`, `$'`, `$\``, ... which String.replace would otherwise
+            // expand, silently corrupting the injected code.
+            vm.evalCode(
+              bufferAndTrack.replace('%PAYLOAD%', () => serialized)
+            ).dispose();
+          }
+        }
+        markCreated(vm, cidJs);
+        break;
+      }
+      case 'hook_conflict': {
+        // Another workflow owns this hook token. Payload awaiters reject
+        // with HookConflictError; getConflict() awaiters resolve with a
+        // Run handle for the conflicting run (revived through the VM's
+        // class registry so its methods are durable step proxies) or
+        // reject with the error when no handle can be constructed,
+        // mirroring the node:vm engine's hook.ts hook_conflict handling.
+        const conflictToken = (eventData?.token as string) ?? 'unknown';
+        const conflictingRunId = eventData?.conflictingRunId as
+          | string
+          | undefined;
+        // A World that declined a forced creation ON PURPOSE (the run holding
+        // the token predates involuntary disposal) marks the conflict; that
+        // is the ordinary, catchable conflict. Unmarked, a conflict on a
+        // forced hook means the World does not implement forcing at all.
+        // Mirrors hook.ts.
+        const forceRefusedReason = eventData?.forceRefusedReason as
+          | string
+          | undefined;
+        const didSettle = vm.dump(
+          vm.evalCode(
+            `(function(){
+              var cid = ${JSON.stringify(cid)};
+              var token = ${JSON.stringify(conflictToken)};
+              var conflictingRunId = ${JSON.stringify(conflictingRunId ?? null)};
+              var forceRefused = ${JSON.stringify(forceRefusedReason !== undefined)};
+              var ErrCls = globalThis[Symbol.for('@workflow/errors//HookConflictError')];
+              var err;
+              var hookState = globalThis.__hooks && globalThis.__hooks[cid];
+              // A forced hook asked for a guarantee the World could not give
+              // (older server, kill switch): a misconfiguration, not the
+              // ordinary conflict the caller opted out of. Mirrors hook.ts.
+              var forced = !!(hookState && hookState.force) && !forceRefused;
+              if (forced) {
+                var FatalCls = globalThis[Symbol.for('@workflow/errors//FatalError')];
+                var forcedMessage = 'createHook({ experimental_force: true }) for token "' + token + '" was answered with a hook_conflict: the configured World does not support force-claiming hook tokens' + (conflictingRunId ? ' (run "' + conflictingRunId + '" holds it)' : '') + '.';
+                if (typeof FatalCls === 'function') {
+                  err = new FatalCls(forcedMessage);
+                } else {
+                  err = new Error(forcedMessage);
+                  err.name = 'FatalError';
+                  err.fatal = true;
+                }
+              } else if (typeof ErrCls === 'function') {
+                err = new ErrCls(token, conflictingRunId || undefined);
+              } else {
+                err = new Error('Hook token "' + token + '" is already in use by another workflow');
+                err.name = 'HookConflictError';
+                err.token = token;
+                if (conflictingRunId) err.conflictingRunId = conflictingRunId;
+              }
+              var run = null;
+              if (conflictingRunId && !forced) {
+                var reg = globalThis[Symbol.for('workflow-class-registry')];
+                var RunCls = reg && reg.get('class//workflow//Run');
+                var des = RunCls && RunCls[Symbol.for('workflow-deserialize')];
+                if (typeof des === 'function') {
+                  run = des.call(RunCls, { runId: conflictingRunId });
+                }
+              }
+              var settled = false;
+              var state = globalThis.__hooks && globalThis.__hooks[cid];
+              if (state && !state.conflict) {
+                state.conflict = { error: err, run: run };
+                var gc = state.getConflictResolvers;
+                state.getConflictResolvers = [];
+                for (var i = 0; i < gc.length; i++) {
+                  if (run) { gc[i].resolve(run); } else { gc[i].reject(err); }
+                  settled = true;
+                }
+              }
+              if (globalThis.__resolvers[cid]) {
+                globalThis.__resolvers[cid].reject(err);
+                delete globalThis.__resolvers[cid];
+                settled = true;
+              }
+              return settled;
+            })()`
+          )
+        );
+        if (didSettle) {
+          resolved = true;
+          let b: number;
+          do {
+            b = vm.executePendingJobs();
+          } while (b > 0);
+        }
+        markCreated(vm, cidJs);
+        break;
+      }
+      case 'step_created':
+      case 'step_started':
+      case 'step_retrying':
+      case 'wait_created': {
+        markCreated(vm, cidJs);
+        break;
+      }
+      case 'hook_created': {
+        // Confirm creation for getConflict() awaiters: resolve them with
+        // null (no conflict) once the event log proves the hook exists.
+        const settledGetConflict = vm.dump(
+          vm.evalCode(
+            `(function(){
+              var hook = globalThis.__findPending(${cidJs}, "hook");
+              if (hook) hook.tokenRetentionUntil = ${JSON.stringify(eventData?.tokenRetentionUntil?.valueOf()) ?? 'undefined'};
+              var state = globalThis.__hooks && globalThis.__hooks[${JSON.stringify(cid)}];
+              if (!state) return false;
+              state.created = true;
+              var gc = state.getConflictResolvers;
+              state.getConflictResolvers = [];
+              for (var i = 0; i < gc.length; i++) gc[i].resolve(null);
+              return gc.length > 0;
+            })()`
+          )
+        );
+        if (settledGetConflict) {
+          resolved = true;
+          let b: number;
+          do {
+            b = vm.executePendingJobs();
+          } while (b > 0);
+        }
+        markCreated(vm, cidJs);
+        break;
+      }
+      case 'hook_disposed': {
+        const claimedBy = eventData?.forceClaimedBy as
+          | { runId?: string; hookId?: string }
+          | undefined;
+        if (claimedBy && typeof claimedBy.runId === 'string') {
+          // Not this run's disposal: another run took the token
+          // (experimental_force). Reject the parked awaiter, settle any
+          // getConflict awaiters (the hook was registered; it just no longer
+          // holds the token), and remember the error so every later await
+          // rejects too — after the buffered payloads, which landed before
+          // the takeover. Mirrors hook.ts.
+          const hookState = vm.dump(
+            vm.evalCode(
+              `(function(){
+                var cid = ${JSON.stringify(cid)};
+                var state = globalThis.__hooks && globalThis.__hooks[cid];
+                var token = state ? state.token : ${JSON.stringify((eventData?.token as string) ?? '')};
+                var claimedByRunId = ${JSON.stringify(claimedBy.runId)};
+                var claimedByHookId = ${JSON.stringify(claimedBy.hookId ?? null)};
+                var ErrCls = globalThis[Symbol.for('@workflow/errors//HookForceClaimedError')];
+                var err;
+                if (typeof ErrCls === 'function') {
+                  err = new ErrCls(token, claimedByRunId, claimedByHookId || undefined);
+                } else {
+                  err = new Error('Hook token "' + token + '" was force-claimed by another workflow (run "' + claimedByRunId + '")');
+                  err.name = 'HookForceClaimedError';
+                  err.token = token;
+                  err.claimedByRunId = claimedByRunId;
+                  if (claimedByHookId) err.claimedByHookId = claimedByHookId;
+                }
+                var settled = false;
+                if (state) {
+                  state.forceClaimed = err;
+                  var gc = state.getConflictResolvers;
+                  state.getConflictResolvers = [];
+                  for (var i = 0; i < gc.length; i++) { gc[i].resolve(null); settled = true; }
+                } else if (
+                  globalThis.__startHook &&
+                  globalThis.__startHook.hookId === cid &&
+                  !globalThis.__startHook.bound
+                ) {
+                  // Another run took the start Hook before the body opened
+                  // it: a later createHook binds to a Hook already taken.
+                  globalThis.__startHookForceClaimed = err;
+                }
+                if (globalThis.__resolvers[cid]) {
+                  globalThis.__resolvers[cid].reject(err);
+                  delete globalThis.__resolvers[cid];
+                  settled = true;
+                }
+                return settled;
+              })()`
+            )
+          );
+          if (hookState) {
+            resolved = true;
+            let b: number;
+            do {
+              b = vm.executePendingJobs();
+            } while (b > 0);
+          }
+          // The takeover may have beaten a cross-region creation's journal,
+          // so the `hook` op is marked created here too: a re-post would
+          // only be refused by the World (its own marker is set).
+          markCreated(vm, cidJs);
+        }
+        // Disambiguate from the `hook` pending op with the same
+        // correlationId: we want to mark the `hook_dispose` entry.
+        if (claimedBy && typeof claimedBy.runId === 'string') {
+          markCreated(vm, cidJs, 'hook_dispose');
+        } else {
+          // This run's own disposal is durable: once the VM's dispose op
+          // is matched, nothing can await, create, or conflict the hook
+          // again, so release its ops and lifecycle state (an unmatched
+          // event — the VM has not reached dispose() yet — leaves them for
+          // the re-scan that matches it).
+          vm.evalCode(
+            `if(globalThis.__markCreated(${cidJs},"hook_dispose"))globalThis.__releaseDisposedHook(${cidJs});`
+          ).dispose();
+        }
+        break;
+      }
+    }
+  }
+  return resolved;
+}
+
+/**
+ * The terminal-inert facts for one batch of events, which every scan of that
+ * batch shares (the fixed-point loop re-scans a batch while it makes
+ * progress, and must reach the same verdicts each time).
+ *
+ * - `firstTerminalIndex`: the position of the first terminal event per
+ *   correlation id in this batch. An event after it is inert; an event
+ *   before it is not, even on a re-scan that runs after the terminal settled
+ *   the entity.
+ * - `closedBefore`: the correlation ids whose terminal is in an EARLIER
+ *   batch, so every event of this batch under them is inert. This is read
+ *   from the VM heap when the batch begins (see TERMINAL_STATE_JS), so it
+ *   travels with a VM snapshot: a restored VM is fed only the events after
+ *   the snapshot, and a straggler among them is recognized against a
+ *   terminal it saw before.
+ *
+ * Both are host-side and live for one batch only. Nothing here grows with
+ * the run's length.
+ */
+interface TerminalInertBatch {
+  firstTerminalIndex: Map<string, number>;
+  closedBefore: Set<string>;
+}
+
+/**
+ * VM-side predicate `reflected(cid)`: whether the VM's own state already
+ * shows that the entity's terminal event was processed, without a record
+ * per entity. `lastUlid` (the last id this VM drew, or null) is in scope.
+ *
+ * - Step, wait and attribute ids are drawn from the run's monotonic ULID
+ *   sequence by the call that registers their resolver, and only a
+ *   terminal event removes that resolver. A drawn id with no resolver has
+ *   had its terminal; an undrawn id has had it exactly when it sits in
+ *   `__terminalBuffer` (an undrawn id's terminal is always buffered).
+ * - A hook id is drawn the same way, but the hook object can register a
+ *   new resolver after its disposal, so resolver absence says nothing.
+ *   Instead: a drawn user hook keeps its `__hooks` entry until this run's
+ *   own disposal is matched (`__releaseDisposedHook`), and a disposal by
+ *   another run's takeover sets `forceClaimed` on it.
+ *
+ * Everything else (an AbortController's system hook, a hook disposed in
+ * the log before this VM reached `dispose()` or created it, an id outside
+ * the ULID scheme) is not reflected, and its terminal is recorded in
+ * `__unreflectedTerminals` until it is (see endTerminalInertBatch).
+ */
+const TERMINAL_STATE_JS = `
+  var re = /^(step|wait|attr|hook)_([0-9A-HJKMNP-TV-Z]{26})$/;
+  function reflected(cid) {
+    var m = re.exec(cid);
+    if (!m) return false;
+    var drawn = lastUlid !== null && m[2] <= lastUlid;
+    if (m[1] !== "hook") {
+      return drawn ? !globalThis.__resolvers[cid] : !!globalThis.__terminalBuffer[cid];
+    }
+    if (!drawn || (globalThis.__abortSignals && globalThis.__abortSignals[cid])) return false;
+    // The run's start Hook id is derived from the run's id, not drawn: it
+    // sorts before every id the VM draws, so "drawn and no state" says
+    // nothing about it until the body has opened it.
+    var startHook = globalThis.__startHook;
+    if (startHook && cid === startHook.hookId && !startHook.bound) return false;
+    var state = globalThis.__hooks && globalThis.__hooks[cid];
+    return !state || !!state.forceClaimed;
+  }
+`;
+
+/**
+ * Starts a batch: finds each correlation id's first terminal event in it,
+ * and asks the VM which ids were already closed by an earlier batch. Also
+ * drops record entries the VM state reflects by now, which keeps the record
+ * at the handful of entities whose terminal outran this VM.
+ */
+function beginTerminalInertBatch(
+  vm: QuickJS,
+  events: Event[],
+  lastUlid: string | undefined
+): TerminalInertBatch {
+  const firstTerminalIndex = new Map<string, number>();
+  const cids = new Set<string>();
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    const cid = event.correlationId;
+    if (!cid || isSealedNoopEvent(event)) continue;
+    cids.add(cid);
+    if (firstTerminalIndex.has(cid)) continue;
+    const entityClass = classifyEntityEvent(event);
+    if (
+      entityClass !== undefined &&
+      TERMINAL_EVENT_CLASSES.has(entityClass.eventClass)
+    ) {
+      firstTerminalIndex.set(cid, index);
+    }
+  }
+  if (cids.size === 0) return { firstTerminalIndex, closedBefore: new Set() };
+  // An object result must be disposed: a leaked handle keeps the array
+  // alive in the VM heap.
+  using closedHandle = vm.evalCode(
+    `(function(cids, lastUlid){${TERMINAL_STATE_JS}
+        var record = globalThis.__unreflectedTerminals;
+        if (record) for (var k in record) if (reflected(k)) delete record[k];
+        var out = [];
+        for (var i = 0; i < cids.length; i++) {
+          if ((record && record[cids[i]]) || reflected(cids[i])) out.push(cids[i]);
+        }
+        return out;
+      })(${JSON.stringify([...cids])}, ${JSON.stringify(lastUlid ?? null)})`
+  );
+  const closed = vm.dump(closedHandle) as string[];
+  return { firstTerminalIndex, closedBefore: new Set(closed) };
+}
+
+/**
+ * Ends a batch: records each terminal it held that the VM state does not
+ * reflect (see TERMINAL_STATE_JS), so the next batch, or a VM restored
+ * from a snapshot taken now, still treats its entity as closed.
+ */
+function endTerminalInertBatch(
+  vm: QuickJS,
+  inert: TerminalInertBatch,
+  lastUlid: string | undefined
+): void {
+  if (inert.firstTerminalIndex.size === 0) return;
+  vm.evalCode(
+    `(function(cids, lastUlid){${TERMINAL_STATE_JS}
+      for (var i = 0; i < cids.length; i++) {
+        if (reflected(cids[i])) continue;
+        (globalThis.__unreflectedTerminals = globalThis.__unreflectedTerminals || {})[cids[i]] = true;
+      }
+    })(${JSON.stringify([...inert.firstTerminalIndex.keys()])}, ${JSON.stringify(lastUlid ?? null)})`
+  ).dispose();
+}
+
+/**
+ * The ULID part of a step, wait or attribute correlation id. These are the
+ * ids whose promise the VM constructs (via __registerResolver) in the same
+ * synchronous call that draws the id.
+ */
+const AWAITED_CORRELATION_ID = /^(?:step|wait|attr)_([0-9A-HJKMNP-TV-Z]{26})$/;
+
+/**
+ * Whether the VM already consumed the terminal for this correlation id.
+ *
+ * Every step, wait and attribute id is drawn from the run's monotonic ULID
+ * sequence by the call that also constructs its awaiting promise, and a
+ * resolver is only removed by settling it. So a terminal that finds no
+ * resolver for an id this VM has already drawn (at or before `lastUlid`;
+ * the sequence shares one timestamp prefix, so it orders lexically) is a
+ * re-scan of one already consumed (continueWithEvents re-scans a batch
+ * while it makes progress, and a restore re-feeds events past its cursor),
+ * not an early arrival. Such terminals must NOT be buffered: nothing would
+ * ever drain them, and a snapshotted heap would carry every one of them for
+ * the rest of the run. A watermark answers this in constant memory, where a
+ * set of consumed ids grew with every step of the run.
+ */
+function isConsumedTerminal(
+  correlationId: string,
+  lastUlid: string | undefined
+): boolean {
+  if (lastUlid === undefined) return false;
+  const match = AWAITED_CORRELATION_ID.exec(correlationId);
+  return match !== null && match[1] <= lastUlid;
+}
+
+function markCreated(vm: QuickJS, cidJs: string, opType?: string): void {
+  // `cidJs` is the JSON.stringify-quoted correlation id (see processEvents).
+  // `hook` and `hook_dispose` pending ops share the same correlationId,
+  // so when processing `hook_disposed` events we must disambiguate by
+  // type: otherwise `.find()` returns the original `hook` op and the
+  // `hook_dispose` op is never marked, causing the entrypoint to keep
+  // retrying a hook_disposed for an already-deleted entity.
+  // Keyed lookup (see __pendingKey in the bootstrap): a linear scan
+  // here ran once per event over every op the run ever created, making
+  // replay quadratic in the run's length.
+  vm.evalCode(
+    `globalThis.__markCreated(${cidJs}${opType ? `,${JSON.stringify(opType)}` : ''});`
+  ).dispose();
+}
+
+// ---- State Checking ----
+
+/**
+ * Per-VM cache of serialized pending-op field bytes, keyed
+ * `correlationId:field`. A step's raw input is immutable once pushed, so
+ * its bytes are computed once even though the op is re-collected on every
+ * suspension it stays pending through.
+ */
+// per-copy-ok: keyed on the VM instance, and a VM is created and driven by one
+// copy. Another copy holds no reference to the key, so a shared map could never
+// be read from it.
+const pendingByteCache = new WeakMap<QuickJS, Map<string, Uint8Array>>();
+
+function ensurePendingByteCache(vm: QuickJS): Map<string, Uint8Array> {
+  let cache = pendingByteCache.get(vm);
+  if (!cache) {
+    cache = new Map();
+    pendingByteCache.set(vm, cache);
+  }
+  return cache;
+}
+
+/**
+ * The pending-op fields that hold RAW guest values (the bootstrap no longer
+ * serializes them in the VM). Collection projects them out of the dumped
+ * plain metadata and serializes each through a handle with the host serde.
+ */
+const RAW_PENDING_FIELDS = ['input', 'metadata', 'abortPayload'] as const;
+
+/**
+ * Dump a filtered view of `globalThis.__pending` to host PendingOperation
+ * objects, serializing the raw-value fields host-side. `filterExpr` is a
+ * guest expression that evaluates to the array of ops to collect.
+ */
+function dumpPendingOps(
+  vm: QuickJS,
+  serde: QuickJSSerde,
+  filterExpr: string,
+  byteCache?: Map<string, Uint8Array>
+): PendingOperation[] {
+  using projected = vm.evalCode(`(function(){
+    var ops = ${filterExpr};
+    globalThis.__rawFields = [];
+    // Ops whose cached bytes are dead weight: released ops (already gone
+    // from __pending; their ids come from __releasedCids, drained here),
+    // and ops still in __pending that are never collected again by either
+    // the suspension or the drain filter: created hooks that are not
+    // currently awaited and have no abort in flight. Surface their cids
+    // so the host can evict them (see the byte-cache eviction below).
+    // (Map#forEach visits values.)
+    var settled = globalThis.__releasedCids;
+    globalThis.__releasedCids = [];
+    globalThis.__pending.forEach(function(p){
+      if (p.hasCreatedEvent && !globalThis.__resolvers[p.correlationId] && !p.abortRequested) {
+        settled.push(p.correlationId);
+      }
+    });
+    return { settled: settled, ops: ops.map(function(p){
+      var q = {};
+      for (var k in p) {
+        if (k === 'input' || k === 'metadata' || k === 'abortPayload') continue;
+        q[k] = p[k];
+      }
+      var raw = {};
+      ['input', 'metadata', 'abortPayload'].forEach(function(f){
+        if (p[f] !== undefined) {
+          raw[f] = globalThis.__rawFields.length;
+          globalThis.__rawFields.push(p[f]);
+        }
+      });
+      q.__rawIndices = raw;
+      return q;
+    }) };
+  })()`);
+  const dumped = vm.dump(projected) as {
+    settled: string[];
+    ops: (PendingOperation & {
+      __rawIndices?: Record<string, number>;
+    })[];
+  };
+  const plainOps = dumped.ops;
+  // Byte-cache eviction: entries for settled ops can never be read again
+  // (neither collection filter matches a settled op), so dropping them
+  // bounds the cache by the LIVE pending set instead of growing
+  // monotonically for the VM's lifetime, which matters for the inline
+  // loop's long-lived sessions and snapshot-restored VMs.
+  if (byteCache && dumped.settled.length > 0) {
+    for (const cid of dumped.settled) {
+      for (const field of RAW_PENDING_FIELDS) {
+        byteCache.delete(`${cid}:${field}`);
+      }
+    }
+  }
+  using rawFields = vm.evalCode('globalThis.__rawFields');
+  for (const op of plainOps) {
+    const rawIndices = op.__rawIndices ?? {};
+    delete op.__rawIndices;
+    for (const field of RAW_PENDING_FIELDS) {
+      const index = rawIndices[field];
+      if (index === undefined) continue;
+      const cacheKey = `${op.correlationId}:${field}`;
+      let bytes = byteCache?.get(cacheKey);
+      if (!bytes) {
+        using valueHandle = rawFields.getProp(String(index));
+        try {
+          bytes = serde.serialize(valueHandle);
+        } catch (err) {
+          // A step input that refuses to serialize is a deterministic user
+          // error: failing the whole collection here would fail the run
+          // from the outside, where no workflow code can observe it (and
+          // with a bare DevalueError instead of the framed message the
+          // node:vm engine produces). Reframe it exactly like
+          // `dehydrateStepArguments` does and surface it on the op: the
+          // entrypoint finalizes the step as step_created + step_failed so
+          // the failure rejects into the workflow, catchable. Other raw
+          // fields (hook metadata, abort payloads) keep the throwing
+          // behavior, matching the node:vm engine's scope.
+          if (op.type === 'step' && field === 'input') {
+            const { message, hint } = formatSerializationError(
+              'step arguments',
+              err
+            );
+            (op as PendingStep).serializationError = new SerializationError(
+              message,
+              { hint, cause: err }
+            );
+            continue;
+          }
+          throw err;
+        }
+        byteCache?.set(cacheKey, bytes);
+      }
+      (op as unknown as Record<string, unknown>)[field] = bytes;
+    }
+  }
+  vm.evalCode('delete globalThis.__rawFields').dispose();
+  return plainOps;
+}
+
+/**
+ * Collect terminal side effects, including abort recordings and uncommitted
+ * operations. Run termination cleans up hooks, so retain disposals only when
+ * they release a retained token early or allow a later pending registration.
+ */
+function collectDrainOperations(
+  vm: QuickJS,
+  serde: QuickJSSerde
+): PendingOperation[] {
+  // Share the per-VM byte cache with the suspension path: an op that was
+  // serialized during a suspension pass must reuse those exact bytes at
+  // terminal drain, since re-serializing can invoke getters again and produce
+  // a DIFFERENT byte sequence for what the event log treats as one value.
+  return dumpPendingOps(
+    vm,
+    serde,
+    `(function(){
+    var pending = globalThis.__pendingList();
+    var lastHookCreation = new Map();
+    var retainedHooks = new Set();
+    pending.forEach(function(p, index){
+      if (p.type === "hook" && p.tokenRetentionUntil !== undefined) {
+        retainedHooks.add(p.correlationId);
+      }
+      if (p.type === "hook" && p.isSystem && !p.abortRequested && !p.disposed) {
+        p.disposed = true;
+      }
+      if (p.type === "hook" && !p.hasCreatedEvent && !p.disposed) {
+        lastHookCreation.set(p.token, index);
+      }
+    });
+    return pending.filter(function(p, index){
+      if (p.type === "hook_dispose") {
+        var last = lastHookCreation.get(p.token);
+        return !p.hasCreatedEvent && (retainedHooks.has(p.correlationId) ||
+          (last !== undefined && index < last));
+      }
+      if (p.abortRequested) return true;
+      if (p.hasCreatedEvent) return false;
+      // Skip system hooks that were disposed before ever being created.
+      if (p.type === "hook" && p.disposed) return false;
+      return true;
+    });
+  })()`,
+    ensurePendingByteCache(vm)
+  );
+}
+
+function checkWorkflowState(
+  vm: QuickJS,
+  serde: QuickJSSerde,
+  opts: { keepAliveOnSuspend?: boolean } = {}
+): QuickJSRuntimeResult {
+  // Check completed: __workflowResult holds the RAW return value (with a
+  // separate done flag so `undefined` results are distinguishable); the
+  // host serializes it through a handle.
+  {
+    using done = vm.evalCode('globalThis.__workflowDone === true');
+    if (done.toBoolean()) {
+      using h = vm.evalCode('globalThis.__workflowResult');
+      const resultBytes = serde.serialize(h);
+      const drainOperations = collectDrainOperations(vm, serde);
+      vm.dispose();
+      return {
+        completed: {
+          result: resultBytes,
+          ...(drainOperations.length > 0 ? { drainOperations } : {}),
+        },
+      };
+    }
+  }
+
+  // Check failed
+  {
+    using h = vm.evalCode('globalThis.__workflowError');
+    if (!h.isUndefined) {
+      // The display fields are plain strings; the thrown value itself is
+      // RAW and serialized host-side through a handle.
+      const errorObj = h.isString
+        ? (h.toString() as string)
+        : (() => {
+            using plain = vm.evalCode(
+              '(function(e){return {message: e.message, stack: e.stack, name: e.name};})(globalThis.__workflowError)'
+            );
+            return vm.dump(plain) as {
+              message: string;
+              stack?: string;
+              name?: string;
+            };
+          })();
+      let valueBytes: Uint8Array | undefined;
+      if (!h.isString) {
+        using rawValue = h.getProp('value');
+        try {
+          valueBytes = serde.serialize(rawValue);
+        } catch (serializeErr) {
+          // A thrown value the codec cannot serialize must not mask the
+          // workflow failure itself, so fall back to the display fields.
+          runtimeLogger.warn(
+            'QuickJS runtime: failed to serialize thrown workflow error',
+            {
+              message:
+                serializeErr instanceof Error
+                  ? serializeErr.message
+                  : String(serializeErr),
+            }
+          );
+        }
+      }
+      const failed =
+        typeof errorObj === 'string'
+          ? { message: errorObj }
+          : {
+              message: errorObj.message,
+              stack: errorObj.stack || undefined,
+              name: errorObj.name || undefined,
+              valueBytes,
+            };
+      runtimeLogger.error('QuickJS runtime: workflow failed in VM', {
+        errorMessage: failed.message,
+        errorName: failed.name,
+        errorStack: failed.stack,
+      });
+      const drainOperations = collectDrainOperations(vm, serde);
+      vm.dispose();
+      return {
+        failed: {
+          ...failed,
+          ...(drainOperations.length > 0 ? { drainOperations } : {}),
+        },
+      };
+    }
+  }
+
+  // Check suspended: the workflow is suspended if there are active resolvers
+  // OR pending operations that haven't been created yet (e.g. hooks created
+  // upfront but not yet awaited)
+  {
+    using h = vm.evalCode(
+      'Object.keys(globalThis.__resolvers).length > 0 || globalThis.__pendingList().some(function(p){return!p.hasCreatedEvent;})'
+    );
+    if (vm.dump(h)) {
+      // Ops with an active resolver or without a created event are
+      // pending; abort-requested hooks are also surfaced (even when
+      // already created and unawaited) so the host records the abort.
+      const pendingOps = dumpPendingOps(
+        vm,
+        serde,
+        `globalThis.__pendingList().filter(function(p){return!!globalThis.__resolvers[p.correlationId] || !p.hasCreatedEvent || p.abortRequested;})`,
+        ensurePendingByteCache(vm)
+      );
+      if (!opts.keepAliveOnSuspend) vm.dispose();
+
+      return {
+        suspended: {
+          pendingOperations: pendingOps,
+        },
+      };
+    }
+  }
+
+  vm.dispose();
+  return { failed: { message: 'Workflow ended in unknown state' } };
+}
+
+// ---- Helpers ----
+
+function extractError(
+  vm: QuickJS,
+  err: unknown,
+  fallbackMessage: string
+): QuickJSRuntimeResult {
+  let message = fallbackMessage;
+  let stack: string | undefined;
+  let name: string | undefined;
+
+  if (err instanceof JSException) {
+    const error = vm.dump(err.handle) as Record<string, unknown> | null;
+    err.handle.dispose();
+    message = (error?.message as string) ?? err.message ?? fallbackMessage;
+    stack = (error?.stack as string) ?? err.stack;
+    name = (error?.name as string) ?? err.name;
+  } else if (err instanceof Error) {
+    message = err.message ?? fallbackMessage;
+    stack = err.stack;
+    name = err.name;
+  }
+
+  vm.dispose();
+  return {
+    failed: { message, stack, name },
+  };
+}
+
+/**
+ * Mutable interrupt budget for a VM. QuickJS polls the interrupt handler
+ * during JS execution; when it returns true, execution aborts. The budget
+ * bounds a single host->VM execution burst (bundle eval + event
+ * processing), not total VM lifetime: the inline-step loop keeps a VM
+ * alive across step executions that can legitimately take minutes, so the
+ * host resets the budget before each re-entry (see resetBudget calls).
+ *
+ * The per-burst ceiling is the same configurable budget as the node
+ * engine's ReplayBudget (REPLAY_TIMEOUT_MS, default 240s): a workflow
+ * whose replay the node engine handles fine must not be interrupted here
+ * by a lower hardcoded ceiling. The interrupt error escapes
+ * runQuickJSWorkflow and reaches the replay loop's catch in runtime.ts,
+ * which records run_failed.
+ */
+interface InterruptBudget {
+  start: number;
+}
+
+function createInterruptHandler(budget: InterruptBudget): () => boolean {
+  const timeout = getReplayTimeoutMs();
+  return () => Date.now() - budget.start > timeout;
+}

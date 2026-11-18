@@ -1,0 +1,995 @@
+/**
+ * Browser-safe serialization format utilities.
+ *
+ * This module contains the format prefix handling, generic hydrate/dehydrate
+ * dispatch, and shared types/classes used by all environments (runtime, web
+ * o11y, CLI o11y). It has NO Node.js dependencies.
+ */
+
+import { globalSingleton } from '@workflow/utils';
+import { getEventDataRefFields } from '@workflow/world/event-metadata';
+import { parse, unflatten } from 'devalue';
+
+// ---------------------------------------------------------------------------
+// Key material (browser-safe re-exports)
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-exported from the envelope layer so browser consumers (web dashboard,
+ * web-shared) can resolve key material without importing
+ * `@workflow/core/serialization`, whose module graph reaches Node built-ins
+ * (`node:util`, `node:async_hooks`) and cannot be bundled for the browser.
+ *
+ * Everything below is Web Crypto only: `serialization/encryption.ts`,
+ * `encryption.ts` and `sealed-box.ts` are all free of Node dependencies.
+ */
+export {
+  type DecryptionKey,
+  decrypt as decryptEnvelope,
+  deriveRunPayloadKeys,
+  encrypt as encryptEnvelope,
+  isRunPayloadKeys,
+  isSealTarget,
+  type PayloadKey,
+  type RunPayloadKeys,
+  runPayloadKeys,
+  type SealTarget,
+  sealTo,
+} from './serialization/encryption.js';
+
+// ---------------------------------------------------------------------------
+// Format prefix constants and encoding/decoding
+// ---------------------------------------------------------------------------
+
+export const SerializationFormat = {
+  /** devalue stringify/parse with TextEncoder/TextDecoder */
+  DEVALUE_V1: 'devl',
+  /** Encrypted payload (inner payload has its own format prefix after decryption) */
+  ENCRYPTED: 'encr',
+  /**
+   * Sealed payload: asymmetrically encrypted to a run's X25519 public key
+   * (inner payload has its own format prefix after opening).
+   *
+   * Written by cross-run writers that hold only the recipient run's public
+   * key. Opening it requires the run's private scalar rather than the
+   * symmetric per-run key, so o11y display treats it as ciphertext via
+   * {@link isEncryptedData} but {@link hydrateDataWithKey} does not attempt
+   * an AES-GCM decrypt on it.
+   */
+  SEALED: 'encp',
+  /** Gzip-compressed payload (inner payload has its own format prefix after decompression) */
+  GZIP: 'gzip',
+  /** Zstandard-compressed payload (inner payload has its own format prefix after decompression) */
+  ZSTD: 'zstd',
+} as const;
+
+export type SerializationFormatType =
+  (typeof SerializationFormat)[keyof typeof SerializationFormat];
+
+/** Length of the format prefix in bytes */
+const FORMAT_PREFIX_LENGTH = 4;
+
+const formatEncoder = new TextEncoder();
+const formatDecoder = new TextDecoder();
+
+/**
+ * Encode a payload with a format prefix.
+ */
+export function encodeWithFormatPrefix(
+  format: SerializationFormatType,
+  payload: Uint8Array | unknown
+): Uint8Array | unknown {
+  if (!(payload instanceof Uint8Array)) {
+    return payload;
+  }
+
+  const prefixBytes = formatEncoder.encode(format);
+  if (prefixBytes.length !== FORMAT_PREFIX_LENGTH) {
+    throw new Error(
+      `Format identifier must be exactly ${FORMAT_PREFIX_LENGTH} ASCII characters, got "${format}" (${prefixBytes.length} bytes)`
+    );
+  }
+
+  const result = new Uint8Array(FORMAT_PREFIX_LENGTH + payload.length);
+  result.set(prefixBytes, 0);
+  result.set(payload, FORMAT_PREFIX_LENGTH);
+  return result;
+}
+
+/**
+ * Decode a format-prefixed payload.
+ */
+export function decodeFormatPrefix(data: Uint8Array | unknown): {
+  format: SerializationFormatType;
+  payload: Uint8Array;
+} {
+  if (!(data instanceof Uint8Array)) {
+    return {
+      format: SerializationFormat.DEVALUE_V1,
+      payload: new TextEncoder().encode(JSON.stringify(data)),
+    };
+  }
+
+  if (data.length < FORMAT_PREFIX_LENGTH) {
+    throw new Error(
+      `Data too short to contain format prefix: expected at least ${FORMAT_PREFIX_LENGTH} bytes, got ${data.length}`
+    );
+  }
+
+  const prefixBytes = data.subarray(0, FORMAT_PREFIX_LENGTH);
+  const format = formatDecoder.decode(prefixBytes);
+
+  const knownFormats = Object.values(SerializationFormat) as string[];
+  if (!knownFormats.includes(format)) {
+    throw new Error(
+      `Unknown serialization format: "${format}". Known formats: ${knownFormats.join(', ')}`
+    );
+  }
+
+  const payload = data.subarray(FORMAT_PREFIX_LENGTH);
+  return { format: format as SerializationFormatType, payload };
+}
+
+// ---------------------------------------------------------------------------
+// Encrypted data detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Placeholder string displayed when data is encrypted and decryption
+ * has not been requested. Used by both CLI and web o11y.
+ */
+export const ENCRYPTED_PLACEHOLDER = '\u{1F512} Encrypted';
+
+// ---------------------------------------------------------------------------
+// Expired data detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if a plain object is `{ expiredAt: "<ISO date>" }`: a single-key
+ * object with a string `expiredAt` value.
+ */
+function isExpiredObject(data: unknown): data is { expiredAt: string } {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    return false;
+  }
+  const keys = Object.keys(data);
+  return (
+    keys.length === 1 &&
+    keys[0] === 'expiredAt' &&
+    typeof (data as Record<string, unknown>).expiredAt === 'string'
+  );
+}
+
+/**
+ * Check if a hydrated value is an expired data stub from the server.
+ *
+ * The server replaces expired ref fields with a devalue-encoded stub
+ * (`makeExpiredStub`) that deserializes to `[{ expiredAt: "<ISO date>" }]`
+ * after `unflatten` (array-wrapped due to backwards-compatible encoding).
+ * Also matches the unwrapped `{ expiredAt: "..." }` form for robustness.
+ */
+export function isExpiredStub(data: unknown): boolean {
+  // Direct object form: { expiredAt: "..." }
+  if (isExpiredObject(data)) return true;
+  // Array-wrapped form from devalue unflatten: [{ expiredAt: "..." }]
+  if (Array.isArray(data) && data.length === 1 && isExpiredObject(data[0])) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Check if a binary value is ciphertext: either a symmetrically encrypted
+ * payload ('encr') or a sealed cross-run payload ('encp').
+ *
+ * This is the predicate display layers want: both schemes are opaque bytes
+ * that must not be fed to the devalue parser, and both render as the same
+ * "Encrypted" affordance in the CLI and web UI. Use {@link isSealedData} when
+ * the *scheme* matters, notably when choosing a decryption path, since a
+ * sealed payload needs the run's private scalar rather than its symmetric key.
+ *
+ * Browser-safe: does not depend on the full serialization module.
+ */
+export function isEncryptedData(data: unknown): boolean {
+  if (!(data instanceof Uint8Array) || data.length < FORMAT_PREFIX_LENGTH) {
+    return false;
+  }
+  const prefix = formatDecoder.decode(data.subarray(0, FORMAT_PREFIX_LENGTH));
+  return (
+    prefix === SerializationFormat.ENCRYPTED ||
+    prefix === SerializationFormat.SEALED
+  );
+}
+
+/**
+ * Check if a binary value has the 'encp' format prefix, indicating a sealed
+ * (asymmetrically encrypted) cross-run payload.
+ *
+ * Browser-safe: does not depend on the full serialization module.
+ */
+export function isSealedData(data: unknown): boolean {
+  if (!(data instanceof Uint8Array) || data.length < FORMAT_PREFIX_LENGTH) {
+    return false;
+  }
+  const prefix = formatDecoder.decode(data.subarray(0, FORMAT_PREFIX_LENGTH));
+  return prefix === SerializationFormat.SEALED;
+}
+
+/**
+ * Check if a binary value has a compression format prefix ('gzip' or 'zstd').
+ * Browser-safe: does not depend on the full serialization module.
+ */
+export function isCompressedData(data: unknown): boolean {
+  if (!(data instanceof Uint8Array) || data.length < FORMAT_PREFIX_LENGTH) {
+    return false;
+  }
+  const prefix = formatDecoder.decode(data.subarray(0, FORMAT_PREFIX_LENGTH));
+  return (
+    prefix === SerializationFormat.GZIP || prefix === SerializationFormat.ZSTD
+  );
+}
+
+interface NodeZlibDecode {
+  gunzipSync?: (data: Uint8Array) => Uint8Array;
+  zstdDecompressSync?: (data: Uint8Array) => Uint8Array;
+}
+
+/**
+ * Resolve `node:zlib` via `process.getBuiltinModule`: no static Node
+ * dependency, invisible to browser bundlers. Returns undefined off Node.
+ */
+function getNodeZlib(): NodeZlibDecode | undefined {
+  try {
+    return (
+      globalThis as {
+        process?: { getBuiltinModule?: (id: string) => NodeZlibDecode };
+      }
+    ).process?.getBuiltinModule?.('node:zlib');
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Synchronously decompress a `gzip`/`zstd` payload when running on Node.js.
+ *
+ * Returns `undefined` when sync decompression isn't available (e.g. in the
+ * browser, or zstd on Node < 22.15); callers fall back to leaving the data
+ * un-hydrated (the async `hydrateDataWithKey` path handles decompression in
+ * browsers via `DecompressionStream` / a registered zstd decoder).
+ */
+function decompressSyncIfAvailable(
+  format: string,
+  payload: Uint8Array
+): Uint8Array | undefined {
+  try {
+    const zlib = getNodeZlib();
+    if (format === SerializationFormat.GZIP && zlib?.gunzipSync) {
+      return new Uint8Array(zlib.gunzipSync(payload));
+    }
+    if (format === SerializationFormat.ZSTD && zlib?.zstdDecompressSync) {
+      return new Uint8Array(zlib.zstdDecompressSync(payload));
+    }
+  } catch {
+    // Fall through: treat as unavailable
+  }
+  return undefined;
+}
+
+/**
+ * Browser zstd decoder, registered by the o11y host (web-shared) since the
+ * Web `DecompressionStream` has no zstd support. Node decodes via `node:zlib`
+ * and never needs this. See `registerZstdDecoder`.
+ */
+// On `globalThis` (see `globalSingleton`): the o11y host registers the decoder
+// once, and a per-copy slot would leave every other copy of this module without
+// one.
+const zstd = globalSingleton('@workflow/core//zstd.decoder', 1, () => ({
+  decoder: undefined as
+    | ((payload: Uint8Array) => Promise<Uint8Array>)
+    | undefined,
+}));
+
+/**
+ * Register a browser zstd decoder (e.g. a WASM-backed one). The web o11y UI
+ * calls this at init so `hydrateDataWithKey` can inflate zstd payloads after
+ * client-side decryption. Node readers use `node:zlib` and ignore this.
+ */
+export function registerZstdDecoder(
+  decoder: (payload: Uint8Array) => Promise<Uint8Array>
+): void {
+  zstd.decoder = decoder;
+}
+
+/**
+ * Asynchronously decompress a `gzip`/`zstd` payload.
+ * - gzip: web-standard `DecompressionStream` (Node 18+, browsers, edge).
+ * - zstd: `node:zlib` when on Node, else the registered browser decoder.
+ */
+async function decompressAsync(
+  format: string,
+  payload: Uint8Array
+): Promise<Uint8Array> {
+  if (format === SerializationFormat.ZSTD) {
+    const sync = decompressSyncIfAvailable(format, payload);
+    if (sync) return sync;
+    if (zstd.decoder) return zstd.decoder(payload);
+    throw new Error(
+      'zstd-compressed workflow data encountered but no zstd decoder is ' +
+        'available. Node.js 22.15+ decodes natively; in the browser register ' +
+        'one via registerZstdDecoder (the web o11y package does this).'
+    );
+  }
+
+  const transform = new DecompressionStream('gzip');
+  const writer = transform.writable.getWriter();
+  const writePromise = writer.write(payload).then(() => writer.close());
+  writePromise.catch(() => {});
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = transform.readable.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.length;
+  }
+  await writePromise;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+export { stateSourceId } from './serialization/state-refs.js';
+// ---------------------------------------------------------------------------
+export {
+  createStateResolver,
+  type StateResolver,
+} from './state-resolver.js';
+
+// Revivers type (shared across all environments)
+// ---------------------------------------------------------------------------
+
+/**
+ * A map of type name → reviver function, used by devalue's `parse`/`unflatten`.
+ * Each environment (runtime, web, CLI) provides its own set.
+ */
+export type Revivers = Record<string, (value: any) => any>;
+
+// ---------------------------------------------------------------------------
+// Generic hydrate/dehydrate dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * Hydrate (deserialize) a value that was stored in the database.
+ *
+ * Handles four data shapes:
+ * 1. `Uint8Array` with 'encr' prefix → returned as-is (encrypted, not yet decrypted)
+ * 2. `Uint8Array` with a format prefix (specVersion 2+) → decode prefix, parse
+ * 3. `Array` (legacy specVersion 1, "revived devalue") → unflatten
+ * 4. Other (already a plain JS value) → return as-is
+ *
+ * Encrypted data is intentionally left as a `Uint8Array` so that consumers
+ * (CLI, web UI) can detect it with `isEncryptedData()` and decide how to
+ * handle it: the CLI replaces it with a styled placeholder, the web UI
+ * renders an "Encrypted" card with a Decrypt button that triggers
+ * client-side decryption on demand.
+ */
+/**
+ * The field a step input from the Node VM workflow carries to say its
+ * workflow reads state records (`STATE_REFS_FIELD` in
+ * `serialization/state-refs.ts`). It's internal, so displays leave it out.
+ */
+const STATE_REFS_MARK = 'stateRefs';
+
+function withoutStateRefsMark(value: unknown): unknown {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    (value as Record<string, unknown>)[STATE_REFS_MARK] !== 1 ||
+    !('args' in value)
+  )
+    return value;
+  const { [STATE_REFS_MARK]: _mark, ...rest } = value as Record<
+    string,
+    unknown
+  >;
+  return rest;
+}
+
+export function hydrateData(value: unknown, revivers: Revivers): unknown {
+  if (value instanceof Uint8Array) {
+    // Encrypted data passes through untouched: o11y layers detect it with
+    // isEncryptedData() and handle display (web: named constructor object,
+    // CLI: EncryptedDataRef with util.inspect.custom).
+    if (isEncryptedData(value)) {
+      return value;
+    }
+
+    const { format, payload } = decodeFormatPrefix(value);
+    if (format === SerializationFormat.DEVALUE_V1) {
+      const str = new TextDecoder().decode(payload);
+      return withoutStateRefsMark(parse(str, revivers));
+    }
+    if (
+      format === SerializationFormat.GZIP ||
+      format === SerializationFormat.ZSTD
+    ) {
+      // Compressed payload: decompress synchronously when running on
+      // Node.js (CLI, server o11y). In browsers there is no sync codec;
+      // pass the data through untouched (like encrypted data) so async
+      // consumers can route it through `hydrateDataWithKey`, which
+      // decompresses via DecompressionStream / a registered zstd decoder.
+      const inflated = decompressSyncIfAvailable(format, payload);
+      if (inflated === undefined) {
+        return value;
+      }
+      // The inflated bytes carry their own format prefix (e.g. 'devl')
+      return hydrateData(inflated, revivers);
+    }
+    throw new Error(`Unsupported serialization format: ${format}`);
+  }
+
+  if (Array.isArray(value)) {
+    return unflatten(value, revivers);
+  }
+
+  // Already a plain JS value (e.g., number, string, null)
+  return value;
+}
+
+/**
+ * Hydrate a value, decrypting it first if an encryption key is provided.
+ *
+ * This is the async version of `hydrateData` that supports transparent
+ * decryption. Used by o11y tooling (web UI, CLI) when the user requests
+ * decryption.
+ *
+ * @param value - The value to hydrate (may be encrypted or sealed)
+ * @param revivers - Devalue revivers for deserialization
+ * @param key - The run's key material. Pass `RunPayloadKeys` (from
+ *   `deriveRunPayloadKeys`) to open both symmetric (`encr`) and sealed
+ *   (`encp`) payloads; a bare `CryptoKey` opens only the symmetric ones.
+ *   Typed as a read capability so a write-only seal target (which could open
+ *   neither scheme) is rejected at compile time rather than failing here.
+ */
+export async function hydrateDataWithKey(
+  value: unknown,
+  revivers: Revivers,
+  key: import('./serialization/encryption.js').DecryptionKey | undefined
+): Promise<unknown> {
+  // Delegate the (decrypted/decompressed) result to sync hydrateData
+  return hydrateData(await decodePayloadWithKey(value, key), revivers);
+}
+
+/**
+ * Decrypts (when `key` opens it) and decompresses a persisted payload, without
+ * hydrating it. A value that is not encrypted or compressed is returned as is;
+ * one `key` cannot open stays encrypted.
+ */
+export async function decodePayloadWithKey(
+  value: unknown,
+  key: import('./serialization/encryption.js').DecryptionKey | undefined
+): Promise<unknown> {
+  let data = value;
+  if (data instanceof Uint8Array && isEncryptedData(data) && key) {
+    // Envelope-aware decrypt: handles both `encr` (AES-GCM under the run's
+    // symmetric key) and `encp` (sealed to the run's X25519 public key by
+    // some other run), dispatching on the format prefix.
+    const { decrypt, isRunPayloadKeys } = await import(
+      './serialization/encryption.js'
+    );
+    // Opening a sealed payload needs the run's private scalar. If the caller
+    // supplied only a symmetric key, leave the bytes as ciphertext so the UI
+    // keeps showing its "Encrypted" affordance, rather than surfacing a
+    // decryption error for something that was never openable with this key.
+    if (!isSealedData(data) || isRunPayloadKeys(key)) {
+      data = await decrypt(data, key);
+    }
+  }
+  if (data instanceof Uint8Array && isCompressedData(data)) {
+    // Decompress: strip the codec prefix and inflate. gzip uses the
+    // web-standard DecompressionStream (works in browsers); zstd uses
+    // node:zlib on Node or the registered WASM decoder in the browser.
+    // The inflated bytes carry their own format prefix (e.g. 'devl').
+    const { format, payload } = decodeFormatPrefix(data);
+    data = await decompressAsync(format, payload);
+  }
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Shared marker types for o11y display
+// ---------------------------------------------------------------------------
+
+const STREAM_ID_PREFIX = 'strm_';
+
+/** Marker for stream reference objects rendered as links in the UI */
+export const STREAM_REF_TYPE = '__workflow_stream_ref__';
+
+/** A stream reference for UI display */
+export interface StreamRef {
+  __type: typeof STREAM_REF_TYPE;
+  streamId: string;
+}
+
+/** Marker for Run reference objects rendered as links in the UI */
+export const RUN_REF_TYPE = '__workflow_run_ref__';
+
+/** A Run reference for UI display */
+export interface RunRef {
+  __type: typeof RUN_REF_TYPE;
+  runId: string;
+}
+
+/** Check if a value is a RunRef object */
+export const isRunRef = (value: unknown): value is RunRef => {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    '__type' in value &&
+    value.__type === RUN_REF_TYPE &&
+    'runId' in value &&
+    typeof value.runId === 'string'
+  );
+};
+
+/** Convert a serialized Run value to a RunRef for display */
+export const serializedRunToRunRef = (value: { runId: string }): RunRef => {
+  return { __type: RUN_REF_TYPE, runId: value.runId };
+};
+
+/** Marker for custom class instance references */
+export const CLASS_INSTANCE_REF_TYPE = '__workflow_class_instance_ref__';
+
+/**
+ * A class instance reference for o11y display.
+ *
+ * Browser-safe base class: no `util.inspect.custom`. Environment-specific
+ * rendering (CLI inspect, web component) is handled by each consumer.
+ */
+export class ClassInstanceRef {
+  readonly __type = CLASS_INSTANCE_REF_TYPE;
+
+  constructor(
+    public readonly className: string,
+    public readonly classId: string,
+    public readonly data: unknown
+  ) {}
+
+  toJSON(): {
+    __type: string;
+    className: string;
+    classId: string;
+    data: unknown;
+  } {
+    return {
+      __type: this.__type,
+      className: this.className,
+      classId: this.classId,
+      data: this.data,
+    };
+  }
+}
+
+/** Check if a value is a ClassInstanceRef object */
+export const isClassInstanceRef = (
+  value: unknown
+): value is ClassInstanceRef => {
+  return (
+    value instanceof ClassInstanceRef ||
+    (value !== null &&
+      typeof value === 'object' &&
+      '__type' in value &&
+      value.__type === CLASS_INSTANCE_REF_TYPE &&
+      'className' in value &&
+      typeof value.className === 'string')
+  );
+};
+
+/** Check if a value is a stream ID string */
+export const isStreamId = (value: unknown): boolean => {
+  return typeof value === 'string' && value.startsWith(STREAM_ID_PREFIX);
+};
+
+/** Check if a value is a StreamRef object */
+export const isStreamRef = (value: unknown): value is StreamRef => {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    '__type' in value &&
+    value.__type === STREAM_REF_TYPE &&
+    'streamId' in value &&
+    typeof value.streamId === 'string'
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Shared o11y reviver helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert a serialized stream value to a StreamRef for display.
+ */
+export const streamToStreamRef = (value: any): StreamRef => {
+  let streamId: string;
+  if ('name' in value) {
+    const name = String(value.name);
+    if (!name.startsWith(STREAM_ID_PREFIX)) {
+      streamId = `${STREAM_ID_PREFIX}${name}`;
+    } else {
+      streamId = name;
+    }
+  } else {
+    streamId = `${STREAM_ID_PREFIX}null`;
+  }
+  return { __type: STREAM_REF_TYPE, streamId };
+};
+
+/** Convert a serialized step function to a display string */
+export const serializedStepFunctionToString = (value: unknown): string => {
+  if (!value) return 'null';
+  if (typeof value !== 'object') return 'null';
+  if ('stepId' in value) {
+    return `<step:${(value as { stepId: string }).stepId}>`;
+  }
+  return '<function>';
+};
+
+/** Extract the class name from a classId */
+export const extractClassName = (classId: string): string => {
+  if (!classId) return 'Unknown';
+  const parts = classId.split('/');
+  return parts[parts.length - 1] || classId;
+};
+
+/** Convert a serialized class instance to a ClassInstanceRef for display.
+ *  Run instances are special-cased to a RunRef for clickable rendering. */
+export const serializedInstanceToRef = (value: {
+  classId: string;
+  data: unknown;
+}): ClassInstanceRef | RunRef => {
+  const className = extractClassName(value.classId);
+  if (
+    className === 'Run' &&
+    value.data !== null &&
+    typeof value.data === 'object' &&
+    'runId' in value.data &&
+    typeof (value.data as { runId: unknown }).runId === 'string'
+  ) {
+    return serializedRunToRunRef(value.data as { runId: string });
+  }
+  return new ClassInstanceRef(className, value.classId, value.data);
+};
+
+/** Convert a serialized class reference to a display string */
+export const serializedClassToString = (value: { classId: string }): string => {
+  return `<class:${extractClassName(value.classId)}>`;
+};
+
+/**
+ * Standard o11y revivers that override runtime-specific types with
+ * display-friendly values. Used by both web and CLI hydration.
+ */
+export const observabilityRevivers: Revivers = {
+  ReadableStream: streamToStreamRef,
+  WritableStream: streamToStreamRef,
+  TransformStream: streamToStreamRef,
+  AbortController: (value: any) =>
+    `<AbortController(aborted: ${value.aborted})>`,
+  AbortSignal: (value: any) => `<AbortSignal(aborted: ${value.aborted})>`,
+  // DOMException needs an explicit reviver: without one, devalue.parse
+  // throws on the `["DOMException", ...]` tag and `hydrateStepIO`'s
+  // try/catch leaves the raw flat-encoded string in the UI. AbortController
+  // synthesizes a DOMException as the default `signal.reason` when abort()
+  // is called with no arg, so any abort that round-trips through a step
+  // boundary surfaces here. Reconstruct as a real DOMException when the
+  // global is available (modern browsers + Node 18+), else fall back to
+  // an Error preserving name/message/stack/cause for display.
+  DOMException: (value: {
+    message: string;
+    name: string;
+    stack?: string;
+    cause?: unknown;
+  }) => {
+    const G = globalThis as { DOMException?: typeof DOMException };
+    if (typeof G.DOMException === 'function') {
+      const e = new G.DOMException(value.message, value.name);
+      if (value.stack !== undefined) e.stack = value.stack;
+      if ('cause' in value) (e as { cause?: unknown }).cause = value.cause;
+      return e;
+    }
+    const e: Error & { cause?: unknown } = new Error(value.message);
+    e.name = value.name;
+    if (value.stack !== undefined) e.stack = value.stack;
+    if ('cause' in value) e.cause = value.cause;
+    return e;
+  },
+  StepFunction: serializedStepFunctionToString,
+  WorkflowFunction: (value: { workflowId: string }) =>
+    `<workflow:${value.workflowId}>`,
+  Instance: serializedInstanceToRef,
+  Class: serializedClassToString,
+  // frozen state records. A whole value displays as itself, as does a
+  // `source` record (hook payloads and run inputs written by earlier previews
+  // of this feature; current ones are stored unwrapped). A reference or a
+  // change needs the run's log to rebuild, so it displays as what it points to.
+  StateRefV1: (record: {
+    kind: string;
+    value?: unknown;
+    version?: string;
+    base?: string;
+    ops?: unknown;
+  }) =>
+    record.kind === 'source' || record.kind === 'full'
+      ? record.value
+      : record.kind === 'patch'
+        ? { [`<state change from ${record.base}>`]: record.ops }
+        : `<state ${record.version}>`,
+  StateSrcV1: ([id, path]: [string, (string | number)[]]) =>
+    `<same as ${id}${path.length ? `.${path.join('.')}` : ''}>`,
+};
+
+// ---------------------------------------------------------------------------
+// Resource-level hydration dispatch (for o11y)
+// ---------------------------------------------------------------------------
+
+/**
+ * Hydrate the data fields of a step resource.
+ */
+function hydrateStepIO<
+  T extends { stepId?: string; input?: any; output?: any; error?: any },
+>(resource: T, revivers: Revivers): T {
+  let hydratedInput = resource.input;
+  let hydratedOutput = resource.output;
+  let hydratedError = resource.error;
+
+  if (resource.input != null) {
+    try {
+      hydratedInput = hydrateData(resource.input, revivers);
+    } catch {
+      // Leave un-hydrated
+    }
+  }
+
+  if (resource.output != null) {
+    try {
+      hydratedOutput = hydrateData(resource.output, revivers);
+    } catch {
+      // Leave un-hydrated
+    }
+  }
+
+  // The `error` field is `SerializedData` (Uint8Array) produced by
+  // `dehydrateStepError`. Hydrate it so observability tools (CLI, web UI)
+  // can read `step.error.message`, `step.error.stack`, etc.
+  if (resource.error != null) {
+    try {
+      hydratedError = hydrateData(resource.error, revivers);
+    } catch {
+      // Leave un-hydrated
+    }
+  }
+
+  return {
+    ...resource,
+    input: hydratedInput,
+    output: hydratedOutput,
+    error: hydratedError,
+  };
+}
+
+/**
+ * Hydrate the data fields of a workflow run resource.
+ */
+function hydrateWorkflowIO<
+  T extends {
+    input?: any;
+    output?: any;
+    error?: any;
+    dynamicWorkflowCode?: any;
+  },
+>(resource: T, revivers: Revivers): T {
+  let hydratedInput = resource.input;
+  let hydratedOutput = resource.output;
+  let hydratedError = resource.error;
+  let hydratedDynamicWorkflowCode = resource.dynamicWorkflowCode;
+
+  if (resource.input != null) {
+    try {
+      hydratedInput = hydrateData(resource.input, revivers);
+    } catch {
+      // Leave un-hydrated
+    }
+  }
+
+  if (resource.output != null) {
+    try {
+      hydratedOutput = hydrateData(resource.output, revivers);
+    } catch {
+      // Leave un-hydrated
+    }
+  }
+
+  // The `error` field is `SerializedData` (Uint8Array) produced by
+  // `dehydrateRunError`. Hydrate it so observability tools (CLI, web UI)
+  // can read `run.error.message`, `run.error.stack`, etc.
+  if (resource.error != null) {
+    try {
+      hydratedError = hydrateData(resource.error, revivers);
+    } catch {
+      // Leave un-hydrated
+    }
+  }
+
+  // A dynamic run's own workflow code, stored through the same pipeline as
+  // `input`. Absent on every static run, so this is a no-op for them.
+  if (resource.dynamicWorkflowCode != null) {
+    try {
+      hydratedDynamicWorkflowCode = hydrateData(
+        resource.dynamicWorkflowCode,
+        revivers
+      );
+    } catch {
+      // Leave un-hydrated
+    }
+  }
+
+  return {
+    ...resource,
+    input: hydratedInput,
+    output: hydratedOutput,
+    error: hydratedError,
+    ...(resource.dynamicWorkflowCode != null
+      ? { dynamicWorkflowCode: hydratedDynamicWorkflowCode }
+      : {}),
+  };
+}
+
+/**
+ * Hydrate the eventData fields of an event resource.
+ */
+function hydrateEventData<
+  T extends { eventId?: string; eventType?: string; eventData?: any },
+>(resource: T, revivers: Revivers): T {
+  if (!resource.eventData) return resource;
+
+  const eventData = { ...resource.eventData };
+
+  for (const field of getEventDataRefFields(resource.eventType ?? '')) {
+    if (eventData[field] == null) continue;
+    try {
+      eventData[field] = hydrateData(eventData[field], revivers);
+    } catch {
+      // Leave un-hydrated
+    }
+  }
+
+  return { ...resource, eventData };
+}
+
+/**
+ * Hydrate the metadata field of a hook resource.
+ */
+function hydrateHookMetadata<T extends { hookId?: string; metadata?: any }>(
+  resource: T,
+  revivers: Revivers
+): T {
+  if (resource.metadata == null) return resource;
+
+  let hydratedMetadata = resource.metadata;
+  try {
+    hydratedMetadata = hydrateData(resource.metadata, revivers);
+  } catch {
+    // Leave un-hydrated
+  }
+
+  return { ...resource, metadata: hydratedMetadata };
+}
+
+/**
+ * Hydrate the serialized data fields of any resource for o11y display.
+ *
+ * Dispatches by resource type (step, hook, event, workflow) and calls
+ * `hydrateData` with the provided revivers for each data field.
+ *
+ * Each environment (web, CLI) provides its own revivers; this function
+ * only handles the dispatch logic and field mapping.
+ */
+export function hydrateResourceIO<
+  T extends {
+    stepId?: string;
+    hookId?: string;
+    eventId?: string;
+    eventType?: string;
+    input?: any;
+    output?: any;
+    metadata?: any;
+    eventData?: any;
+    executionContext?: any;
+  },
+>(resource: T, revivers: Revivers): T {
+  if (!resource) return resource;
+
+  let hydrated: T;
+  if ('stepId' in resource) {
+    hydrated = hydrateStepIO(resource, revivers);
+  } else if ('hookId' in resource) {
+    hydrated = hydrateHookMetadata(resource, revivers);
+  } else if ('eventId' in resource) {
+    hydrated = hydrateEventData(resource, revivers);
+  } else {
+    hydrated = hydrateWorkflowIO(resource, revivers);
+  }
+
+  // Strip executionContext, preserving only display-safe fields:
+  // workflowCoreVersion, and the VM engine + snapshot policy (which UIs use
+  // to tell whether a run was eligible for the QuickJS event limit
+  // exemption).
+  if ('executionContext' in hydrated) {
+    const { executionContext, ...rest } = hydrated;
+    const ctx =
+      executionContext && typeof executionContext === 'object'
+        ? (executionContext as Record<string, unknown>)
+        : undefined;
+    const preserved: Record<string, unknown> = {};
+    if (ctx?.workflowCoreVersion) {
+      preserved.workflowCoreVersion = ctx.workflowCoreVersion;
+    }
+    if (typeof ctx?.workflowVm === 'string') {
+      preserved.workflowVm = ctx.workflowVm;
+    }
+    if (typeof ctx?.snapshotThreshold === 'number') {
+      preserved.snapshotThreshold = ctx.snapshotThreshold;
+    }
+    return { ...rest, ...preserved } as unknown as T;
+  }
+
+  return hydrated;
+}
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+
+/** Extract all stream IDs from a value (recursively traverses objects/arrays) */
+export function extractStreamIds(obj: unknown): string[] {
+  const streamIds: string[] = [];
+  // The hydrated o11y data this walks comes from devalue, which supports
+  // circular and repeated references. Track visited containers so a cycle
+  // (e.g. a step result whose object refers back to itself) doesn't recurse
+  // forever and overflow the stack.
+  const seen = new WeakSet<object>();
+
+  function traverse(value: unknown): void {
+    if (isStreamId(value)) {
+      streamIds.push(value as string);
+    } else if (Array.isArray(value)) {
+      if (seen.has(value)) return;
+      seen.add(value);
+      for (const item of value) {
+        traverse(item);
+      }
+    } else if (value && typeof value === 'object') {
+      if (seen.has(value)) return;
+      seen.add(value);
+      for (const val of Object.values(value)) {
+        traverse(val);
+      }
+    }
+  }
+
+  traverse(obj);
+  return Array.from(new Set(streamIds));
+}
+
+/** Truncate a string to a maximum length, adding ellipsis if needed */
+export function truncateId(id: string, maxLength = 12): string {
+  if (id.length <= maxLength) return id;
+  return `${id.slice(0, maxLength)}...`;
+}

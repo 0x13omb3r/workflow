@@ -1,0 +1,33 @@
+{
+  "name": "@workflow/example-fastify",
+  "version": "0.0.0",
+  "private": true,
+  "description": "",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "generate:workflows": "node ../scripts/generate-workflows-registry.js",
+    "predev": "pnpm generate:workflows && pnpm copy:index",
+    "copy:index": "mkdir -p public && cp index.html public/index.html",
+    "prebuild": "pnpm generate:workflows && pnpm copy:index",
+    "postbuild": "rm -f public/index.html",
+    "build": "nitro build",
+    "dev": "nitro dev",
+    "start": "node .output/server/index.mjs"
+  },
+  "dependencies": {
+    "fastify": "^5.12.8",
+    "nitro": "catalog:"
+  },
+  "devDependencies": {
+    "@ai-sdk/workflow": "catalog:ai-sdk-v7",
+    "@types/node": "catalog:",
+    "@workflow/world-postgres": "workspace:*",
+    "ai": "catalog:ai-sdk-v7",
+    "lodash.chunk": "^4.2.0",
+    "openai": "^6.49.0",
+    "typescript": "catalog:",
+    "workflow": "workspace:*",
+    "zod": "catalog:"
+  }
+}

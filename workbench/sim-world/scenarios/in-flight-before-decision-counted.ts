@@ -1,0 +1,51 @@
+import type { ScenarioSpec } from '@workflow/world-sim';
+
+export const scenario: ScenarioSpec = {
+  id: 'in-flight-before-decision-counted',
+  name: 'in-flight: same tempo, in-band fence only, so an out-of-band hook supersedes nothing',
+  description:
+    'A hook in flight around the decision, against a single delivery with no ' +
+    'overlap (the scenario above adds one). The webhook receiver commits ' +
+    'its hook after the orchestrator has written its timeout and while its ' +
+    'branch decision (`step_started` for `settle`) is produced but not ' +
+    'committed. The in-band fence does not refuse that write: it counts only the ' +
+    'orchestrator’s own writes, and `hook_received` is out-of-band, so the ' +
+    'decision is accepted as made and the hook takes the log position after ' +
+    'the timeout. The log then says what the run did: the timer won the race, ' +
+    '`settle` ran, and the hook was consumed late, never as the race’s winner. ' +
+    '(An earlier out-of-band count guard refused this write and made the ' +
+    'orchestrator decide again.)',
+  workflow: 'stepCountForkWorkflow',
+  input: ['doc-30'],
+  script: async (sim) => {
+    const wf = sim.writer.orchestrator();
+    await wf.runToEventProduced('wait_completed');
+    const hook = await sim.beginHookDelivery('count:doc-30', {
+      approved: true,
+    });
+    const decision = await wf.runToEventProduced('step_started');
+    sim.check(
+      'the live pass decided the fork without the hook',
+      JSON.stringify(decision.ctx.request?.eventData).includes('settle')
+    );
+    await hook.commit();
+    const done = sim.until({ eventType: 'run_completed' });
+    await wf.release();
+    await done;
+
+    sim.check(
+      'nothing the orchestrator wrote was refused',
+      sim.world.rejections().length === 0
+    );
+    const events = sim.world.events();
+    const at = (type: string) => events.findIndex((e) => e.eventType === type);
+    sim.check(
+      'the log puts the timeout ahead of the hook, the order the run decided in',
+      at('wait_completed') < at('hook_received')
+    );
+  },
+  expect: {
+    status: 'completed',
+    output: 'reconciled(settled:doc-30)',
+  },
+};

@@ -1,0 +1,510 @@
+import {
+  decryptEnvelope,
+  deriveRunPayloadKeys,
+  hydrateData,
+  isEncryptedData,
+  type PayloadKey,
+  SerializationFormat,
+} from '@workflow/core/serialization-format';
+import { getStreamImageType, getWebRevivers } from '@workflow/web-shared';
+import type { WorkflowRunStatus } from '@workflow/world';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { EnvMap } from '~/lib/types';
+import { readStream } from '~/lib/workflow-api-client';
+
+export interface StreamChunk {
+  id: number;
+  /** Hydrated payload rendered by StreamViewer/DataInspector */
+  value: unknown;
+}
+
+const FRAME_HEADER_SIZE = 4;
+const ENCRYPTED_PLACEHOLDER = '[Encrypted]';
+const POLL_INTERVAL_MS = 3000;
+
+function isRunActive(status?: WorkflowRunStatus): boolean {
+  return status === 'pending' || status === 'running';
+}
+
+const yieldToMain = (): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, 0));
+
+const YIELD_EVERY_N_FRAMES = 64;
+
+/**
+ * Detect stream encoding from the first bytes.
+ *
+ * - **framed**: Current format — 4-byte big-endian length + format-prefixed
+ *   payload (`devl`/`encr`). The first uint32 is a plausible frame size.
+ * - **unframed**: One format-prefixed payload, such as an internal abort
+ *   packet. Network chunks must be joined before decoding the payload.
+ * - **legacy**: Older SDK versions used newline-delimited devalue strings
+ *   with no binary framing.
+ */
+type StreamEncoding = 'framed' | 'unframed' | 'legacy' | 'image';
+
+function detectEncoding(data: Uint8Array, streamId: string): StreamEncoding {
+  if (getStreamImageType(data)) return 'image';
+  if (data.length < FRAME_HEADER_SIZE) return 'legacy';
+  const prefix = new TextDecoder().decode(data.subarray(0, FRAME_HEADER_SIZE));
+  // Only internal abort streams store unframed serialized packets. A user
+  // text stream may begin with e.g. "encrypted", which shares the encr prefix.
+  if (
+    streamId.endsWith('_system_abort') &&
+    Object.values(SerializationFormat).some((format) => format === prefix)
+  ) {
+    return 'unframed';
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const len = view.getUint32(0, false);
+  if (len > 0 && len <= 10 * 1024 * 1024) return 'framed';
+  return 'legacy';
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  if (parts.length === 1) return parts[0];
+  const joined = new Uint8Array(
+    parts.reduce((length, part) => length + part.length, 0)
+  );
+  let offset = 0;
+  for (const part of parts) {
+    joined.set(part, offset);
+    offset += part.length;
+  }
+  return joined;
+}
+
+function hasSameImageBytes(previous: StreamChunk[], next: StreamChunk[]) {
+  const before = previous[0]?.value;
+  const after = next[0]?.value;
+  return (
+    previous.length === 1 &&
+    next.length === 1 &&
+    before instanceof Uint8Array &&
+    after instanceof Uint8Array &&
+    before.length === after.length &&
+    before.every((byte, index) => byte === after[index])
+  );
+}
+
+export function useStreamReader(
+  env: EnvMap,
+  streamId: string | null,
+  runId?: string,
+  encryptionKey?: Uint8Array | null,
+  runStatus?: WorkflowRunStatus
+) {
+  const [chunks, setChunks] = useState<StreamChunk[]>([]);
+  const [isLive, setIsLive] = useState(false);
+  const [isInitialLoading, setIsInitialLoading] = useState(
+    Boolean(streamId && runId)
+  );
+  const [error, setError] = useState<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const chunkIdRef = useRef(0);
+  const frameCountRef = useRef(0);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runStatusRef = useRef(runStatus);
+  runStatusRef.current = runStatus;
+  const serverCursorRef = useRef<string | null>(null);
+
+  const processFrame = useCallback(
+    async (
+      rawFrame: Uint8Array,
+      cryptoKey: PayloadKey | undefined,
+      revivers: ReturnType<typeof getWebRevivers>
+    ): Promise<
+      { encrypted: true } | { encrypted: false; chunk: StreamChunk }
+    > => {
+      let frameData = rawFrame;
+      // Safety net: if a chunk was stored with an extra inner length prefix
+      // (double-framing), strip it. In practice the format prefix bytes
+      // ("devl"=0x6465766c, "encr"=0x656e6372) decode to uint32 values >1B
+      // which fail the <= 10MB check, so this branch is rarely taken.
+      if (
+        frameData.length >= FRAME_HEADER_SIZE + 4 &&
+        !isEncryptedData(frameData)
+      ) {
+        const innerView = new DataView(
+          frameData.buffer,
+          frameData.byteOffset,
+          frameData.byteLength
+        );
+        const innerLen = innerView.getUint32(0, false);
+        if (
+          innerLen > 0 &&
+          innerLen <= 10 * 1024 * 1024 &&
+          innerLen === frameData.length - FRAME_HEADER_SIZE
+        ) {
+          frameData = frameData.slice(FRAME_HEADER_SIZE);
+        }
+      }
+
+      let hydrated: unknown;
+      try {
+        if (isEncryptedData(frameData)) {
+          if (!cryptoKey) {
+            return { encrypted: true };
+          }
+          // Envelope-aware: frames may be symmetric ('encr', written by the
+          // run itself) or sealed ('encp', written by another run into a
+          // forwarded stream). `decryptEnvelope` dispatches on the prefix and
+          // strips it, so no manual slice here.
+          hydrated = hydrateData(
+            (await decryptEnvelope(frameData, cryptoKey)) as Uint8Array,
+            revivers
+          );
+        } else {
+          hydrated = hydrateData(frameData, revivers);
+        }
+      } catch {
+        hydrated = ENCRYPTED_PLACEHOLDER;
+      }
+
+      const chunkId = chunkIdRef.current++;
+      return { encrypted: false, chunk: { id: chunkId, value: hydrated } };
+    },
+    []
+  );
+
+  useEffect(() => {
+    setChunks([]);
+    setError(null);
+    setIsLive(false);
+    setIsInitialLoading(Boolean(streamId && runId));
+    chunkIdRef.current = 0;
+    frameCountRef.current = 0;
+    serverCursorRef.current = null;
+
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+
+    if (!streamId || !runId) {
+      setIsInitialLoading(false);
+      return;
+    }
+
+    let mounted = true;
+    let isImageStream = false;
+    let imageChunkId: number | undefined;
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
+    const revivers = getWebRevivers();
+
+    const parseLegacyLine = (line: string): StreamChunk => {
+      const chunkId = chunkIdRef.current++;
+      let value: unknown;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        value = line;
+      }
+      return { id: chunkId, value };
+    };
+
+    /**
+     * Fetch stream data and parse frames.
+     *
+     * When `cursor` is provided, the server only returns chunks after that
+     * position (incremental fetch). `skipFrames` skips N frames from the
+     * response to handle the overlap from cursor-based pagination.
+     */
+    const fetchAndParse = async (
+      targetBuffer: StreamChunk[],
+      cryptoKey: PayloadKey | undefined,
+      options?: { skipFrames?: number; cursor?: string | null }
+    ): Promise<
+      | { encrypted: true }
+      | {
+          encrypted: false;
+          image: boolean;
+          frameCount: number;
+          cursor: string | null;
+          done: boolean;
+        }
+    > => {
+      const streamResponse = await readStream(
+        env,
+        streamId,
+        runId,
+        abortController.signal,
+        isImageStream ? undefined : (options?.cursor ?? undefined)
+      );
+
+      const skipFrames = isImageStream ? 0 : (options?.skipFrames ?? 0);
+      const reader = streamResponse.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = new Uint8Array(0);
+      let encoding: StreamEncoding | null = null;
+      let textRemainder = '';
+      // Image reads are joined once at the end: growing one buffer per read
+      // copies the image repeatedly and stalls large previews.
+      const imageParts: Uint8Array[] = [];
+      let frameIndex = 0;
+
+      const appendToBuffer = (data: Uint8Array) => {
+        const newBuffer = new Uint8Array(buffer.length + data.length);
+        newBuffer.set(buffer, 0);
+        newBuffer.set(data, buffer.length);
+        buffer = newBuffer;
+      };
+
+      for (;;) {
+        if (abortController.signal.aborted) break;
+
+        const { value, done } = await reader.read();
+        if (done) {
+          if (encoding === null && buffer.length > 0) {
+            // Refetch a short open stream before deciding whether its
+            // incomplete signature is image bytes or legacy text.
+            if (!streamResponse.done && buffer.length < 12) break;
+            encoding = detectEncoding(buffer, streamId);
+            if (encoding === 'legacy') textRemainder = decoder.decode(buffer);
+          }
+          if (encoding === 'image') {
+            imageChunkId ??= chunkIdRef.current++;
+            frameIndex++;
+            targetBuffer.push({
+              id: imageChunkId,
+              value: concatBytes([buffer, ...imageParts]),
+            });
+          } else if (encoding === 'unframed' && buffer.length > 0) {
+            frameIndex++;
+            if (frameIndex > skipFrames) {
+              const result = await processFrame(buffer, cryptoKey, revivers);
+              if (result.encrypted) return { encrypted: true };
+              targetBuffer.push(result.chunk);
+            }
+          } else if (encoding === 'legacy') {
+            textRemainder += decoder.decode();
+            for (const line of textRemainder.split('\n')) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              frameIndex++;
+              if (frameIndex > skipFrames) {
+                targetBuffer.push(parseLegacyLine(trimmed));
+              }
+            }
+            textRemainder = '';
+          }
+          break;
+        }
+
+        if (encoding === null) {
+          appendToBuffer(value);
+          if (buffer.length >= FRAME_HEADER_SIZE) {
+            const detected = detectEncoding(buffer, streamId);
+            // Frame headers are distinguishable after four bytes; WebP
+            // needs twelve bytes before a stream can be decoded as text.
+            if (
+              detected === 'framed' ||
+              detected === 'unframed' ||
+              buffer.length >= 12
+            )
+              encoding = detected;
+          }
+          if (encoding === 'legacy') {
+            textRemainder = decoder.decode(buffer, { stream: true });
+            buffer = new Uint8Array(0);
+          }
+        } else if (encoding === 'legacy') {
+          textRemainder += decoder.decode(value, { stream: true });
+        } else if (encoding === 'image') {
+          imageParts.push(value);
+        } else {
+          appendToBuffer(value);
+        }
+
+        if (encoding === 'legacy') {
+          const lines = textRemainder.split('\n');
+          textRemainder = lines.pop() ?? '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed) {
+              frameIndex++;
+              if (frameIndex > skipFrames) {
+                targetBuffer.push(parseLegacyLine(trimmed));
+              }
+            }
+          }
+          continue;
+        }
+
+        if (
+          encoding === null ||
+          encoding === 'unframed' ||
+          encoding === 'image'
+        )
+          continue;
+
+        let offset = 0;
+        let framesInBatch = 0;
+
+        while (offset + FRAME_HEADER_SIZE <= buffer.length) {
+          const view = new DataView(
+            buffer.buffer,
+            buffer.byteOffset + offset,
+            buffer.byteLength - offset
+          );
+          const frameLength = view.getUint32(0, false);
+
+          if (frameLength === 0 || frameLength > 10 * 1024 * 1024) {
+            break;
+          }
+
+          if (offset + FRAME_HEADER_SIZE + frameLength > buffer.length) {
+            break;
+          }
+
+          const frameData = buffer.slice(
+            offset + FRAME_HEADER_SIZE,
+            offset + FRAME_HEADER_SIZE + frameLength
+          );
+          offset += FRAME_HEADER_SIZE + frameLength;
+
+          frameIndex++;
+          if (frameIndex <= skipFrames) {
+            continue;
+          }
+
+          const result = await processFrame(frameData, cryptoKey, revivers);
+          if (result.encrypted) {
+            reader.cancel().catch(() => {});
+            return { encrypted: true };
+          }
+          targetBuffer.push(result.chunk);
+
+          framesInBatch++;
+          if (framesInBatch % YIELD_EVERY_N_FRAMES === 0) {
+            await yieldToMain();
+            if (abortController.signal.aborted || !mounted) break;
+          }
+        }
+
+        buffer = buffer.slice(offset);
+      }
+
+      isImageStream ||= encoding === 'image';
+      return {
+        encrypted: false,
+        image: isImageStream,
+        frameCount: frameIndex,
+        cursor: encoding === null ? null : streamResponse.cursor,
+        done: streamResponse.done,
+      };
+    };
+
+    const readStreamData = async () => {
+      try {
+        // Full capability so sealed ('encp') frames written by other runs
+        // decrypt too, not just this run's own symmetric frames.
+        const cryptoKey = encryptionKey
+          ? await deriveRunPayloadKeys(encryptionKey)
+          : undefined;
+
+        const initialChunks: StreamChunk[] = [];
+        const result = await fetchAndParse(initialChunks, cryptoKey);
+
+        if (result.encrypted) {
+          if (mounted) {
+            setError('This stream is encrypted. Click Decrypt to view.');
+            setIsLive(false);
+            setIsInitialLoading(false);
+          }
+          return;
+        }
+
+        frameCountRef.current = result.frameCount;
+        serverCursorRef.current = result.cursor;
+
+        if (!mounted || abortController.signal.aborted) return;
+
+        setChunks(initialChunks);
+        setIsInitialLoading(false);
+
+        // If the stream itself is done, no need to poll regardless of run status
+        if (result.done) {
+          setIsLive(false);
+          return;
+        }
+
+        if (isRunActive(runStatusRef.current)) {
+          setIsLive(true);
+          const poll = async () => {
+            if (!mounted || abortController.signal.aborted) return;
+            try {
+              const newChunks: StreamChunk[] = [];
+              const pollResult = await fetchAndParse(newChunks, cryptoKey, {
+                cursor: serverCursorRef.current,
+                skipFrames: frameCountRef.current,
+              });
+              if (!pollResult.encrypted) {
+                frameCountRef.current = pollResult.frameCount;
+                if (pollResult.cursor) {
+                  serverCursorRef.current = pollResult.cursor;
+                }
+                if (newChunks.length > 0 && mounted) {
+                  // Images are one binary value, refreshed from the start
+                  // rather than parsed as frames after a storage cursor.
+                  // Keep the current preview when an open image stream has
+                  // no new bytes, so it isn't reloaded on every poll.
+                  setChunks((prev) => {
+                    if (!pollResult.image) return [...prev, ...newChunks];
+                    return hasSameImageBytes(prev, newChunks)
+                      ? prev
+                      : newChunks;
+                  });
+                }
+                if (pollResult.done) {
+                  setIsLive(false);
+                  return;
+                }
+              }
+            } catch (err) {
+              console.warn('Stream poll error:', err);
+            }
+            if (mounted && !abortController.signal.aborted) {
+              pollTimerRef.current = setTimeout(poll, POLL_INTERVAL_MS);
+            }
+          };
+          pollTimerRef.current = setTimeout(poll, POLL_INTERVAL_MS);
+        } else {
+          setIsLive(false);
+        }
+      } catch (err) {
+        if (abortController.signal.aborted) return;
+        if (mounted) {
+          setError(err instanceof Error ? err.message : String(err));
+          setIsLive(false);
+          setIsInitialLoading(false);
+        }
+      }
+    };
+
+    void readStreamData();
+
+    return () => {
+      mounted = false;
+      abortController.abort();
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [env, streamId, runId, encryptionKey, processFrame]);
+
+  // When run finishes, stop polling
+  useEffect(() => {
+    if (!isRunActive(runStatus) && pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+      setIsLive(false);
+    }
+  }, [runStatus]);
+
+  return { chunks, isLive, isInitialLoading, error };
+}

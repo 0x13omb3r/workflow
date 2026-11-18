@@ -1,14 +1,50 @@
+import type { StandardSchemaV1 } from '@standard-schema/spec';
 import type { Hook as HookEntity } from '@workflow/world';
+import { throwNotInWorkflowContext } from './context-errors.js';
 import type { Hook, HookOptions } from './create-hook.js';
 import { resumeHook } from './runtime/resume-hook.js';
 
 /**
+ * A typed hook interface for type-safe hook creation and resumption.
+ */
+export interface TypedHook<TInput, TOutput> {
+  /**
+   * Creates a new hook with the defined output type.
+   *
+   * Note: This method is not available in runtime bundles. Use it from workflow contexts only.
+   *
+   * @param options - Optional hook configuration
+   * @returns A Hook that resolves to the defined output type
+   */
+  create(options?: HookOptions): Hook<TOutput>;
+  /**
+   * Resumes a hook by sending a payload with the defined input type.
+   * This is a type-safe wrapper around the `resumeHook` runtime function.
+   *
+   * @param token - The unique token identifying the hook
+   * @param payload - The payload to send; if a `schema` is configured it is validated/transformed before resuming
+   * @returns Promise resolving to the hook entity
+   * @throws Error if the hook is not found or if there's an error during the process
+   */
+  resume(token: string, payload: TInput): Promise<HookEntity>;
+}
+
+export namespace TypedHook {
+  /**
+   * Extracts the input type from a {@link TypedHook}
+   */
+  export type Input<T extends TypedHook<any, any>> =
+    T extends TypedHook<infer I, any> ? I : never;
+}
+
+/**
  * Defines a typed hook for type-safe hook creation and resumption.
  *
- * This helper provides type safety by allowing you to define the payload type once
- * and reuse it when creating hooks and resuming them.
+ * This helper provides type safety by allowing you to define the input and output types
+ * for the hook's payload, with optional validation and transformation via a schema.
  *
- * @returns An object with `create` and `resume` functions pre-typed with the payload type
+ * @param schema - Schema used to validate and transform the input payload before resuming
+ * @returns An object with `create` and `resume` functions pre-typed with the input and output types
  *
  * @example
  *
@@ -21,44 +57,65 @@ import { resumeHook } from './runtime/resume-hook.js';
  *   "use workflow";
  *
  *   const hook = approvalHook.create();
- *   const result = await hook; // Fully typed as { approved: boolean; comment: string }
+ *   const result = await hook; // Fully typed as { approved: boolean; comment: string; }
  * }
  *
  * // In an API route
  * export async function POST(request: Request) {
  *   const { token, approved, comment } = await request.json();
- *   await approvalHook.resume(token, { approved, comment });
+ *   await approvalHook.resume(token, { approved, comment }); // Input type
  *   return Response.json({ success: true });
  * }
  * ```
  */
-export function defineHook<T>() {
-  return {
-    /**
-     * Creates a new hook with the defined payload type.
-     *
-     * Note: This method is not available in runtime bundles. Use it from workflow contexts only.
-     *
-     * @param _options - Optional hook configuration
-     * @returns A Hook that resolves to the defined payload type
-     */
-    // @ts-expect-error `options` is here for types/docs
-    create(options?: HookOptions): Hook<T> {
-      throw new Error(
-        '`defineHook().create()` can only be called inside a workflow function.'
-      );
-    },
+export function defineHook<TInput, TOutput = TInput>({
+  schema,
+}: {
+  schema?: StandardSchemaV1<TInput, TOutput>;
+} = {}): TypedHook<TInput, TOutput> {
+  function create(_options?: HookOptions): Hook<TOutput> {
+    // NOTE: `create` is referenced by name (not `this.create`) so the stack
+    // strip still works if the caller destructured the hook (`const { create }
+    // = defineHook(); create()`), since in that case `this` is undefined.
+    throwNotInWorkflowContext(
+      'defineHook().create()',
+      'https://workflow-sdk.dev/docs/api-reference/workflow/define-hook',
+      create
+    );
+  }
 
-    /**
-     * Resumes a hook by sending a payload with the defined type.
-     * This is a type-safe wrapper around the `resumeHook` runtime function.
-     *
-     * @param token - The unique token identifying the hook
-     * @param payload - The payload to send (must match the defined type)
-     * @returns Promise resolving to the hook entity, or null if the hook doesn't exist
-     */
-    resume(token: string, payload: T): Promise<HookEntity | null> {
-      return resumeHook<T>(token, payload);
+  return {
+    create,
+    async resume(token: string, payload: TInput): Promise<HookEntity> {
+      if (!schema?.['~standard']) {
+        return await resumeHook(token, payload);
+      }
+
+      let result = schema['~standard'].validate(payload);
+      if (result instanceof Promise) {
+        result = await result;
+      }
+
+      // if the `issues` field exists, the validation failed
+      if (result.issues) {
+        const lines = result.issues.map((issue) => {
+          const path = issue.path
+            ?.map((segment) =>
+              typeof segment === 'object' && segment !== null
+                ? String((segment as { key: PropertyKey }).key)
+                : String(segment)
+            )
+            .join('.');
+          return path
+            ? `  at "${path}": ${issue.message}`
+            : `  ${issue.message}`;
+        });
+        throw new Error(
+          `Hook payload did not match the defined schema:\n${lines.join('\n')}`
+        );
+      }
+
+      return await resumeHook<TOutput>(token, result.value);
     },
   };
 }

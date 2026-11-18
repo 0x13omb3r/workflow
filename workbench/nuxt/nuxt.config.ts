@@ -1,12 +1,9 @@
-import { defineNuxtConfig } from 'nuxt/config';
-import { workflowRollupPlugin } from 'workflow/rollup-plugin';
+import { fileURLToPath } from 'node:url';
 
 export default defineNuxtConfig({
   compatibilityDate: 'latest',
-  nitro: {
-    modules: ['workflow/nitro'],
-  },
-  rollupConfig: {
-    plugins: [workflowRollupPlugin()],
+  modules: ['workflow/nuxt'],
+  alias: {
+    '@repo': fileURLToPath(new URL('../../', import.meta.url)),
   },
 });

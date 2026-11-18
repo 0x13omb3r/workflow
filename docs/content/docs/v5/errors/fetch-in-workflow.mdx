@@ -1,0 +1,102 @@
+---
+title: fetch-in-workflow
+description: Make HTTP requests from step functions instead of workflow functions.
+type: troubleshooting
+summary: Resolve the fetch-in-workflow error by moving HTTP requests into a step function.
+prerequisites:
+  - /docs/foundations/workflows-and-steps
+related:
+  - /docs/api-reference/workflow/fetch
+---
+
+<CopyPrompt
+  text="Fix `fetch` usage inside workflow functions. Search workflow files for direct global `fetch(...)` calls and libraries such as AI SDK calls that use fetch. For basic HTTP calls inside a `&quot;use workflow&quot;` function, import `{ fetch }` from `workflow` and replace the global call. For SDK/client calls that need normal Node.js or provider behavior, move the call into a helper function with `&quot;use step&quot;` and call that step from the workflow. Keep all step inputs and outputs serializable. Verify the workflow starts and replays without the fetch-in-workflow error."
+/>
+
+This error occurs when you try to use `fetch()` directly in a workflow function, or when a library (like the AI SDK) tries to call `fetch()` under the hood.
+
+## Error message
+
+```text
+Global "fetch" is unavailable in workflow functions. Use the "fetch" step function from "workflow" to make HTTP requests.
+```
+
+## Why this happens
+
+Workflow functions run in a sandboxed environment without direct access to `fetch()`.
+
+Many libraries make HTTP requests under the hood. For example, the AI SDK's `generateText()` function calls `fetch()` to make HTTP requests to AI providers. When these libraries run inside a workflow function, they fail because the global `fetch` is not available.
+
+## Quick fix
+
+Move the code that makes the request into a step function, and call that step from the workflow. Steps have full Node.js access, so `fetch()` and libraries that call it work as usual.
+
+**Before:**
+
+```typescript lineNumbers title="workflows/ai.ts"
+import { generateText } from "ai";
+
+export async function chatWorkflow(prompt: string) {
+  "use workflow";
+
+  // Error - generateText() calls fetch() under the hood
+  const result = await generateText({ // [!code highlight]
+    model: "spacexai/grok-4.6", // [!code highlight]
+    prompt, // [!code highlight]
+  }); // [!code highlight]
+
+  return result.text;
+}
+```
+
+**After:**
+
+```typescript lineNumbers title="workflows/ai.ts"
+import { generateText } from "ai";
+
+async function generate(prompt: string) {
+  "use step"; // [!code highlight]
+
+  // generateText calls fetch() under the hood
+  const result = await generateText({
+    model: "spacexai/grok-4.6",
+    prompt,
+  });
+
+  return result.text;
+}
+
+export async function chatWorkflow(prompt: string) {
+  "use workflow";
+
+  return await generate(prompt); // [!code highlight]
+}
+```
+
+## Common scenarios
+
+### AI SDK integration
+
+For agents, use AI SDK's [`WorkflowAgent`](https://ai-sdk.dev/v7/docs/agents/workflow-agent#workflowagent) or [`HarnessAgent`](https://ai-sdk.dev/v7/docs/ai-sdk-harnesses/workflow-utilities), which run model calls as steps.
+
+For single AI SDK calls, use a step function as shown above.
+
+### Direct API calls
+
+For simple requests, you can use the `fetch` step function from `workflow` directly:
+
+```typescript lineNumbers
+import { fetch } from "workflow";
+
+export async function dataWorkflow() {
+  "use workflow";
+
+  // Use fetch directly for HTTP requests
+  const response = await fetch("https://api.example.com/data"); // [!code highlight]
+  const data = await response.json();
+
+  return data;
+}
+```
+
+For more details on the `fetch` step function, see the [fetch API reference](/docs/api-reference/workflow/fetch).

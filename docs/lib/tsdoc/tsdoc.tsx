@@ -1,13 +1,13 @@
+import { Callout } from '@vercel/geistdocs/components/callout';
 import cn from 'clsx';
 import Slugger from 'github-slugger';
 import Link from 'next/link';
 import type { FC, ReactElement, ReactNode } from 'react';
-import { Callout } from '@/components/ui/callout';
-import type { generateDefinition } from './base';
+import { generateDefinition } from './base';
 import type { GeneratedFunction, TypeField } from './types';
 
 type TSDocProps = {
-  definition: ReturnType<typeof generateDefinition>;
+  definition: string;
   typeLinkMap?: Record<string, string>;
   noParametersContent?: ReactNode;
   showSections: ('parameters' | 'returns' | 'throws')[];
@@ -17,21 +17,35 @@ const classes = {
   card: cn('rounded-sm transition-colors'),
   anchor: cn(
     'absolute top-2 right-2 text-lg font-black',
-    'before:content-["#"] hover:text-foreground',
+    'before:content-["#"] hover:text-gray-1000',
     'px-2 py-1 opacity-0 group-hover:opacity-100 transition-opacity'
   ),
 };
 
 export const TSDoc: FC<TSDocProps> = ({
-  definition,
+  definition: rawDefinition,
   typeLinkMap = {},
   noParametersContent = (
-    <p className="text-muted-foreground">
+    <p className="text-gray-900">
       This function does not accept any parameters.
     </p>
   ),
   showSections = ['parameters', 'returns'],
 }) => {
+  let definition: ReturnType<typeof generateDefinition>;
+
+  try {
+    definition = generateDefinition({
+      code: rawDefinition,
+    });
+  } catch (error) {
+    return (
+      <Callout type="warn">
+        Could not generate the API signature for this reference entry.
+        {error instanceof Error ? ` ${error.message}` : null}
+      </Callout>
+    );
+  }
   const showParameters = showSections.includes('parameters');
   const showReturns = showSections.includes('returns');
   const showThrows = showSections.includes('throws');
@@ -85,7 +99,7 @@ function FunctionSignature({
   showReturns = true,
   showThrows = true,
   noParametersContent = (
-    <p className="text-muted-foreground">
+    <p className="text-gray-900">
       This function does not accept any parameters.
     </p>
   ),
@@ -149,7 +163,7 @@ function FunctionSignature({
                 'text-sm relative p-3 border before:content-["Type:_"]'
               )}
             >
-              <code className="bg-muted px-1.5 py-0.5 rounded text-sm">
+              <code className="bg-gray-100 px-1.5 py-0.5 rounded text-sm">
                 {linkify(signature.returns.type, typeLinkMap)}
               </code>
             </div>
@@ -176,7 +190,7 @@ function FunctionSignature({
                   return (
                     <Row key={id} id={id}>
                       <td className="relative table-cell pr-3">
-                        <code className="bg-muted px-1.5 py-0.5 rounded text-xs whitespace-nowrap my-0">
+                        <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs whitespace-nowrap my-0">
                           {linkify(type, typeLinkMap)}
                         </code>
                       </td>
@@ -193,7 +207,7 @@ function FunctionSignature({
               </tbody>
             </table>
           ) : (
-            <p className="text-muted-foreground">
+            <p className="text-gray-900">
               This function does not throw any errors.
             </p>
           )}
@@ -226,7 +240,7 @@ const NameCell: FC<{
       {name && (
         <code
           className={cn(
-            'bg-muted px-1.5 py-0.5 rounded text-xs whitespace-nowrap my-0',
+            'bg-gray-100 px-1.5 py-0.5 rounded text-xs whitespace-nowrap my-0',
             optional && 'after:content-["?"]'
           )}
         >
@@ -327,13 +341,9 @@ function linkify(
             if (i % 2 === 1) {
               // It's code
               return (
-                <Link
-                  key={`link-code-${parts.length}-${i}`}
-                  href={linkUrl}
-                  className="text-primary-foreground"
-                >
-                  <code className="text-xs">{part}</code>
-                </Link>
+                <code key={`code-${parts.length}-${i}`} className="text-xs">
+                  {part}
+                </code>
               );
             }
             return part;
@@ -341,7 +351,7 @@ function linkify(
           .filter(Boolean);
 
         parts.push(
-          <Link key={parts.length} href={linkUrl}>
+          <Link key={parts.length} href={linkUrl} className="text-primary-blue">
             {linkContent}
           </Link>
         );
@@ -358,7 +368,7 @@ function linkify(
       parts.push(
         <code
           key={parts.length}
-          className="bg-muted px-1 py-0.5 rounded text-xs"
+          className="bg-gray-100 px-1 py-0.5 rounded text-xs"
         >
           {codeText}
         </code>
@@ -380,14 +390,12 @@ function linkify(
     const chunks = text.match(/(\w+|\W+)/g) || [];
 
     for (const chunk of chunks) {
-      const href = typeLinkMap[chunk];
+      const href = Object.hasOwn(typeLinkMap, chunk)
+        ? typeLinkMap[chunk]
+        : undefined;
       if (href) {
         result.push(
-          <Link
-            key={result.length}
-            href={href}
-            className="text-primary-foreground"
-          >
+          <Link key={result.length} href={href} className="text-primary-blue">
             {chunk}
           </Link>
         );
@@ -411,13 +419,15 @@ function linkify(
     const processedChunks: (string | ReactElement)[] = [];
 
     for (const chunk of chunks) {
-      const href = typeLinkMap[chunk];
+      const href = Object.hasOwn(typeLinkMap, chunk)
+        ? typeLinkMap[chunk]
+        : undefined;
       if (href) {
         processedChunks.push(
           <Link
             key={`${index}-${processedChunks.length}`}
             href={href}
-            className="text-primary-foreground hover:underline"
+            className="text-primary-blue hover:underline"
           >
             <code>{chunk}</code>
           </Link>

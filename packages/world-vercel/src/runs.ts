@@ -1,60 +1,141 @@
-import { WorkflowAPIError, WorkflowRunNotFoundError } from '@workflow/errors';
+import { WorkflowRunNotFoundError, WorkflowWorldError } from '@workflow/errors';
+import { globalSingleton } from '@workflow/utils';
 import {
+  type AttributeChange,
+  type BulkCancelWorkflowRunsRequest,
+  BulkCancelWorkflowRunsRequestSchema,
+  type BulkCancelWorkflowRunsResult,
+  BulkCancelWorkflowRunsResultSchema,
   type CancelWorkflowRunParams,
   type CreateWorkflowRunRequest,
+  type ExperimentalSetAttributesResult,
   type GetWorkflowRunParams,
   type ListWorkflowRunsParams,
   type PaginatedResponse,
   PaginatedResponseSchema,
-  type PauseWorkflowRunParams,
-  type ResumeWorkflowRunParams,
-  type UpdateWorkflowRunRequest,
+  SerializedDataSchema,
+  type WaitForTerminalRunStatusParams,
   type WorkflowRun,
-  WorkflowRunSchema,
+  WorkflowRunBaseSchema,
+  type WorkflowRunWithoutData,
 } from '@workflow/world';
 import { z } from 'zod';
+import { getRequestTimeoutMs } from './http-core.js';
+import { normalizeWorkflowRunData } from './serialized-data.js';
 import type { APIConfig } from './utils.js';
 import {
   DEFAULT_RESOLVE_DATA_OPTION,
-  dateToStringReplacer,
+  deserializeError,
+  getHttpUrl,
   makeRequest,
 } from './utils.js';
 
-// Local schema for lazy mode with refs instead of data
-const WorkflowRunWithRefsSchema = WorkflowRunSchema.omit({
+/**
+ * Wire format schema for workflow runs coming from the backend.
+ *
+ * `error` is SerializedData produced by `dehydrateRunError` in the new
+ * (specVersion >= 2) format. For backward compatibility with legacy
+ * records, we also accept any other shape and let `deserializeError`
+ * normalize it.
+ *
+ * `errorCode` is a separate plaintext metadata field used for routing
+ * and classification.
+ */
+export const WorkflowRunWireBaseSchema = WorkflowRunBaseSchema.omit({
+  error: true,
+  errorCode: true,
+}).extend({
+  error: z.union([SerializedDataSchema, z.any()]).optional(),
+  errorCode: z.string().optional(),
+  // Not part of the World interface, but passed through for direct consumers and debugging
+  blobStorageBytes: z.number().optional(),
+  streamStorageBytes: z.number().optional(),
+});
+
+// Wire schema for resolved data (full input/output)
+const WorkflowRunWireSchema = WorkflowRunWireBaseSchema;
+
+// Wire schema for lazy mode with refs instead of data
+// input/output can be Uint8Array (v2) or any JSON (legacy v1)
+const WorkflowRunWireWithRefsSchema = WorkflowRunWireBaseSchema.omit({
   input: true,
   output: true,
 }).extend({
   // We discard the results of the refs, so we don't care about the type here
   inputRef: z.any().optional(),
   outputRef: z.any().optional(),
-  input: z.array(z.any()).optional(),
-  output: z.any().optional(),
+  // Accept both Uint8Array (v2 format) and any (legacy v1 JSON format)
+  input: z.union([z.instanceof(Uint8Array), z.any()]).optional(),
+  output: z.union([z.instanceof(Uint8Array), z.any()]).optional(),
+  // Discarded by `filterRunData`: `resolveData: 'none'` never returns a
+  // dynamic run's code, whatever shape the backend sends it in.
+  dynamicWorkflowCode: z.any().optional(),
 });
 
-// Helper to filter run data based on resolveData setting
-function filterRunData(run: any, resolveData: 'none' | 'all'): WorkflowRun {
+// Overloaded function signatures for filterRunData
+function filterRunData(run: any, resolveData: 'none'): WorkflowRunWithoutData;
+function filterRunData(run: any, resolveData: 'all'): WorkflowRun;
+function filterRunData(
+  run: any,
+  resolveData: 'none' | 'all'
+): WorkflowRun | WorkflowRunWithoutData;
+
+// Implementation. This is a read/display entry point (getRun/listRuns),
+// so it decompresses gzip/zstd payload wrappers via
+// `normalizeWorkflowRunData`. The runtime write path (events.create)
+// re-hydrates run errors through `hydrateRunError`, which decompresses
+// on its own, so it deliberately does not route through here.
+function filterRunData(
+  run: any,
+  resolveData: 'none' | 'all'
+): WorkflowRun | WorkflowRunWithoutData {
   if (resolveData === 'none') {
-    const { inputRef: _inputRef, outputRef: _outputRef, ...rest } = run;
+    // The code is dropped before normalizing, so it is never decompressed.
+    const {
+      inputRef: _inputRef,
+      outputRef: _outputRef,
+      dynamicWorkflowCode: _dynamicWorkflowCode,
+      ...rest
+    } = run;
+    const deserialized = normalizeWorkflowRunData(
+      deserializeError<WorkflowRun>(rest) as unknown as Record<string, unknown>
+    );
     return {
-      ...rest,
-      input: [],
+      ...deserialized,
+      input: undefined,
       output: undefined,
-    };
+    } as WorkflowRunWithoutData;
   }
-  return run;
+  return normalizeWorkflowRunData(
+    deserializeError<WorkflowRun>(run) as unknown as Record<string, unknown>
+  ) as unknown as WorkflowRun;
 }
 
 // Functions
 
 /**
- * This query technically works but should be used sparingly till the backend
- * uses CH to resolve this instead of scanning a dynamo table.
+ * Lists canonical workflow storage records.
+ *
+ * Observability and inspection usage is deprecated: use
+ * `world.analytics.runs.list()` for plan-aware, ClickHouse-backed queries.
+ * This path remains for operational and payload-bearing callers.
  */
+export async function listWorkflowRuns(
+  params: ListWorkflowRunsParams & { resolveData: 'none' },
+  config?: APIConfig
+): Promise<PaginatedResponse<WorkflowRunWithoutData>>;
+export async function listWorkflowRuns(
+  params?: ListWorkflowRunsParams & { resolveData?: 'all' },
+  config?: APIConfig
+): Promise<PaginatedResponse<WorkflowRun>>;
+export async function listWorkflowRuns(
+  params?: ListWorkflowRunsParams,
+  config?: APIConfig
+): Promise<PaginatedResponse<WorkflowRun | WorkflowRunWithoutData>>;
 export async function listWorkflowRuns(
   params: ListWorkflowRunsParams = {},
   config?: APIConfig
-): Promise<PaginatedResponse<WorkflowRun>> {
+): Promise<PaginatedResponse<WorkflowRun | WorkflowRunWithoutData>> {
   const {
     workflowName,
     status,
@@ -65,6 +146,15 @@ export async function listWorkflowRuns(
   const searchParams = new URLSearchParams();
 
   if (workflowName) searchParams.set('workflowName', workflowName);
+  if (Array.isArray(status)) {
+    // The world-vercel backend's `/v2/runs` only accepts a single status
+    // value today. Reject explicitly rather than joining into a value the
+    // backend would silently reject or misinterpret.
+    throw new WorkflowWorldError(
+      'listWorkflowRuns: status does not support an array of statuses on world-vercel yet; pass a single status',
+      { code: 'INVALID_ARGUMENT', field: 'status' }
+    );
+  }
   if (status) searchParams.set('status', status);
   if (pagination?.limit) searchParams.set('limit', pagination.limit.toString());
   if (pagination?.cursor) searchParams.set('cursor', pagination.cursor);
@@ -76,7 +166,7 @@ export async function listWorkflowRuns(
   searchParams.set('remoteRefBehavior', remoteRefBehavior);
 
   const queryString = searchParams.toString();
-  const endpoint = `/v1/runs${queryString ? `?${queryString}` : ''}`;
+  const endpoint = `/v2/runs${queryString ? `?${queryString}` : ''}`;
 
   const response = (await makeRequest({
     endpoint,
@@ -84,8 +174,8 @@ export async function listWorkflowRuns(
     config,
     schema: PaginatedResponseSchema(
       remoteRefBehavior === 'lazy'
-        ? WorkflowRunWithRefsSchema
-        : WorkflowRunSchema
+        ? WorkflowRunWireWithRefsSchema
+        : WorkflowRunWireSchema
     ),
   })) as PaginatedResponse<WorkflowRun>;
 
@@ -95,82 +185,329 @@ export async function listWorkflowRuns(
   };
 }
 
-export async function createWorkflowRun(
+export async function createWorkflowRunV1(
   data: CreateWorkflowRunRequest,
   config?: APIConfig
 ): Promise<WorkflowRun> {
-  return makeRequest({
+  const run = await makeRequest({
     endpoint: '/v1/runs/create',
-    options: {
-      method: 'POST',
-      body: JSON.stringify(data, dateToStringReplacer),
-    },
+    options: { method: 'POST' },
+    data,
     config,
-    schema: WorkflowRunSchema,
+    schema: WorkflowRunWireSchema,
   });
+  return deserializeError<WorkflowRun>(run);
 }
 
 export async function getWorkflowRun(
   id: string,
+  params: GetWorkflowRunParams & { resolveData: 'none' },
+  config?: APIConfig
+): Promise<WorkflowRunWithoutData>;
+export async function getWorkflowRun(
+  id: string,
+  params?: GetWorkflowRunParams & { resolveData?: 'all' },
+  config?: APIConfig
+): Promise<WorkflowRun>;
+export async function getWorkflowRun(
+  id: string,
   params?: GetWorkflowRunParams,
   config?: APIConfig
-): Promise<WorkflowRun> {
+): Promise<WorkflowRun | WorkflowRunWithoutData>;
+export async function getWorkflowRun(
+  id: string,
+  params?: GetWorkflowRunParams,
+  config?: APIConfig
+): Promise<WorkflowRun | WorkflowRunWithoutData> {
   const resolveData = params?.resolveData ?? DEFAULT_RESOLVE_DATA_OPTION;
+  return readRunOrNotFound(id, { resolveData }, config);
+}
+
+/**
+ * The plain run read, with a `404` raised as `WorkflowRunNotFoundError`.
+ * `waitForWorkflowRunTerminalStatus` falls back to this with the caller's
+ * `signal`, which `GetWorkflowRunParams` has no field for.
+ */
+async function readRunOrNotFound(
+  id: string,
+  params: { resolveData: 'none' | 'all'; signal?: AbortSignal },
+  config?: APIConfig
+): Promise<WorkflowRun | WorkflowRunWithoutData> {
+  try {
+    return await readRun(id, params, config);
+  } catch (error) {
+    if (error instanceof WorkflowWorldError && error.status === 404) {
+      throw new WorkflowRunNotFoundError(id);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Issue one run read against the backend and normalize it into the World's
+ * `WorkflowRun` shape.
+ *
+ * `waitMs`, when set, targets the long-pollable `GET /v2/runs/:runId/status`
+ * route instead of the plain read: same entity, same errors, but the server
+ * holds the request open until the run reaches a terminal status or the budget
+ * expires. Shared by `getWorkflowRun` and `waitForWorkflowRunTerminalStatus` so
+ * the two can never drift in how they parse or filter a run.
+ */
+async function readRun(
+  id: string,
+  params: {
+    resolveData: 'none' | 'all';
+    waitMs?: number;
+    signal?: AbortSignal;
+  },
+  config?: APIConfig
+): Promise<WorkflowRun | WorkflowRunWithoutData> {
+  const { resolveData, waitMs, signal } = params;
   const remoteRefBehavior = resolveData === 'none' ? 'lazy' : 'resolve';
 
   const searchParams = new URLSearchParams();
   searchParams.set('remoteRefBehavior', remoteRefBehavior);
+  if (waitMs !== undefined) searchParams.set('waitMs', String(waitMs));
 
+  const path = waitMs === undefined ? '' : '/status';
   const queryString = searchParams.toString();
-  const endpoint = `/v1/runs/${id}${queryString ? `?${queryString}` : ''}`;
+  const endpoint = `/v2/runs/${encodeURIComponent(id)}${path}${queryString ? `?${queryString}` : ''}`;
 
-  try {
-    const run = await makeRequest({
-      endpoint,
-      options: { method: 'GET' },
-      config,
-      schema: (remoteRefBehavior === 'lazy'
-        ? WorkflowRunWithRefsSchema
-        : WorkflowRunSchema) as any,
-    });
+  const run = await makeRequest({
+    endpoint,
+    options: { method: 'GET', ...(signal ? { signal } : {}) },
+    config,
+    retryConnectTimeout: true,
+    schema: (remoteRefBehavior === 'lazy'
+      ? WorkflowRunWireWithRefsSchema
+      : WorkflowRunWireSchema) as any,
+  });
 
-    return filterRunData(run, resolveData);
-  } catch (error) {
-    if (error instanceof WorkflowAPIError && error.status === 404) {
-      throw new WorkflowRunNotFoundError(id);
-    }
-    throw error;
-  }
+  return filterRunData(run, resolveData);
 }
 
-export async function updateWorkflowRun(
+/**
+ * Headroom kept between the wait budget we ask the server to hold and the
+ * adapter's own per-request HTTP timeout. The budget must always expire as a
+ * *response* (a non-terminal run) rather than as a client-side timeout: a
+ * timeout is indistinguishable from a broken backend and would turn a healthy
+ * wait into retry noise.
+ */
+const WAIT_TIMEOUT_HEADROOM_MS = 10_000;
+
+/**
+ * How long a `404`/`405`/`501` on the long-poll route suppresses further
+ * attempts before the next one re-probes.
+ *
+ * A miss means the backend serving this base URL predates the route (or has it
+ * rolled back), which is a property of the *backend*, not of the run, so it is
+ * cached rather than re-learned per call. It expires so a client that outlives
+ * a server roll-forward picks the fast path back up on its own.
+ */
+const LONG_POLL_UNSUPPORTED_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Suppression deadline per base URL, because one process can hold worlds
+ * pointed at different backends: the api.vercel.com proxy (with
+ * `projectConfig`) and the backend directly resolve to different hosts,
+ * which can be on different versions. A miss against one must not disable the
+ * fast path for the other. Bounded by construction: the key is the resolved
+ * base URL, of which a process has a handful at most.
+ */
+const longPoll = globalSingleton(
+  '@workflow/world-vercel//runStatusLongPollSupport',
+  1,
+  () => ({ unsupportedUntilByBaseUrl: new Map<string, number>() })
+);
+
+/** Test-only: forget that the long-poll route was unavailable. @internal */
+export function _resetRunStatusLongPollSupportForTests(): void {
+  longPoll.unsupportedUntilByBaseUrl.clear();
+}
+
+/**
+ * Whether this failure means "the long poll is not usable against this
+ * backend", as opposed to something the caller needs to see.
+ *
+ * Two shapes, for the same reason: the answer we want is a plain read either
+ * way, and the fast path should stand down until it re-probes.
+ *
+ * - **The route is missing** (`404`/`405`/`501`). `404` is ambiguous (the run
+ *   may not exist), which the plain read below disambiguates.
+ * - **The hold did not survive**: the request timed out client-side
+ *   (`TIMEOUT`), the connection was severed mid-hold (`TRANSPORT`), or an
+ *   intermediary gave up on it (`504`). Holding a request open for ~25s is a
+ *   new shape for this client, and it crosses gateways and egress proxies that
+ *   are entitled to cut an apparently idle connection. None of that means the
+ *   run is in trouble, so it must not surface as a failed `run.returnValue`:
+ *   without this, a healthy still-running run hard-fails the caller's await,
+ *   and does so on every retry, since nothing would mark the route unusable.
+ *
+ * A plain `500`/`502`/`503` still propagates. Those say the backend itself is
+ * unwell rather than that this *route* cannot be held open, and masking them
+ * behind a second read would hide a real outage. `RetryAgent` has already
+ * retried them in-process by the time they reach here.
+ */
+function isLongPollUnusable(error: WorkflowWorldError): boolean {
+  if (error.status === 404 || error.status === 405 || error.status === 501) {
+    return true;
+  }
+  if (error.status === 504) return true;
+  // Set by makeRequest/instrumentedFetch; both carry no HTTP status, because
+  // no response ever arrived.
+  return (
+    error.status === undefined &&
+    (error.code === 'TIMEOUT' || error.code === 'TRANSPORT')
+  );
+}
+
+/**
+ * Wait for a run to reach a terminal status, using the backend's
+ * long-pollable `GET /v2/runs/:runId/status` route.
+ *
+ * Implements `Storage['runs'].waitForTerminalStatus`: resolves as soon as the
+ * run is terminal, and otherwise with the latest snapshot once the budget
+ * expires. Never throws on a timeout, since a still-running run is an answer.
+ *
+ * Degrades in two places, because the adapter can outlive the server version
+ * it was built against:
+ *
+ * - **Budget.** Clamped to leave {@link WAIT_TIMEOUT_HEADROOM_MS} under the
+ *   adapter's per-request timeout, and the server clamps again to its own
+ *   ceiling. A budget that clamps to zero is a plain read.
+ * - **Missing route.** A `404` is ambiguous (the run may not exist, or this
+ *   server may not have the route), so it is resolved by falling back to the
+ *   plain read, which is the answer we want either way: it raises
+ *   `WorkflowRunNotFoundError` for a missing run, and returns the run when the
+ *   *route* was what was missing. Only the latter (proof that the run exists
+ *   and the route does not) suppresses the fast path, and only for the base URL
+ *   that answered, so neither one bad run ID nor one lagging backend can
+ *   disable long polling everywhere.
+ */
+export async function waitForWorkflowRunTerminalStatus(
   id: string,
-  data: UpdateWorkflowRunRequest,
+  params: WaitForTerminalRunStatusParams & { resolveData: 'none' },
   config?: APIConfig
-): Promise<WorkflowRun> {
+): Promise<WorkflowRunWithoutData>;
+export async function waitForWorkflowRunTerminalStatus(
+  id: string,
+  params?: WaitForTerminalRunStatusParams & { resolveData?: 'all' },
+  config?: APIConfig
+): Promise<WorkflowRun>;
+export async function waitForWorkflowRunTerminalStatus(
+  id: string,
+  params?: WaitForTerminalRunStatusParams,
+  config?: APIConfig
+): Promise<WorkflowRun | WorkflowRunWithoutData>;
+export async function waitForWorkflowRunTerminalStatus(
+  id: string,
+  params?: WaitForTerminalRunStatusParams,
+  config?: APIConfig
+): Promise<WorkflowRun | WorkflowRunWithoutData> {
+  const resolveData = params?.resolveData ?? DEFAULT_RESOLVE_DATA_OPTION;
+  const waitMs = Math.max(
+    0,
+    Math.min(
+      params?.timeoutMs ?? 0,
+      getRequestTimeoutMs() - WAIT_TIMEOUT_HEADROOM_MS
+    )
+  );
+
+  const signal = params?.signal;
+
+  const { baseUrl } = getHttpUrl(config);
+  const unsupportedUntil = longPoll.unsupportedUntilByBaseUrl.get(baseUrl) ?? 0;
+
+  if (waitMs === 0 || Date.now() < unsupportedUntil) {
+    return readRunOrNotFound(id, { resolveData, signal }, config);
+  }
+
   try {
-    return makeRequest({
-      endpoint: `/v1/runs/${id}`,
-      options: {
-        method: 'PUT',
-        body: JSON.stringify(data, dateToStringReplacer),
-      },
-      config,
-      schema: WorkflowRunSchema,
-    });
+    return await readRun(id, { resolveData, waitMs, signal }, config);
   } catch (error) {
-    if (error instanceof WorkflowAPIError && error.status === 404) {
-      throw new WorkflowRunNotFoundError(id);
+    // The caller cancelled on purpose. That is not a verdict on the route, so
+    // it propagates rather than degrading; otherwise an ordinary abort would
+    // both cost an extra read and switch the fast path off for every run in
+    // this process. Checked first because an abort surfaces with the same
+    // `TIMEOUT` code as a request that ran out of time on its own.
+    if (signal?.aborted) {
+      throw error;
     }
-    throw error;
+    if (!(error instanceof WorkflowWorldError) || !isLongPollUnusable(error)) {
+      throw error;
+    }
+
+    // Throws WorkflowRunNotFoundError when the run is what was missing.
+    const run = await readRunOrNotFound(id, { resolveData, signal }, config);
+    longPoll.unsupportedUntilByBaseUrl.set(
+      baseUrl,
+      Date.now() + LONG_POLL_UNSUPPORTED_TTL_MS
+    );
+    return run;
   }
 }
 
-export async function cancelWorkflowRun(
+/**
+ * Retrieves a snapshot for each requested run ID. Delegates to
+ * `getWorkflowRun` for each ID and returns null for IDs that do not exist.
+ */
+export async function getWorkflowRuns(
+  ids: readonly string[],
+  params: GetWorkflowRunParams & { resolveData: 'none' },
+  config?: APIConfig
+): Promise<(WorkflowRunWithoutData | null)[]>;
+export async function getWorkflowRuns(
+  ids: readonly string[],
+  params?: GetWorkflowRunParams & { resolveData?: 'all' },
+  config?: APIConfig
+): Promise<(WorkflowRun | null)[]>;
+export async function getWorkflowRuns(
+  ids: readonly string[],
+  params?: GetWorkflowRunParams,
+  config?: APIConfig
+): Promise<(WorkflowRun | WorkflowRunWithoutData | null)[]>;
+export async function getWorkflowRuns(
+  ids: readonly string[],
+  params?: GetWorkflowRunParams,
+  config?: APIConfig
+): Promise<(WorkflowRun | WorkflowRunWithoutData | null)[]> {
+  const uniqueIds = [...new Set(ids)];
+  const runs = await Promise.all(
+    uniqueIds.map(async (id) => {
+      try {
+        return await getWorkflowRun(id, params, config);
+      } catch (error) {
+        if (error instanceof WorkflowRunNotFoundError) {
+          return null;
+        }
+        throw error;
+      }
+    })
+  );
+  const runById = new Map(uniqueIds.map((id, i) => [id, runs[i]]));
+  return ids.map((id) => runById.get(id) ?? null);
+}
+
+export async function cancelWorkflowRunV1(
+  id: string,
+  params: CancelWorkflowRunParams & { resolveData: 'none' },
+  config?: APIConfig
+): Promise<WorkflowRunWithoutData>;
+export async function cancelWorkflowRunV1(
+  id: string,
+  params?: CancelWorkflowRunParams & { resolveData?: 'all' },
+  config?: APIConfig
+): Promise<WorkflowRun>;
+export async function cancelWorkflowRunV1(
   id: string,
   params?: CancelWorkflowRunParams,
   config?: APIConfig
-): Promise<WorkflowRun> {
+): Promise<WorkflowRun | WorkflowRunWithoutData>;
+export async function cancelWorkflowRunV1(
+  id: string,
+  params?: CancelWorkflowRunParams,
+  config?: APIConfig
+): Promise<WorkflowRun | WorkflowRunWithoutData> {
   const resolveData = params?.resolveData ?? DEFAULT_RESOLVE_DATA_OPTION;
   const remoteRefBehavior = resolveData === 'none' ? 'lazy' : 'resolve';
 
@@ -178,7 +515,7 @@ export async function cancelWorkflowRun(
   searchParams.set('remoteRefBehavior', remoteRefBehavior);
 
   const queryString = searchParams.toString();
-  const endpoint = `/v1/runs/${id}/cancel${queryString ? `?${queryString}` : ''}`;
+  const endpoint = `/v1/runs/${encodeURIComponent(id)}/cancel${queryString ? `?${queryString}` : ''}`;
 
   try {
     const run = await makeRequest({
@@ -186,80 +523,110 @@ export async function cancelWorkflowRun(
       options: { method: 'PUT' },
       config,
       schema: (remoteRefBehavior === 'lazy'
-        ? WorkflowRunWithRefsSchema
-        : WorkflowRunSchema) as any,
+        ? WorkflowRunWireWithRefsSchema
+        : WorkflowRunWireSchema) as any,
     });
 
     return filterRunData(run, resolveData);
   } catch (error) {
-    if (error instanceof WorkflowAPIError && error.status === 404) {
+    if (error instanceof WorkflowWorldError && error.status === 404) {
       throw new WorkflowRunNotFoundError(id);
     }
     throw error;
   }
 }
 
-export async function pauseWorkflowRun(
-  id: string,
-  params?: PauseWorkflowRunParams,
+/**
+ * Cancel many runs in a single backend request.
+ *
+ * The request is validated client-side (1–500 unique IDs) before hitting
+ * `POST /v4/runs/cancel`, and the structured response is parsed with the
+ * shared world schema. Results are reordered to match the requested
+ * `runIds` so callers get a stable, request-aligned array regardless of
+ * the order the backend returns.
+ */
+export async function cancelWorkflowRuns(
+  request: BulkCancelWorkflowRunsRequest,
   config?: APIConfig
-): Promise<WorkflowRun> {
-  const resolveData = params?.resolveData ?? DEFAULT_RESOLVE_DATA_OPTION;
-  const remoteRefBehavior = resolveData === 'none' ? 'lazy' : 'resolve';
+): Promise<BulkCancelWorkflowRunsResult> {
+  const { runIds, cancelReason } =
+    BulkCancelWorkflowRunsRequestSchema.parse(request);
 
-  const searchParams = new URLSearchParams();
-  searchParams.set('remoteRefBehavior', remoteRefBehavior);
+  const response = await makeRequest({
+    endpoint: '/v4/runs/cancel',
+    options: { method: 'POST' },
+    data: cancelReason !== undefined ? { runIds, cancelReason } : { runIds },
+    config,
+    schema: BulkCancelWorkflowRunsResultSchema,
+  });
 
-  const queryString = searchParams.toString();
-  const endpoint = `/v1/runs/${id}/pause${queryString ? `?${queryString}` : ''}`;
-
-  try {
-    const run = await makeRequest({
-      endpoint,
-      options: { method: 'PUT' },
-      config,
-      schema: (remoteRefBehavior === 'lazy'
-        ? WorkflowRunWithRefsSchema
-        : WorkflowRunSchema) as any,
-    });
-
-    return filterRunData(run, resolveData);
-  } catch (error) {
-    if (error instanceof WorkflowAPIError && error.status === 404) {
-      throw new WorkflowRunNotFoundError(id);
-    }
-    throw error;
+  // The backend must return exactly one result per requested ID. A missing
+  // ID, a duplicate, or an unexpected extra ID is a protocol violation:
+  // reject it rather than papering over it by synthesizing a `not_found`
+  // outcome, which would silently disagree with the backend's own summary.
+  const resultByRunId = new Map(
+    response.results.map((result) => [result.runId, result])
+  );
+  const isBijection =
+    resultByRunId.size === response.results.length &&
+    response.results.length === runIds.length &&
+    runIds.every((runId) => resultByRunId.has(runId));
+  if (!isBijection) {
+    throw new WorkflowWorldError(
+      `Bulk cancel response did not contain exactly one result per requested run ID ` +
+        `(requested ${runIds.length}, received ${response.results.length}).`
+    );
   }
+
+  const orderedResults = runIds.map(
+    (runId) => resultByRunId.get(runId) as (typeof response.results)[number]
+  );
+
+  return { summary: response.summary, results: orderedResults };
 }
 
-export async function resumeWorkflowRun(
-  id: string,
-  params?: ResumeWorkflowRunParams,
+/**
+ * Wire response schema for `experimentalSetAttributes`. The backend
+ * returns the post-merge attribute snapshot so callers don't need to
+ * issue a follow-up read.
+ */
+const ExperimentalSetAttributesResponseSchema = z.object({
+  attributes: z.record(z.string(), z.string()),
+});
+
+/**
+ * Apply attribute changes to a workflow run. The body shape mirrors the
+ * future `attr_set` event's `eventData.changes`, so the wire contract is
+ * forward-compatible with the full 5.0.0 attributes feature; only the
+ * endpoint path changes.
+ *
+ * `options.allowReservedAttributes` opts the request into permitting
+ * `$`-prefixed keys (framework-only; see the SDK helper for details).
+ * The flag is forwarded to the server via the request body.
+ *
+ * EXPERIMENTAL: tied to the MVP write-only attributes API. See
+ * `docs/content/docs/v5/changelog/attributes-mvp.mdx`.
+ */
+export async function experimentalSetAttributes(
+  runId: string,
+  changes: AttributeChange[],
+  options?: { allowReservedAttributes?: boolean },
   config?: APIConfig
-): Promise<WorkflowRun> {
-  const resolveData = params?.resolveData ?? DEFAULT_RESOLVE_DATA_OPTION;
-  const remoteRefBehavior = resolveData === 'none' ? 'lazy' : 'resolve';
-
-  const searchParams = new URLSearchParams();
-  searchParams.set('remoteRefBehavior', remoteRefBehavior);
-
-  const queryString = searchParams.toString();
-  const endpoint = `/v1/runs/${id}/resume${queryString ? `?${queryString}` : ''}`;
-
+): Promise<ExperimentalSetAttributesResult> {
   try {
-    const run = await makeRequest({
-      endpoint,
-      options: { method: 'PUT' },
+    const response = await makeRequest({
+      endpoint: `/v2/runs/${encodeURIComponent(runId)}/attributes`,
+      options: { method: 'POST' },
+      data: options?.allowReservedAttributes
+        ? { changes, allowReservedAttributes: true }
+        : { changes },
       config,
-      schema: (remoteRefBehavior === 'lazy'
-        ? WorkflowRunWithRefsSchema
-        : WorkflowRunSchema) as any,
+      schema: ExperimentalSetAttributesResponseSchema,
     });
-
-    return filterRunData(run, resolveData);
+    return { attributes: response.attributes };
   } catch (error) {
-    if (error instanceof WorkflowAPIError && error.status === 404) {
-      throw new WorkflowRunNotFoundError(id);
+    if (error instanceof WorkflowWorldError && error.status === 404) {
+      throw new WorkflowRunNotFoundError(runId);
     }
     throw error;
   }

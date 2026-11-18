@@ -30,12 +30,12 @@ export const cliFlags = {
     description: 'backend to inspect',
     required: false,
     char: 'b',
-    default: 'embedded',
+    default: 'local',
     env: 'WORKFLOW_TARGET_WORLD',
     helpGroup: 'Target',
     helpLabel: '-b, --backend',
-    helpValue: ['embedded', 'vercel', '<your-package-name>'],
-    defaultHelp: 'embedded',
+    helpValue: ['local', 'vercel', '<your-package-name>'],
+    defaultHelp: 'local',
   }),
   authToken: Flags.string({
     description:
@@ -92,11 +92,49 @@ export const cliFlags = {
     helpGroup: 'Output',
     helpLabel: '-w, --web',
   }),
+  webPort: Flags.integer({
+    description: 'Port to use when launching the web UI (default: 3456)',
+    required: false,
+    default: 3456,
+    helpGroup: 'Output',
+    helpLabel: '--webPort',
+    helpValue: 'WEB_PORT',
+    env: 'WORKFLOW_WEB_PORT',
+  }),
+  noBrowser: Flags.boolean({
+    description: 'Disable automatic browser opening when launching web UI',
+    required: false,
+    default: false,
+    env: 'WORKFLOW_DISABLE_BROWSER_OPEN',
+    helpGroup: 'Output',
+    helpLabel: '--noBrowser',
+  }),
+  localUi: Flags.boolean({
+    description:
+      'Use local web UI instead of Vercel dashboard (when backend is vercel)',
+    required: false,
+    default: false,
+    env: 'WORKFLOW_LOCAL_UI',
+    helpGroup: 'Output',
+    helpLabel: '--localUi',
+  }),
+  standalone: Flags.boolean({
+    description:
+      'Always start the standalone web UI, even if an embedded dashboard (e.g. /_workflow) is already running',
+    required: false,
+    default: false,
+    env: 'WORKFLOW_STANDALONE_UI',
+    helpGroup: 'Output',
+    helpLabel: '--standalone',
+  }),
   sort: Flags.string({
     description: 'sort order for list commands',
     required: false,
     options: ['asc', 'desc'],
-    default: 'desc',
+    // No parser-level default: every time-ordered listing already falls back
+    // to `desc` itself, and a default here made the flag indistinguishable
+    // from an explicit one, so `inspect attributes` could not tell that it
+    // should leave the backend's alphabetical key order alone.
     helpGroup: 'Filtering',
     helpLabel: '--sort',
     helpValue: ['asc', 'desc'],
@@ -109,5 +147,29 @@ export const cliFlags = {
     helpGroup: 'Filtering',
     helpLabel: '--limit',
     helpValue: 'NUMBER',
+  }),
+  interactive: Flags.boolean({
+    description: 'Enable interactive pagination with keyboard controls',
+    required: false,
+    char: 'i',
+    default: false,
+    helpGroup: 'Output',
+    helpLabel: '-i, --interactive',
+  }),
+};
+
+/**
+ * Flag for printing a shareable deep-link URL instead of opening the web UI.
+ * Only relevant to commands that can open a dashboard (`inspect`, `web`), so it
+ * is exported separately rather than bundled into `cliFlags`.
+ */
+export const urlFlag = {
+  url: Flags.boolean({
+    description:
+      'Print the deep-link URL to the run/dashboard and exit (no browser, no server)',
+    required: false,
+    default: false,
+    helpGroup: 'Output',
+    helpLabel: '--url',
   }),
 };

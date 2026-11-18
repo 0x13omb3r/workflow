@@ -1,20 +1,45 @@
 {
-  "$schema": "https://unpkg.com/@changesets/config@3.1.1/schema.json",
-  "changelog": "@changesets/cli/changelog",
+  "$schema": "https://unpkg.com/@changesets/config@4.0.0/schema.json",
+  "changelog": [
+    "./changelog.mjs",
+    {
+      "repo": "vercel/workflow"
+    }
+  ],
   "commit": false,
-  "fixed": [],
+  "format": false,
+  "privatePackages": {
+    "version": true,
+    "tag": true
+  },
+  "fixed": [
+    [
+      "workflow",
+      "@workflow/core",
+      "@workflow/world-vercel"
+    ],
+    [
+      "@workflow/web",
+      "@workflow/web-shared"
+    ]
+  ],
   "linked": [],
   "access": "public",
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
+  "___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH": {
+    "onlyUpdatePeerDependentsWhenOutOfRange": true
+  },
   "ignore": [
     "docs",
+    "tarballs",
     "nextjs-turbopack",
     "nextjs-webpack",
-    "@workflow/example-app",
-    "@workflow/example-hono",
-    "@workflow/example-nitro-v3",
-    "@workflow/example-nitro-v2",
-    "@workflow/example-nuxt"
+    "workflow-sdk-compiler-playground",
+    "@workflow/docs-typecheck",
+    "@workflow/example-*",
+    "@workflow/vitest-workbench",
+    "@workflow/world-sim",
+    "@workflow/sim-world-workbench"
   ]
 }
